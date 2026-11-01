@@ -40,6 +40,10 @@ pub struct History {
 }
 
 impl History {
+    pub fn latest_word(&self) -> Option<&Word> {
+        self.words.last()
+    }
+
     /// Returns lines for stdout on completion, restoration or reset.
     /// A repeat is another stroke, not a held key in the stored word.
     pub fn process(&mut self, device: &Path, key: KeyCode, value: i32) -> Vec<String> {

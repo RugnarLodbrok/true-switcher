@@ -34,7 +34,7 @@ pub fn listen() -> io::Result<Receiver<KeyboardEvent>> {
 
         // Identify the device itself, rather than suppressing all input during
         // replay: physical keystrokes must still reach the listener.
-        if is_own_keyboard(device.physical_path()) {
+        if is_own_keyboard(device.physical_path(), device.name()) {
             continue;
         }
 
