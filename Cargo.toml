@@ -1,0 +1,11 @@
+[package]
+name = "true-switcher"
+version = "0.1.0"
+edition = "2024"
+default-run = "true-switcher"
+
+[[bin]]
+name = "learn"
+path = "src-learn/main.rs"
+
+[dependencies]
