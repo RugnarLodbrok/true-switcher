@@ -6,6 +6,8 @@ use std::thread;
 
 use evdev::{Device, EventType, InputEvent, KeyCode};
 
+use crate::output::is_own_keyboard;
+
 type KeyboardEvent = io::Result<(PathBuf, InputEvent)>;
 
 /// Opens keyboards present at startup. Each device has a blocking reader so
@@ -29,6 +31,12 @@ pub fn listen() -> io::Result<Receiver<KeyboardEvent>> {
                 continue;
             }
         };
+
+        // Identify the device itself, rather than suppressing all input during
+        // replay: physical keystrokes must still reach the listener.
+        if is_own_keyboard(device.physical_path()) {
+            continue;
+        }
 
         // EV_KEY alone also describes mice, gamepads and power buttons.
         let is_keyboard = device.supported_keys().is_some_and(|keys| {

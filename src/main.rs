@@ -1,6 +1,7 @@
 mod environment;
 mod history;
 mod input;
+pub mod output;
 
 use std::io::{self, Write};
 use std::process::ExitCode;

@@ -143,7 +143,7 @@ fn is_modifier(key: KeyCode) -> bool {
         )
 }
 
-fn is_text_key(key: KeyCode) -> bool {
+pub(crate) fn is_text_key(key: KeyCode) -> bool {
     // Linux input keycode ranges for the alphanumeric rows, including
     // punctuation. No layout-to-character mapping is involved.
     (KeyCode::KEY_1.0..=KeyCode::KEY_EQUAL.0).contains(&key.0)
