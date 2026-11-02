@@ -1,4 +1,4 @@
-.PHONY: run run-learn run-modifier-experiment-100 run-modifier-experiment-101 fmt-check test
+.PHONY: run run-learn run-modifier-experiment-100 run-modifier-experiment-101 run-capture-experiment-102 fmt-check test
 
 run:
 	cargo build --bin true-switcher
@@ -29,6 +29,15 @@ run-modifier-experiment-101:
 		--property=SupplementaryGroups=input \
 		--working-directory="$(CURDIR)" \
 		"$(CURDIR)/target/debug/experiment-101" $(EXPERIMENT_ARGS)
+
+run-capture-experiment-102:
+	cargo build --bin experiment-102
+	chcon -t bin_t "$(CURDIR)/target/debug/experiment-102"
+	sudo systemd-run --pty --wait --collect \
+		--uid="$$(id -u)" \
+		--property=SupplementaryGroups=input \
+		--working-directory="$(CURDIR)" \
+		"$(CURDIR)/target/debug/experiment-102" $(EXPERIMENT_ARGS)
 
 fmt-check:
 	cargo fmt --check
