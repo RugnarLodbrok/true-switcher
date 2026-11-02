@@ -25,6 +25,7 @@ const TEST_KEYS: [KeyCode; 6] = [
     KeyCode::KEY_B,
     KeyCode::KEY_C,
 ];
+const SHIFT_KEYS: [KeyCode; 2] = [KeyCode::KEY_LEFTSHIFT, KeyCode::KEY_RIGHTSHIFT];
 
 struct Log {
     file: File,
@@ -253,7 +254,7 @@ impl Experiment {
         ))?;
         if keyboard.injected_releases.contains(&event.code()) && matches!(event.value(), 1 | 2) {
             self.log.write(format_args!(
-                "REASSERTED {} {:?} value={}; no corrective release will be injected",
+                "REASSERTED {} {:?} value={}; observed after source release",
                 keyboard.path.display(),
                 KeyCode::new(event.code()),
                 event.value()
@@ -265,7 +266,7 @@ impl Experiment {
     fn release_source(&mut self, index: usize, key: KeyCode) -> io::Result<()> {
         let keyboard = &mut self.keyboards[index];
         self.log.write(format_args!(
-            "SOURCE_RELEASE attempt {} {key:?} value=0 + SYN_REPORT; before grab={}",
+            "SOURCE_RELEASE attempt {} {key:?} value=0 + SYN_REPORT; grabbed={}",
             keyboard.path.display(),
             keyboard.device.is_grabbed()
         ))?;
@@ -364,11 +365,14 @@ impl Experiment {
     }
 
     fn wait_for_releases(&mut self) -> io::Result<bool> {
-        self.log.write("WAIT_RELEASES begin; original injected releases excluded, new presses and repeats included")?;
+        self.log.write("WAIT_RELEASES begin; held Shifts reset through source devices, other new presses and repeats awaited")?;
         loop {
             if self.read_events()?.1 {
                 self.log.write("ABORT Escape while waiting for releases")?;
                 return Ok(false);
+            }
+            if self.release_captured_shifts()? {
+                continue;
             }
             if self
                 .keyboards
@@ -380,6 +384,27 @@ impl Experiment {
             }
             thread::sleep(POLL_INTERVAL);
         }
+    }
+
+    fn release_captured_shifts(&mut self) -> io::Result<bool> {
+        let mut is_reset = false;
+        for index in 0..self.keyboards.len() {
+            if !self.keyboards[index].device.is_grabbed() {
+                continue;
+            }
+            let state = self.keyboards[index].device.get_key_state()?;
+            for key in SHIFT_KEYS {
+                if state.contains(key) || self.keyboards[index].held.contains(&key.0) {
+                    self.log.write(format_args!(
+                        "CAPTURE_SHIFT_RESET {} {key:?}; before ungrab",
+                        self.keyboards[index].path.display()
+                    ))?;
+                    self.release_source(index, key)?;
+                    is_reset = true;
+                }
+            }
+        }
+        Ok(is_reset)
     }
 
     fn run(&mut self) -> io::Result<()> {
@@ -440,6 +465,12 @@ impl Drop for Experiment {
                 KeyCode::new(code)
             ));
         }
+        if let Err(error) = self.release_captured_shifts() {
+            eprintln!("Cleanup source Shift release failed: {error}");
+            let _ = self
+                .log
+                .write(format_args!("CLEANUP source Shift release failed: {error}"));
+        }
         if let Err(error) = self.ungrab() {
             eprintln!("Cleanup ungrab failed: {error}");
         }
@@ -458,6 +489,11 @@ fn update_held(held: &mut BTreeSet<u16>, code: u16, value: i32) {
         _ => {}
     }
 }
+
+const SHIFTED_REMINDER: &str = "[REMINDER] Don't forget to run shifted version with:
+cargo run --bin experiment-101 -- --shifted
+ or
+make run-modifier-experiment-101 EXPERIMENT_ARGS=--shifted";
 
 fn run() -> io::Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
@@ -501,6 +537,10 @@ fn run() -> io::Result<()> {
     );
     let result = experiment.run();
     let _ = experiment.log.write(format_args!("FINISH {result:?}"));
+    drop(experiment);
+    if result.is_ok() && !is_shifted {
+        eprintln!("{SHIFTED_REMINDER}");
+    }
     result
 }
 

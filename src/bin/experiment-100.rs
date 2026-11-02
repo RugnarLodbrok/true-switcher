@@ -316,6 +316,11 @@ fn update_held(held: &mut BTreeSet<u16>, code: u16, value: i32) {
     }
 }
 
+const SHIFTED_REMINDER: &str = "[REMINDER] Don't forget to run shifted version with:
+cargo run --bin experiment-100 -- --shifted
+ or
+make run-modifier-experiment-100 EXPERIMENT_ARGS=--shifted";
+
 fn run() -> io::Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args == ["--help"] {
@@ -359,6 +364,10 @@ fn run() -> io::Result<()> {
     );
     let result = experiment.run();
     let _ = experiment.log.write(format_args!("FINISH {result:?}"));
+    drop(experiment);
+    if result.is_ok() && !is_shifted {
+        eprintln!("{SHIFTED_REMINDER}");
+    }
     result
 }
 
