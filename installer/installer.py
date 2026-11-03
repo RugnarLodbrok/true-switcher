@@ -31,6 +31,18 @@ def _systemctl(*args: str, user: bool = False, check: bool = True) -> subprocess
     return _run(['systemctl', *(['--user'] if user else ['--system']), *args], check)
 
 
+def _path_exists(path: Path, is_privileged: bool) -> bool:
+    if not is_privileged:
+        return os.path.lexists(path)
+    script = 'if [ -e "$1" ] || [ -L "$1" ]; then exit 0; else exit 3; fi'
+    result = _run(['sudo', 'sh', '-c', script, 'sh', str(path)], check=False)
+    if result.returncode == 0:
+        return True
+    if result.returncode == 3:
+        return False
+    raise RuntimeError(f'Cannot check {path}: {result.stderr.strip()}')
+
+
 def _check_invocation() -> None:
     if os.geteuid() == 0 or 'SUDO_USER' in os.environ:
         if os.environ.get('TRUE_SWITCHER_INSTALL_ALLOW_SUDO') == '1':
@@ -57,8 +69,8 @@ def _preflight() -> bool:
     _systemctl('show-environment')
     for target in ('graphical-session.target', 'plasma-workspace.target'):
         _systemctl('is-active', '--quiet', target, user=True)
-    for path in (BINARY, SYSTEM_UNIT, USER_UNIT, POLKIT):
-        if os.path.lexists(path):
+    for path, is_privileged in ((BINARY, True), (SYSTEM_UNIT, True), (USER_UNIT, False), (POLKIT, True)):
+        if _path_exists(path, is_privileged):
             raise RuntimeError('Installation path already exists: ' + str(path))
     for name, user in ((SYSTEM_NAME, False), (USER_NAME, True)):
         for verb in ('is-active', 'is-enabled', 'is-failed'):
@@ -196,11 +208,16 @@ def _uninstall() -> None:
             # Missing units are already removed; other failures must be reported.
             if 'not loaded' not in result.stderr and 'not found' not in result.stderr and 'does not exist' not in result.stderr:
                 failures.append(f'{label}: {result.stderr.strip()}')
-    for path, privileged in ((USER_UNIT, False), (SYSTEM_UNIT, True), (POLKIT, True), (BINARY, True)):
-        if not os.path.lexists(path):
+    for path, is_privileged in ((USER_UNIT, False), (SYSTEM_UNIT, True), (POLKIT, True), (BINARY, True)):
+        try:
+            is_present = _path_exists(path, is_privileged)
+        except RuntimeError as error:
+            failures.append(str(error))
+            continue
+        if not is_present:
             print(f'Already absent: {path}')
             continue
-        result = _run((['sudo'] if privileged else []) + ['rm', '-f', str(path)], check=False)
+        result = _run((['sudo'] if is_privileged else []) + ['rm', '-f', str(path)], check=False)
         if result.returncode:
             failures.append(f'{path}: {result.stderr.strip()}')
         else:
