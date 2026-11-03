@@ -1,6 +1,7 @@
 import json
 import os
 import pwd
+import shlex
 import shutil
 import subprocess
 import sys
@@ -19,6 +20,11 @@ SYSTEM_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 
 
 def _run(args: List[str], check: bool = True) -> subprocess.CompletedProcess:
+    executable = args[1] if len(args) > 1 and args[0] == 'sudo' else args[0]
+    if executable == 'systemctl':
+        print('cmd: ' + shlex.join(args))
+    # else:
+        # print('OTHER CMD:' + shlex.join(args))
     try:
         return subprocess.run(args, check=check, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except OSError as error:
@@ -129,6 +135,7 @@ def _install_file(source: Path, destination: Path, privileged: bool) -> None:
     if privileged:
         args += ['-o', 'root', '-g', 'root']
     _run((['sudo'] if privileged else []) + args + [str(source), str(destination)])
+    print(f'created [{"root" if privileged else "user"}] {destination}')
 
 
 def _instructions(policy: bool, skip: bool) -> None:
@@ -140,13 +147,13 @@ matchpathcon -V /usr/local/bin/true-switcher
 
 If either command fails or reports a label mismatch, do not start True Switcher until the issue is resolved.''')
     if policy:
-        print('''You have SELinux on your system. Now you have to do these manual steps to verify that is is not blocking the installation:
-1. `getenforce` — Enforcing blocks denied operations; Permissive logs denials without blocking. If Disabled, stop here: SELinux checks and denials are absent, installation is fine.
-2. `matchpathcon -V /usr/local/bin/true-switcher` — expected exit status 0 and a matching label.
-3. `systemctl --user start true-switcher-session.service` — expected success.
-4. `systemctl --user is-active true-switcher-session.service` — expected active.
-5. `systemctl is-active true-switcher.service` — expected active.
-6. `sudo ausearch -m AVC,USER_AVC -ts recent` — check for denials related to this startup. A denial in Permissive would block the operation in Enforcing.''')
+        print('''[!] You have SELinux on your system. Now you have to do these manual checks to verify that is is not blocking TrueSwitcher:
+    1. `getenforce` — If Disabled, stop here: SELinux checks and denials are absent, installation is fine.
+    2. `matchpathcon -V /usr/local/bin/true-switcher` — expected exit status 0 and a matching label.
+    3. `systemctl --user start true-switcher-session.service` — expected success.
+    4. `systemctl --user is-active true-switcher-session.service` — expected active.
+    5. `systemctl is-active true-switcher.service` — expected active.
+    6. `sudo ausearch -m AVC,USER_AVC -ts recent` — check for denials related to this startup. A denial in Permissive would block the operation in Enforcing.''')
 
 
 def _install() -> None:
@@ -190,7 +197,7 @@ def _install() -> None:
             if result.returncode:
                 print(f'Rollback reload failed: {result.stderr}', file=sys.stderr)
         raise
-    print('Autostart enabled. Start manually: systemctl --user start true-switcher-session.service')
+    print('[SUCCESS] Autostart enabled. Start manually: systemctl --user start true-switcher-session.service')
     _instructions(policy, skip)
 
 
@@ -217,7 +224,8 @@ def _uninstall() -> None:
         if not is_present:
             print(f'Already absent: {path}')
             continue
-        result = _run((['sudo'] if is_privileged else []) + ['rm', '-f', str(path)], check=False)
+        command = (['sudo'] if is_privileged else []) + ['rm', '-f', '--', str(path)]
+        result = _run(command, check=False)
         if result.returncode:
             failures.append(f'{path}: {result.stderr.strip()}')
         else:
@@ -226,7 +234,8 @@ def _uninstall() -> None:
         result = _run(command, check=False)
         if result.returncode:
             failures.append('daemon reload: ' + result.stderr.strip())
-    print('User settings and data were retained in their original locations; the current application does not define persistent settings or data files.')
+    print('[SUCCESS] uninstall done')
+    print('user settings are retained (~/.config/true-switcher)')
     if failures:
         raise RuntimeError('\n'.join(failures))
 
