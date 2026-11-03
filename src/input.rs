@@ -2,6 +2,8 @@ use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -26,6 +28,17 @@ const LOCK_KEYS: [KeyCode; 3] = [
     KeyCode::KEY_NUMLOCK,
     KeyCode::KEY_SCROLLLOCK,
 ];
+const NAVIGATION_KEYS: [KeyCode; 9] = [
+    KeyCode::KEY_UP,
+    KeyCode::KEY_DOWN,
+    KeyCode::KEY_LEFT,
+    KeyCode::KEY_RIGHT,
+    KeyCode::KEY_PAGEUP,
+    KeyCode::KEY_PAGEDOWN,
+    KeyCode::KEY_HOME,
+    KeyCode::KEY_END,
+    KeyCode::KEY_ESC,
+];
 
 #[derive(Default)]
 struct EntryRecording {
@@ -44,6 +57,21 @@ struct Keyboard {
     path: PathBuf,
     device: Box<dyn Source>,
     held: BTreeSet<u16>,
+}
+
+struct Pointer {
+    path: PathBuf,
+    device: Box<dyn PointerSource>,
+}
+
+trait PointerSource {
+    fn events(&mut self) -> io::Result<Vec<InputEvent>>;
+}
+
+impl PointerSource for RawDevice {
+    fn events(&mut self) -> io::Result<Vec<InputEvent>> {
+        Ok(self.fetch_events()?.collect())
+    }
 }
 
 trait Source {
@@ -83,7 +111,10 @@ impl Source for RawDevice {
 
 pub struct Input {
     keyboards: Vec<Keyboard>,
+    pointers: Vec<Pointer>,
     history: History,
+    focus_changes: Arc<AtomicBool>,
+    is_cancel_requested: bool,
     pending: Option<usize>,
     is_original_pause_held: bool,
     recording: Option<EntryRecording>,
@@ -93,8 +124,9 @@ pub struct Input {
 }
 
 impl Input {
-    pub fn open() -> io::Result<Self> {
+    pub fn open(focus_changes: Arc<AtomicBool>) -> io::Result<Self> {
         let mut keyboards = Vec::new();
+        let mut pointers = Vec::new();
         for entry in fs::read_dir("/dev/input")? {
             let entry = entry?;
             if !entry.file_name().as_encoded_bytes().starts_with(b"event") {
@@ -108,17 +140,31 @@ impl Input {
                     continue;
                 }
             };
-            if is_own_keyboard(probe.physical_path(), probe.name()) || !is_keyboard(&probe) {
+            if is_own_keyboard(probe.physical_path(), probe.name()) {
                 continue;
             }
-            let device = open_device(&path)?;
-            let held = device.get_key_state()?.iter().map(|key| key.0).collect();
-            eprintln!("OPEN {} {:?} held={held:?}", path.display(), device.name());
-            keyboards.push(Keyboard {
-                path,
-                device: Box::new(device),
-                held,
-            });
+            if is_pointer(&probe) {
+                match open_read_device(&path) {
+                    Ok(device) => {
+                        eprintln!("OPEN POINTER {} {:?}", path.display(), device.name());
+                        pointers.push(Pointer {
+                            path: path.clone(),
+                            device: Box::new(device),
+                        });
+                    }
+                    Err(error) => eprintln!("Cannot monitor pointer {}: {error}", path.display()),
+                }
+            }
+            if is_keyboard(&probe) {
+                let device = open_device(&path)?;
+                let held = device.get_key_state()?.iter().map(|key| key.0).collect();
+                eprintln!("OPEN {} {:?} held={held:?}", path.display(), device.name());
+                keyboards.push(Keyboard {
+                    path,
+                    device: Box::new(device),
+                    held,
+                });
+            }
         }
         if keyboards.is_empty() {
             return Err(io::Error::new(
@@ -126,9 +172,17 @@ impl Input {
                 "no accessible keyboards",
             ));
         }
+        if pointers.is_empty() {
+            eprintln!(
+                "No accessible pointer devices; mouse clicks and touchpad taps cannot reset history"
+            );
+        }
         let mut input = Self {
             keyboards,
+            pointers,
             history: History::default(),
+            focus_changes,
+            is_cancel_requested: false,
             pending: None,
             is_original_pause_held: false,
             recording: None,
@@ -191,8 +245,9 @@ impl Input {
         self.history.latest_word()
     }
 
-    pub fn read_captured(&mut self) -> io::Result<()> {
-        self.drain()
+    pub fn read_captured(&mut self) -> io::Result<bool> {
+        self.drain()?;
+        Ok(self.take_cancel_request())
     }
 
     pub fn leave(&mut self) -> io::Result<()> {
@@ -259,6 +314,8 @@ impl Input {
                     self.process(index, event)?;
                 }
             }
+            count += self.drain_pointers()?;
+            self.process_focus_change();
             if count == 0 {
                 return Ok(());
             }
@@ -279,26 +336,36 @@ impl Input {
         }
         let key = KeyCode::new(event.code());
         let value = event.value();
-        let keyboard = &mut self.keyboards[index];
-        eprintln!(
-            "EVDEV {} {key:?} value={value} kernel_time={:?} grabbed={}",
-            keyboard.path.display(),
-            event.timestamp(),
-            keyboard.device.is_grabbed()
-        );
-        match value {
-            0 => {
-                keyboard.held.remove(&key.0);
+        let (path, is_grabbed) = {
+            let keyboard = &mut self.keyboards[index];
+            eprintln!(
+                "EVDEV {} {key:?} value={value} kernel_time={:?} grabbed={}",
+                keyboard.path.display(),
+                event.timestamp(),
+                keyboard.device.is_grabbed()
+            );
+            match value {
+                0 => {
+                    keyboard.held.remove(&key.0);
+                }
+                1 | 2 => {
+                    keyboard.held.insert(key.0);
+                }
+                _ => {}
             }
-            1 | 2 => {
-                keyboard.held.insert(key.0);
-            }
-            _ => {}
-        }
+            (keyboard.path.clone(), keyboard.device.is_grabbed())
+        };
         if let Some(recording) = &mut self.recording {
             recording.record(index, key.0, value);
         }
-        if self.is_captured || keyboard.device.is_grabbed() {
+        let is_tab_separator = key == KeyCode::KEY_TAB && !self.has_shortcut_modifier();
+        let is_pointer_click = value == 1 && is_pointer_press(key.0);
+        if (self.should_reset_for_key(key, value) || is_pointer_click)
+            && (!is_tab_separator || self.is_captured)
+        {
+            self.request_history_reset();
+        }
+        if self.is_captured || is_grabbed {
             return Ok(());
         }
         if key == KeyCode::KEY_PAUSE {
@@ -319,7 +386,7 @@ impl Input {
             }
             return Ok(());
         }
-        let lines = self.history.process(&keyboard.path, key, value);
+        let lines = self.history.process(&path, key, value);
         if !lines.is_empty() {
             let stdout = io::stdout();
             let mut output = stdout.lock();
@@ -329,6 +396,90 @@ impl Input {
             output.flush()?;
         }
         Ok(())
+    }
+
+    fn drain_pointers(&mut self) -> io::Result<usize> {
+        let mut count = 0;
+        for index in 0..self.pointers.len() {
+            let events = match self.pointers[index].device.events() {
+                Ok(events) => events,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            for event in events {
+                if event.event_type() == EventType::SYNCHRONIZATION
+                    && event.code() == SynchronizationCode::SYN_DROPPED.0
+                {
+                    self.request_history_reset();
+                    return Err(io::Error::other(format!(
+                        "{}: SYN_DROPPED",
+                        self.pointers[index].path.display()
+                    )));
+                }
+                if event.event_type() == EventType::KEY
+                    && event.value() == 1
+                    && is_pointer_press(event.code())
+                {
+                    count += 1;
+                    self.request_history_reset();
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    fn process_focus_change(&mut self) {
+        if self.focus_changes.swap(false, Ordering::AcqRel) {
+            self.request_history_reset();
+        }
+    }
+
+    fn should_reset_for_key(&self, key: KeyCode, value: i32) -> bool {
+        if !matches!(value, 1 | 2) {
+            return false;
+        }
+        if NAVIGATION_KEYS.contains(&key) || key == KeyCode::KEY_TAB || key == KeyCode::KEY_DELETE {
+            return true;
+        }
+        self.has_shortcut_modifier() && !MODIFIERS.contains(&key)
+    }
+
+    fn has_shortcut_modifier(&self) -> bool {
+        self.keyboards.iter().any(|keyboard| {
+            keyboard.held.iter().any(|&code| {
+                matches!(
+                    KeyCode::new(code),
+                    KeyCode::KEY_LEFTCTRL
+                        | KeyCode::KEY_RIGHTCTRL
+                        | KeyCode::KEY_LEFTALT
+                        | KeyCode::KEY_RIGHTALT
+                        | KeyCode::KEY_LEFTMETA
+                        | KeyCode::KEY_RIGHTMETA
+                )
+            })
+        })
+    }
+
+    fn request_history_reset(&mut self) {
+        self.history.reset();
+        if self.is_captured {
+            self.is_cancel_requested = true;
+        }
+    }
+
+    pub fn reset_history(&mut self) {
+        self.history.reset();
+    }
+
+    pub fn take_cancel_request(&mut self) -> bool {
+        std::mem::take(&mut self.is_cancel_requested)
     }
 
     fn write_source(&mut self, index: usize, key: KeyCode, value: i32) -> io::Result<()> {
@@ -499,6 +650,17 @@ fn is_keyboard(device: &RawDevice) -> bool {
     })
 }
 
+fn is_pointer(device: &RawDevice) -> bool {
+    device.supported_keys().is_some_and(|keys| {
+        (KeyCode::BTN_LEFT.0..=KeyCode::BTN_TASK.0).any(|code| keys.contains(KeyCode::new(code)))
+            || keys.contains(KeyCode::BTN_TOUCH)
+    })
+}
+
+fn is_pointer_press(code: u16) -> bool {
+    (KeyCode::BTN_LEFT.0..=KeyCode::BTN_TASK.0).contains(&code) || code == KeyCode::BTN_TOUCH.0
+}
+
 fn open_device(path: &Path) -> io::Result<RawDevice> {
     let file = OpenOptions::new()
         .read(true)
@@ -510,6 +672,18 @@ fn open_device(path: &Path) -> io::Result<RawDevice> {
                 format!("{} requires read/write access: {error}", path.display()),
             )
         })?;
+    let configuration = Device::from_fd(file.try_clone()?.into())?;
+    configuration.set_nonblocking(true)?;
+    RawDevice::try_from(file)
+}
+
+fn open_read_device(path: &Path) -> io::Result<RawDevice> {
+    let file = OpenOptions::new().read(true).open(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("{} requires read access: {error}", path.display()),
+        )
+    })?;
     let configuration = Device::from_fd(file.try_clone()?.into())?;
     configuration.set_nonblocking(true)?;
     RawDevice::try_from(file)
@@ -638,7 +812,10 @@ mod tests {
             .collect();
         Input {
             keyboards,
+            pointers: Vec::new(),
             history: History::default(),
+            focus_changes: Arc::new(AtomicBool::new(false)),
+            is_cancel_requested: false,
             pending: Some(0),
             is_original_pause_held: true,
             recording: None,

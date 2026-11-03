@@ -10,3 +10,4 @@ path = "src-learn/main.rs"
 
 [dependencies]
 evdev = "0.13.2"
+zbus = "5"

@@ -1,4 +1,5 @@
 mod environment;
+mod focus;
 mod history;
 mod input;
 pub mod output;
@@ -11,7 +12,8 @@ use std::time::Duration;
 
 fn run() -> io::Result<()> {
     let mut keyboard = output::KeyboardOutput::new()?;
-    let mut input = input::Input::open()?;
+    let focus_service = focus::FocusService::start()?;
+    let mut input = input::Input::open(focus_service.changes())?;
     let desktop = environment::KdePlasma;
 
     // Give the desktop time to discover the uinput keyboard before accepting Pause.
@@ -21,25 +23,35 @@ fn run() -> io::Result<()> {
     loop {
         input.wait_for_request()?;
         input.enter()?;
+        let is_cancelled = AtomicBool::new(input.read_captured()?);
         let word = input.latest_word().cloned();
-        let is_cancelled = AtomicBool::new(false);
         thread::scope(|scope| -> io::Result<()> {
             let worker =
                 scope.spawn(|| correct_word(word.as_ref(), &mut keyboard, &desktop, &is_cancelled));
             let mut read_error = None;
             while !worker.is_finished() {
-                if let Err(error) = input.read_captured() {
-                    is_cancelled.store(true, Ordering::Relaxed);
-                    read_error = Some(error);
-                    break;
+                match input.read_captured() {
+                    Ok(true) => is_cancelled.store(true, Ordering::Relaxed),
+                    Ok(false) => {}
+                    Err(error) => {
+                        is_cancelled.store(true, Ordering::Relaxed);
+                        read_error = Some(error);
+                        break;
+                    }
                 }
                 thread::sleep(Duration::from_millis(5));
+            }
+            if input.read_captured()? {
+                is_cancelled.store(true, Ordering::Relaxed);
             }
             let result = worker
                 .join()
                 .map_err(|_| io::Error::other("correction thread panicked"))?;
             if let Some(error) = read_error {
                 return Err(error);
+            }
+            if is_cancelled.load(Ordering::Relaxed) {
+                input.reset_history();
             }
             result
         })?;
