@@ -1,3 +1,4 @@
+mod config;
 mod environment;
 mod focus;
 mod history;
@@ -13,10 +14,10 @@ use std::time::Duration;
 fn run() -> io::Result<()> {
     let mut keyboard = output::KeyboardOutput::new()?;
     let focus_service = focus::FocusService::start()?;
-    let mut input = input::Input::open(focus_service.changes())?;
+    let mut input = input::Input::open(focus_service.changes(), config::switch_key())?;
     let desktop = environment::KdePlasma;
 
-    // Give the desktop time to discover the uinput keyboard before accepting Pause.
+    // Give the desktop time to discover the uinput keyboard before accepting input.
     thread::sleep(Duration::from_millis(500));
     eprintln!("Ready");
 

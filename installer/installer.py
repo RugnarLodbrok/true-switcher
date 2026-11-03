@@ -13,10 +13,17 @@ ROOT = Path(__file__).resolve().parent.parent
 BINARY = Path('/usr/local/bin/true-switcher')
 SYSTEM_UNIT = Path('/etc/systemd/system/true-switcher.service')
 USER_UNIT = Path.home() / '.config/systemd/user/true-switcher-session.service'
+USER_CONFIG = Path.home() / '.config/true-switcher/config.toml'
 POLKIT = Path('/etc/polkit-1/rules.d/49-true-switcher.rules')
 SYSTEM_NAME = 'true-switcher.service'
 USER_NAME = 'true-switcher-session.service'
 SYSTEM_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+DEFAULT_USER_CONFIG = '''# Restart the service to apply changes:
+# systemctl --user restart true-switcher-session.service
+# Examples: KEY_PAUSE, KEY_CAPSLOCK, KEY_RIGHTCTRL, KEY_RIGHTSHIFT,
+# KEY_RIGHTALT, KEY_RIGHTMETA, KEY_SCROLLLOCK, KEY_MENU, KEY_F12, KEY_F13
+switch_key = "KEY_PAUSE"
+'''
 
 
 def _run(args: List[str], check: bool = True) -> subprocess.CompletedProcess:
@@ -86,6 +93,16 @@ def _preflight() -> bool:
             if result.returncode not in (1, 3, 4):
                 raise RuntimeError(f'Cannot determine {name} state: {result.stderr.strip()}')
     return _policy_available()
+
+
+def _ensure_user_config() -> None:
+    USER_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with USER_CONFIG.open('x', encoding='utf-8') as config:
+            config.write(DEFAULT_USER_CONFIG)
+    except FileExistsError:
+        return
+    print(f'created user config {USER_CONFIG}')
 
 
 def _contents() -> tuple:
@@ -158,6 +175,7 @@ If either command fails or reports a label mismatch, do not start True Switcher 
 
 def _install() -> None:
     policy = _preflight()
+    _ensure_user_config()
     skip = os.environ.get('TRUE_SWITCHER_INSTALL_SELINUX_SKIP') == '1'
     created = []
     enable_attempted = False

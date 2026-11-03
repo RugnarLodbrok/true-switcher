@@ -114,9 +114,10 @@ pub struct Input {
     pointers: Vec<Pointer>,
     history: History,
     focus_changes: Arc<AtomicBool>,
+    switch_key: KeyCode,
     is_cancel_requested: bool,
     pending: Option<usize>,
-    is_original_pause_held: bool,
+    is_original_switch_key_held: bool,
     recording: Option<EntryRecording>,
     repair: BTreeSet<(usize, u16)>,
     repair_prepared: BTreeSet<(usize, u16)>,
@@ -124,7 +125,7 @@ pub struct Input {
 }
 
 impl Input {
-    pub fn open(focus_changes: Arc<AtomicBool>) -> io::Result<Self> {
+    pub fn open(focus_changes: Arc<AtomicBool>, switch_key: KeyCode) -> io::Result<Self> {
         let mut keyboards = Vec::new();
         let mut pointers = Vec::new();
         for entry in fs::read_dir("/dev/input")? {
@@ -182,9 +183,10 @@ impl Input {
             pointers,
             history: History::default(),
             focus_changes,
+            switch_key,
             is_cancel_requested: false,
             pending: None,
-            is_original_pause_held: false,
+            is_original_switch_key_held: false,
             recording: None,
             repair: BTreeSet::new(),
             repair_prepared: BTreeSet::new(),
@@ -209,7 +211,7 @@ impl Input {
     }
 
     pub fn enter(&mut self) -> io::Result<()> {
-        let mut is_pause_reset = false;
+        let mut is_switch_key_reset = false;
         let mut attempt = 0_u64;
         loop {
             self.wait_ordinary()?;
@@ -218,10 +220,13 @@ impl Input {
             self.recording = Some(EntryRecording::default());
             self.release_locks()?;
             self.release_modifiers()?;
-            if !is_pause_reset {
-                self.write_source(self.pending.unwrap(), KeyCode::KEY_PAUSE, 0)?;
-                is_pause_reset = true;
-                self.is_original_pause_held = false;
+            if !is_switch_key_reset {
+                let source = self.pending.unwrap();
+                if self.keyboards[source].held.contains(&self.switch_key.0) {
+                    self.write_source(source, self.switch_key, 0)?;
+                }
+                is_switch_key_reset = true;
+                self.is_original_switch_key_held = false;
             }
             self.drain()?;
             self.grab()?;
@@ -277,13 +282,13 @@ impl Input {
         eprintln!("WAIT_ORDINARY begin");
         loop {
             self.drain()?;
-            let pause_source = self.pending.unwrap();
+            let switch_source = self.pending.unwrap();
             let is_held = self.keyboards.iter().enumerate().any(|(index, keyboard)| {
                 keyboard.held.iter().any(|&code| {
                     !MODIFIERS.contains(&KeyCode::new(code))
-                        && !(self.is_original_pause_held
-                            && index == pause_source
-                            && code == KeyCode::KEY_PAUSE.0)
+                        && !(self.is_original_switch_key_held
+                            && index == switch_source
+                            && code == self.switch_key.0)
                 })
             });
             if !is_held {
@@ -368,21 +373,16 @@ impl Input {
         if self.is_captured || is_grabbed {
             return Ok(());
         }
-        if key == KeyCode::KEY_PAUSE {
+        if key == self.switch_key {
             if value == 0 && self.pending == Some(index) {
-                self.is_original_pause_held = false;
+                self.is_original_switch_key_held = false;
             }
             if value == 1
                 && self.pending.is_none()
-                && !self.keyboards.iter().any(|keyboard| {
-                    keyboard
-                        .held
-                        .iter()
-                        .any(|&code| MODIFIERS.contains(&KeyCode::new(code)))
-                })
+                && !self.has_other_switch_modifiers(index, key)
             {
                 self.pending = Some(index);
-                self.is_original_pause_held = true;
+                self.is_original_switch_key_held = true;
             }
             return Ok(());
         }
@@ -463,6 +463,15 @@ impl Input {
                         | KeyCode::KEY_LEFTMETA
                         | KeyCode::KEY_RIGHTMETA
                 )
+            })
+        })
+    }
+
+    fn has_other_switch_modifiers(&self, source: usize, switch_key: KeyCode) -> bool {
+        self.keyboards.iter().enumerate().any(|(index, keyboard)| {
+            keyboard.held.iter().any(|&code| {
+                MODIFIERS.contains(&KeyCode::new(code))
+                    && !(index == source && code == switch_key.0)
             })
         })
     }
@@ -815,9 +824,10 @@ mod tests {
             pointers: Vec::new(),
             history: History::default(),
             focus_changes: Arc::new(AtomicBool::new(false)),
+            switch_key: KeyCode::KEY_PAUSE,
             is_cancel_requested: false,
             pending: Some(0),
-            is_original_pause_held: true,
+            is_original_switch_key_held: true,
             recording: None,
             repair: BTreeSet::new(),
             repair_prepared: BTreeSet::new(),
