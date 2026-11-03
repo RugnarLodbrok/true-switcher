@@ -10,7 +10,7 @@ pub struct Stroke {
     pub shift: bool,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Word {
     pub strokes: Vec<Stroke>,
     pub trailing_spaces: usize,
