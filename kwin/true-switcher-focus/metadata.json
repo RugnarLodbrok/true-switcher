@@ -1,0 +1,13 @@
+{
+    "KPlugin": {
+        "Id": "true-switcher-focus",
+        "Name": "True Switcher Focus Tracking",
+        "Description": "Reports active window changes to True Switcher",
+        "Version": "1.0",
+        "License": "MIT",
+        "Category": "Window Management"
+    },
+    "KPackageStructure": "KWin/Script",
+    "X-Plasma-API": "javascript",
+    "X-Plasma-MainScript": "code/main.js"
+}
