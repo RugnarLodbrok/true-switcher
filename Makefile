@@ -44,3 +44,11 @@ fmt-check:
 
 test:
 	cargo test --bin true-switcher
+
+.PHONY: install uninstall
+install uninstall:
+	./installer/installer.sh $@
+
+.PHONY: build
+build:
+	cargo build --release --bin true-switcher
