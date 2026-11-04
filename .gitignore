@@ -1,3 +1,14 @@
 mahou_reference
 context
 src-learn
+
+# Build artifacts
+/target/
+**/*.rs.bk
+
+# Experiment logs
+/experiment-*.log
+
+# Python cache
+__pycache__/
+*.py[cod]
