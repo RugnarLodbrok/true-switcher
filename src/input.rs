@@ -125,7 +125,11 @@ pub struct Input {
 }
 
 impl Input {
-    pub fn open(focus_changes: Arc<AtomicBool>, switch_key: KeyCode) -> io::Result<Self> {
+    pub fn open(
+        focus_changes: Arc<AtomicBool>,
+        switch_key: KeyCode,
+        layouts: crate::layout::LayoutTracker,
+    ) -> io::Result<Self> {
         let mut keyboards = Vec::new();
         let mut pointers = Vec::new();
         for entry in fs::read_dir("/dev/input")? {
@@ -181,7 +185,7 @@ impl Input {
         let mut input = Self {
             keyboards,
             pointers,
-            history: History::default(),
+            history: History::with_layouts(layouts),
             focus_changes,
             switch_key,
             is_cancel_requested: false,
@@ -248,6 +252,14 @@ impl Input {
 
     pub fn latest_word(&self) -> Option<&crate::history::Word> {
         self.history.latest_word()
+    }
+
+    pub fn previous_word(&self) -> Option<&crate::history::Word> {
+        self.history.previous_word()
+    }
+
+    pub fn set_latest_layout(&mut self, layout: Option<Arc<crate::layout::Layout>>) {
+        self.history.set_latest_layout(layout);
     }
 
     pub fn read_captured(&mut self) -> io::Result<bool> {
@@ -377,9 +389,7 @@ impl Input {
             if value == 0 && self.pending == Some(index) {
                 self.is_original_switch_key_held = false;
             }
-            if value == 1
-                && self.pending.is_none()
-                && !self.has_other_switch_modifiers(index, key)
+            if value == 1 && self.pending.is_none() && !self.has_other_switch_modifiers(index, key)
             {
                 self.pending = Some(index);
                 self.is_original_switch_key_held = true;

@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use evdev::KeyCode;
 
@@ -14,6 +15,26 @@ pub struct Stroke {
 pub struct Word {
     pub strokes: Vec<Stroke>,
     pub trailing_spaces: usize,
+    pub layouts: Vec<Option<Arc<crate::layout::Layout>>>,
+}
+
+impl Word {
+    pub fn text(&self) -> Option<String> {
+        if self.layouts.len() != self.strokes.len() {
+            return None;
+        }
+        let mut text = String::new();
+        let mut start = 0;
+        while start < self.strokes.len() {
+            let layout = self.layouts[start].as_ref()?;
+            let end = (start + 1..self.strokes.len())
+                .find(|&index| self.layouts[index].as_ref() != Some(layout))
+                .unwrap_or(self.strokes.len());
+            text.push_str(&layout.text(&self.strokes[start..end])?);
+            start = end;
+        }
+        Some(text)
+    }
 }
 
 impl fmt::Display for Word {
@@ -34,12 +55,33 @@ impl fmt::Display for Word {
 #[derive(Default)]
 pub struct History {
     words: Vec<Word>,
+    layouts: crate::layout::LayoutTracker,
     // Track modifiers per keyboard: releasing Shift on one device must not
     // release a Shift still held on another one.
     modifiers: HashSet<(PathBuf, KeyCode)>,
 }
 
 impl History {
+    pub fn with_layouts(layouts: crate::layout::LayoutTracker) -> Self {
+        Self {
+            layouts,
+            ..Self::default()
+        }
+    }
+
+    pub fn previous_word(&self) -> Option<&Word> {
+        self.words
+            .len()
+            .checked_sub(2)
+            .and_then(|index| self.words.get(index))
+    }
+
+    pub fn set_latest_layout(&mut self, layout: Option<Arc<crate::layout::Layout>>) {
+        if let Some(word) = self.words.last_mut() {
+            word.layouts = vec![layout; word.strokes.len()];
+        }
+    }
+
     pub fn latest_word(&self) -> Option<&Word> {
         self.words.last()
     }
@@ -93,11 +135,9 @@ impl History {
                     self.words.push(Word::default());
                 }
                 let shift = self.modifiers.iter().any(|(_, key)| is_shift(*key));
-                self.words
-                    .last_mut()
-                    .unwrap()
-                    .strokes
-                    .push(Stroke { key, shift });
+                let word = self.words.last_mut().unwrap();
+                word.strokes.push(Stroke { key, shift });
+                word.layouts.push(self.layouts.current());
                 Vec::new()
             }
             _ => Vec::new(),
@@ -117,6 +157,7 @@ impl History {
             return None;
         }
         word.strokes.pop();
+        word.layouts.pop();
         if word.strokes.is_empty() {
             self.words.pop();
             return Some(
@@ -160,6 +201,48 @@ pub(crate) fn is_text_key(key: KeyCode) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn layout(name: &str) -> Arc<crate::layout::Layout> {
+        Arc::new(crate::layout::Layout {
+            name: name.into(),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn previous_word_keeps_its_layout_and_backspace_keeps_layouts_aligned() {
+        let layouts = crate::layout::LayoutTracker::default();
+        layouts.set(Some(layout("us")));
+        let mut history = History::with_layouts(layouts.clone());
+        press(&mut history, KeyCode::KEY_A);
+        press(&mut history, KeyCode::KEY_SPACE);
+        layouts.set(Some(layout("ru")));
+        press(&mut history, KeyCode::KEY_A);
+        press(&mut history, KeyCode::KEY_B);
+        assert_eq!(
+            history.previous_word().unwrap().text().as_deref(),
+            Some("a")
+        );
+        assert_eq!(history.latest_word().unwrap().text().as_deref(), Some("фи"));
+        press(&mut history, KeyCode::KEY_BACKSPACE);
+        assert_eq!(history.latest_word().unwrap().text().as_deref(), Some("ф"));
+        history.set_latest_layout(Some(layout("us")));
+        assert_eq!(history.latest_word().unwrap().text().as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn layout_changes_within_word_preserve_each_typed_character() {
+        let layouts = crate::layout::LayoutTracker::default();
+        layouts.set(Some(layout("us")));
+        let mut history = History::with_layouts(layouts.clone());
+        press(&mut history, KeyCode::KEY_A);
+        layouts.set(Some(layout("ru")));
+        press(&mut history, KeyCode::KEY_A);
+        assert_eq!(history.latest_word().unwrap().text().as_deref(), Some("aф"));
+        layouts.set(None);
+        press(&mut history, KeyCode::KEY_B);
+        assert!(history.latest_word().unwrap().text().is_none());
+    }
 
     fn event(history: &mut History, key: KeyCode, value: i32) -> Vec<String> {
         history.process(Path::new("keyboard"), key, value)
