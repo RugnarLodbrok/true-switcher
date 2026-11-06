@@ -2,6 +2,8 @@ use std::env;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, params};
@@ -25,18 +27,54 @@ struct Record {
     b: String,
 }
 
-pub fn record_switch(
-    previous: Option<&Word>,
-    word: Option<&Word>,
-    target: &Layout,
-    time: SystemTime,
+pub struct Statistics {
+    sender: Sender<Record>,
+}
+
+impl Statistics {
+    pub fn start() -> Self {
+        Self::start_with_writer(store)
+    }
+
+    fn start_with_writer(
+        writer: impl FnMut(&Record) -> Result<(), Box<dyn std::error::Error>> + Send + 'static,
+    ) -> Self {
+        let (sender, receiver) = mpsc::channel();
+        // Dropping the handle detaches the worker; shutdown does not wait for queued records.
+        if let Err(error) = thread::Builder::new()
+            .name("statistics".into())
+            .spawn(move || write_records(receiver, writer))
+        {
+            eprintln!("true-switcher: cannot start statistics thread: {error}");
+        }
+        Self { sender }
+    }
+
+    pub fn record_switch(
+        &self,
+        previous: Option<&Word>,
+        word: Option<&Word>,
+        target: &Layout,
+        time: SystemTime,
+    ) {
+        let Some(record) = make_record(previous, word, target, time) else {
+            eprintln!("true-switcher: skipping statistics: cannot convert word to text");
+            return;
+        };
+        if let Err(error) = self.sender.send(record) {
+            eprintln!("true-switcher: statistics queue: {error}");
+        }
+    }
+}
+
+fn write_records(
+    receiver: Receiver<Record>,
+    mut writer: impl FnMut(&Record) -> Result<(), Box<dyn std::error::Error>>,
 ) {
-    let Some(record) = make_record(previous, word, target, time) else {
-        eprintln!("true-switcher: skipping statistics: cannot convert word to text");
-        return;
-    };
-    if let Err(error) = store(&record) {
-        eprintln!("true-switcher: statistics database: {error}");
+    for record in receiver {
+        if let Err(error) = writer(&record) {
+            eprintln!("true-switcher: statistics database: {error}");
+        }
     }
 }
 
@@ -102,6 +140,8 @@ mod tests {
     use evdev::KeyCode;
     use std::sync::Arc;
     use std::time::Duration;
+
+    const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
     fn layout(name: &str) -> Arc<Layout> {
         Arc::new(Layout {
@@ -209,5 +249,120 @@ mod tests {
         connection.execute_batch("PRAGMA query_only = ON").unwrap();
         let record = make_record(None, None, &layout("us"), UNIX_EPOCH).unwrap();
         assert!(insert(&connection, &record).is_err());
+    }
+
+    #[test]
+    fn queues_switch_snapshot_despite_replay_cancellation_or_error() {
+        for is_cancelled in [true, false] {
+            let (sent, received) = mpsc::channel();
+            let statistics = Statistics::start_with_writer(move |record| {
+                sent.send(Record {
+                    timestamp: record.timestamp,
+                    prev: record.prev.clone(),
+                    a: record.a.clone(),
+                    b: record.b.clone(),
+                })
+                .unwrap();
+                Ok(())
+            });
+            let previous = word("ru");
+            let original = word("us");
+            let time = UNIX_EPOCH + Duration::from_secs(123);
+            let result = crate::switch_and_replay(
+                || Ok(()),
+                || statistics.record_switch(Some(&previous), Some(&original), &layout("ru"), time),
+                || Err(io::Error::other("replay failed")),
+                &std::sync::atomic::AtomicBool::new(is_cancelled),
+            );
+            assert_eq!(result.is_ok(), is_cancelled);
+            assert_eq!(
+                received.recv_timeout(TEST_TIMEOUT).unwrap(),
+                make_record(Some(&previous), Some(&original), &layout("ru"), time).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn replay_and_shutdown_do_not_wait_for_database_write() {
+        let (started, writing) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        let (finished, completed) = mpsc::channel();
+        let statistics = Statistics::start_with_writer(move |_| {
+            started.send(()).unwrap();
+            blocked.recv_timeout(TEST_TIMEOUT).unwrap();
+            finished.send(()).unwrap();
+            Ok(())
+        });
+        crate::switch_and_replay(
+            || Ok(()),
+            || {
+                statistics.record_switch(None, None, &layout("us"), UNIX_EPOCH);
+                writing.recv_timeout(TEST_TIMEOUT).unwrap();
+            },
+            || {
+                assert!(matches!(
+                    completed.try_recv(),
+                    Err(mpsc::TryRecvError::Empty)
+                ));
+                Ok(())
+            },
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        drop(statistics);
+        release.send(()).unwrap();
+        completed.recv_timeout(TEST_TIMEOUT).unwrap();
+    }
+
+    #[test]
+    fn database_error_does_not_stop_replay_or_later_writes() {
+        let (sent, received) = mpsc::channel();
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch("PRAGMA query_only = ON").unwrap();
+        let statistics = Statistics::start_with_writer(move |record| {
+            let result = insert(&connection, record);
+            sent.send(result.is_ok()).unwrap();
+            connection.execute_batch("PRAGMA query_only = OFF")?;
+            result.map_err(Into::into)
+        });
+        for is_expected_success in [false, true] {
+            let mut is_replayed = false;
+            crate::switch_and_replay(
+                || Ok(()),
+                || {
+                    statistics.record_switch(None, None, &layout("us"), UNIX_EPOCH);
+                    assert_eq!(
+                        received.recv_timeout(TEST_TIMEOUT).unwrap(),
+                        is_expected_success
+                    );
+                },
+                || {
+                    is_replayed = true;
+                    Ok(())
+                },
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+            .unwrap();
+            assert!(is_replayed);
+        }
+    }
+
+    #[test]
+    fn disconnected_statistics_queue_does_not_stop_replay() {
+        let (sender, receiver) = mpsc::channel();
+        drop(receiver);
+        let statistics = Statistics { sender };
+        let mut is_replayed = false;
+        crate::switch_and_replay(
+            || Ok(()),
+            || statistics.record_switch(None, None, &layout("us"), UNIX_EPOCH),
+            || {
+                is_replayed = true;
+                Ok(())
+            },
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(is_replayed);
     }
 }

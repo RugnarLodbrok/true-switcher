@@ -18,6 +18,7 @@ fn run() -> io::Result<()> {
     let mut keyboard = output::KeyboardOutput::new()?;
     let focus_service = focus::FocusService::start()?;
     let layouts = layout::LayoutTracker::start();
+    let statistics = statistics::Statistics::start();
     let mut input = input::Input::open(focus_service.changes(), config::switch_key(), layouts)?;
     let desktop = environment::KdePlasma;
 
@@ -38,6 +39,7 @@ fn run() -> io::Result<()> {
                     word.as_ref(),
                     &mut keyboard,
                     &desktop,
+                    &statistics,
                     &is_cancelled,
                 )
             });
@@ -79,6 +81,7 @@ fn correct_word(
     word: Option<&history::Word>,
     keyboard: &mut output::KeyboardOutput,
     desktop: &environment::KdePlasma,
+    statistics: &statistics::Statistics,
     is_cancelled: &AtomicBool,
 ) -> io::Result<Option<Arc<layout::Layout>>> {
     if is_cancelled.load(Ordering::Relaxed) {
@@ -93,7 +96,7 @@ fn correct_word(
     }
     switch_and_replay(
         || desktop.switch_to_next_layout(),
-        || record_switch(previous, word),
+        || record_switch(statistics, previous, word),
         || {
             eprintln!("SYNTHETIC replay");
             if let Some(word) = word {
@@ -106,13 +109,14 @@ fn correct_word(
 }
 
 fn record_switch(
+    statistics: &statistics::Statistics,
     previous: Option<&history::Word>,
     word: Option<&history::Word>,
 ) -> Option<Arc<layout::Layout>> {
     let time = SystemTime::now();
     match layout::current_layout() {
         Ok(target) => {
-            statistics::record_switch(previous, word, &target, time);
+            statistics.record_switch(previous, word, &target, time);
             Some(target)
         }
         Err(error) => {
