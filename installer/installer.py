@@ -27,6 +27,7 @@ DEFAULT_USER_CONFIG = '''# Restart the service to apply changes:
 # Examples: KEY_PAUSE, KEY_CAPSLOCK, KEY_RIGHTCTRL, KEY_RIGHTSHIFT,
 # KEY_RIGHTALT, KEY_RIGHTMETA, KEY_SCROLLLOCK, KEY_MENU, KEY_F12, KEY_F13
 switch_key = "KEY_PAUSE"
+manual_switch_sound = false
 '''
 
 
@@ -132,6 +133,7 @@ Type=simple
 User={user}
 SupplementaryGroups=input
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{os.getuid()}/bus
+Environment=XDG_RUNTIME_DIR=/run/user/{os.getuid()}
 Environment=PATH={SYSTEM_PATH}
 ExecStart={BINARY}
 '''

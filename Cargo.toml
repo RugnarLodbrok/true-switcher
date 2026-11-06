@@ -11,6 +11,10 @@ path = "src-learn/main.rs"
 
 [dependencies]
 evdev = "0.13.2"
+libpulse-binding = "2"
+libpulse-simple-binding = "2"
 rusqlite = { version = "0.41.1", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+toml = "1"
 xkbcommon = "0.9.0"
 zbus = "5"

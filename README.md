@@ -35,17 +35,17 @@ Automatic layout switching is not supported for now.
 On Fedora:
 
 ```sh
-sudo dnf install libxkbcommon-devel
+sudo dnf install libxkbcommon-devel pulseaudio-libs-devel
 ```
 
 On Bazzite:
 
 ```sh
-rpm-ostree install libxkbcommon-devel
+rpm-ostree install libxkbcommon-devel pulseaudio-libs-devel
 ```
 
 Reboot after installing the package on Bazzite to activate the new deployment.
-The development package is only needed to build from source; users of prebuilt binaries need the runtime library and XKB layout data.
+The development packages are only needed to build from source; users of prebuilt binaries need the runtime libraries and XKB layout data.
 
 ## Installation
 
@@ -67,6 +67,14 @@ True Switcher shows an icon in the KDE Plasma system tray while the process is r
 Its menu contains `Reload`, which restarts the system service `true-switcher.service` without waiting for the restart to finish. The icon briefly disappears and the new process reads `~/.config/true-switcher/config.toml` again.
 
 If the configuration cannot be read, or `switch_key` is missing or invalid, the program uses `KEY_PAUSE` and sends a desktop notification. A failed restart request is also logged and reported in a notification.
+
+To play a short sound after a successful manual switch, set the following in `~/.config/true-switcher/config.toml` and select Reload in the tray menu:
+
+```toml
+manual_switch_sound = false
+```
+
+Change `false` to `true` to enable sound. When the option is missing, sound is disabled. Playback errors are logged and do not interrupt switching. Linux playback requires a PulseAudio-compatible server such as `pipewire-pulse`.
 The tray registers again when Plasma's tray service becomes available or changes its D-Bus owner.
 
 The installer copies the SVG from `icon/` to `/usr/local/share/true-switcher/icons/` and allows `restart` for this service in its Polkit rule. Runs from the source tree can use `icon/` directly; `Reload` always targets the installed system service.

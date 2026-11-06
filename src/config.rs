@@ -12,6 +12,7 @@ const DEFAULT_SWITCH_KEY: KeyCode = KeyCode::KEY_PAUSE;
 
 pub struct Configuration {
     pub switch_key: KeyCode,
+    pub is_manual_switch_sound: bool,
     pub warning: Option<String>,
 }
 
@@ -26,6 +27,17 @@ pub fn load() -> Configuration {
 }
 
 fn from_contents(contents: Result<String, String>) -> Configuration {
+    let is_manual_switch_sound = contents
+        .as_ref()
+        .ok()
+        .and_then(|text| {
+            text.parse::<toml::Table>().ok().and_then(|table| {
+                table
+                    .get("manual_switch_sound")
+                    .and_then(toml::Value::as_bool)
+            })
+        })
+        .unwrap_or(false);
     let result = contents.and_then(|contents| {
         parse_switch_key(&contents)
             .ok_or_else(|| "Missing or invalid switch_key in config.toml.".to_owned())
@@ -33,10 +45,12 @@ fn from_contents(contents: Result<String, String>) -> Configuration {
     match result {
         Ok(switch_key) => Configuration {
             switch_key,
+            is_manual_switch_sound,
             warning: None,
         },
         Err(error) => Configuration {
             switch_key: DEFAULT_SWITCH_KEY,
+            is_manual_switch_sound,
             warning: Some(format!(
                 "{error} Using KEY_PAUSE. Fix the configuration and select Reload in the tray menu."
             )),
@@ -81,6 +95,20 @@ mod tests {
         let config = from_contents(Ok("switch_key = \"KEY_F12\" # comment".into()));
         assert_eq!(config.switch_key, KeyCode::KEY_F12);
         assert!(config.warning.is_none());
+    }
+
+    #[test]
+    fn manual_sound_is_disabled_by_default_and_enabled_only_by_true() {
+        for (value, expected) in [
+            ("", false),
+            ("manual_switch_sound = false", false),
+            ("manual_switch_sound = true", true),
+            ("manual_switch_sound = \"true\"", false),
+        ] {
+            let config = from_contents(Ok(format!("switch_key = \"KEY_PAUSE\"\n{value}")));
+            assert_eq!(config.is_manual_switch_sound, expected);
+        }
+        assert!(!from_contents(Err("unavailable".into())).is_manual_switch_sound);
     }
 
     #[test]

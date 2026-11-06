@@ -270,6 +270,7 @@ mod tests {
             let time = UNIX_EPOCH + Duration::from_secs(123);
             let result = crate::switch_and_replay(
                 || Ok(()),
+                || {},
                 || statistics.record_switch(Some(&previous), Some(&original), &layout("ru"), time),
                 || Err(io::Error::other("replay failed")),
                 &std::sync::atomic::AtomicBool::new(is_cancelled),
@@ -295,6 +296,7 @@ mod tests {
         });
         crate::switch_and_replay(
             || Ok(()),
+            || {},
             || {
                 statistics.record_switch(None, None, &layout("us"), UNIX_EPOCH);
                 writing.recv_timeout(TEST_TIMEOUT).unwrap();
@@ -329,6 +331,7 @@ mod tests {
             let mut is_replayed = false;
             crate::switch_and_replay(
                 || Ok(()),
+                || {},
                 || {
                     statistics.record_switch(None, None, &layout("us"), UNIX_EPOCH);
                     assert_eq!(
@@ -355,6 +358,7 @@ mod tests {
         let mut is_replayed = false;
         crate::switch_and_replay(
             || Ok(()),
+            || {},
             || statistics.record_switch(None, None, &layout("us"), UNIX_EPOCH),
             || {
                 is_replayed = true;

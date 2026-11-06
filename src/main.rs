@@ -5,6 +5,7 @@ mod history;
 mod input;
 mod layout;
 pub mod output;
+mod sound;
 mod statistics;
 mod tray;
 
@@ -30,6 +31,7 @@ fn run() -> io::Result<()> {
     let focus_service = focus::FocusService::start()?;
     let layouts = layout::LayoutTracker::start();
     let statistics = statistics::Statistics::start();
+    let sound = sound::Sound::start(config.is_manual_switch_sound);
     let mut input = input::Input::open(focus_service.changes(), config.switch_key, layouts)?;
 
     // Give the desktop time to discover the uinput keyboard before accepting input.
@@ -50,6 +52,7 @@ fn run() -> io::Result<()> {
                     &mut keyboard,
                     &desktop,
                     &statistics,
+                    &sound,
                     &is_cancelled,
                 )
             });
@@ -92,6 +95,7 @@ fn correct_word(
     keyboard: &mut output::KeyboardOutput,
     desktop: &environment::KdePlasma,
     statistics: &statistics::Statistics,
+    sound: &sound::Sound,
     is_cancelled: &AtomicBool,
 ) -> io::Result<Option<Arc<layout::Layout>>> {
     if is_cancelled.load(Ordering::Relaxed) {
@@ -106,6 +110,7 @@ fn correct_word(
     }
     switch_and_replay(
         || desktop.switch_to_next_layout(),
+        || sound.play(),
         || record_switch(statistics, previous, word),
         || {
             eprintln!("SYNTHETIC replay");
@@ -138,11 +143,13 @@ fn record_switch(
 
 fn switch_and_replay<T>(
     switch: impl FnOnce() -> io::Result<()>,
+    play_sound: impl FnOnce(),
     record: impl FnOnce() -> T,
     replay: impl FnOnce() -> io::Result<()>,
     is_cancelled: &AtomicBool,
 ) -> io::Result<T> {
     switch()?;
+    play_sound();
     let result = record();
     if !is_cancelled.load(Ordering::Relaxed) {
         replay()?;
@@ -176,6 +183,7 @@ mod tests {
                 is_cancelled.store(true, Ordering::Relaxed);
                 Ok(())
             },
+            || calls.borrow_mut().push("sound"),
             || calls.borrow_mut().push("record"),
             || {
                 calls.borrow_mut().push("replay");
@@ -184,7 +192,7 @@ mod tests {
             &is_cancelled,
         )
         .unwrap();
-        assert_eq!(*calls.borrow(), ["switch", "record"]);
+        assert_eq!(*calls.borrow(), ["switch", "sound", "record"]);
     }
 
     #[test]
@@ -196,6 +204,7 @@ mod tests {
                 calls.borrow_mut().push("switch");
                 Ok(())
             },
+            || calls.borrow_mut().push("sound"),
             || calls.borrow_mut().push("record"),
             || {
                 calls.borrow_mut().push("replay");
@@ -204,10 +213,11 @@ mod tests {
             &is_cancelled,
         );
         assert!(result.is_err());
-        assert_eq!(*calls.borrow(), ["switch", "record", "replay"]);
+        assert_eq!(*calls.borrow(), ["switch", "sound", "record", "replay"]);
         calls.borrow_mut().clear();
         let result = switch_and_replay(
             || Err(io::Error::other("switch failed")),
+            || calls.borrow_mut().push("sound"),
             || calls.borrow_mut().push("record"),
             || {
                 calls.borrow_mut().push("replay");
