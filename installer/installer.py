@@ -18,6 +18,7 @@ POLKIT = Path('/etc/polkit-1/rules.d/49-true-switcher.rules')
 SYSTEM_NAME = 'true-switcher.service'
 USER_NAME = 'true-switcher-session.service'
 SYSTEM_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+QDBUS_NAMES = ('qdbus-qt6', 'qdbus6', 'qdbus')
 DEFAULT_USER_CONFIG = '''# Restart the service to apply changes:
 # systemctl --user restart true-switcher-session.service
 # Examples: KEY_PAUSE, KEY_CAPSLOCK, KEY_RIGHTCTRL, KEY_RIGHTSHIFT,
@@ -70,12 +71,21 @@ def _policy_available() -> bool:
     return _run(['matchpathcon', str(BINARY)], check=False).returncode == 0
 
 
+def _find_qdbus() -> str:
+    for name in QDBUS_NAMES:
+        executable = shutil.which(name, path=SYSTEM_PATH)
+        if executable:
+            return executable
+    raise RuntimeError(
+        f'No qdbus executable found; tried {", ".join(QDBUS_NAMES)} in system service PATH={SYSTEM_PATH}'
+    )
+
+
 def _preflight() -> bool:
     binary = ROOT / 'target/release/true-switcher'
     if not binary.is_file() or not os.access(binary, os.X_OK):
         raise RuntimeError('Build the executable target/release/true-switcher first.')
-    if not shutil.which('qdbus', path=SYSTEM_PATH):
-        raise RuntimeError('qdbus is unavailable in the system service PATH.')
+    print(f'qdbus executable: {_find_qdbus()}')
     if os.environ.get('XDG_SESSION_TYPE') != 'wayland' or 'KDE' not in os.environ.get('XDG_CURRENT_DESKTOP', '').split(':'):
         raise RuntimeError('An active KDE Wayland session is required.')
     _systemctl('show-environment', user=True)

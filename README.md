@@ -23,7 +23,7 @@ Automatic layout switching is not supported for now.
 
 - Linux with `evdev` and `uinput` support
 - KDE Plasma on Wayland.
-- `systemd` and `qdbus`.
+- `systemd` and a `qdbus` executable in the runtime `PATH`. Supported names, in preference order: `qdbus-qt6`, `qdbus6`, `qdbus`. Fedora/Bazzite provides it in `qt6-qttools`.
 - `libxkbcommon` and XKB layout data (`xkeyboard-config`)
 
 ### Build
@@ -59,6 +59,8 @@ make build
 make install
 ```
 
+The installer checks for `qdbus` using the system service's `PATH`, which may differ from your shell's `PATH`, and prints the selected executable. The program resolves the executable once at startup using its own `PATH` and logs the selected path.
+
 ## Switching statistics
 
 Each successful layout switch is recorded in SQLite, even if replaying the word is later cancelled or fails.
@@ -71,6 +73,12 @@ Missing words are stored as empty strings. Records are skipped when the layout o
 
 ```sh
 cargo test --bin true-switcher
+```
+
+Installer command discovery tests use Python's standard library and temporary files:
+
+```sh
+python3 -m unittest discover -s installer -p 'test_*.py'
 ```
 
 The D-Bus tests use a separate `dbus-daemon` and do not change the desktop layout.

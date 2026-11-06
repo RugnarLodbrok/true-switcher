@@ -15,12 +15,12 @@ use std::thread;
 use std::time::{Duration, SystemTime};
 
 fn run() -> io::Result<()> {
+    let desktop = environment::KdePlasma::new()?;
     let mut keyboard = output::KeyboardOutput::new()?;
     let focus_service = focus::FocusService::start()?;
     let layouts = layout::LayoutTracker::start();
     let statistics = statistics::Statistics::start();
     let mut input = input::Input::open(focus_service.changes(), config::switch_key(), layouts)?;
-    let desktop = environment::KdePlasma;
 
     // Give the desktop time to discover the uinput keyboard before accepting input.
     thread::sleep(Duration::from_millis(500));
