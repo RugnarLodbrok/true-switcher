@@ -128,7 +128,7 @@ impl Input {
     pub fn open(
         focus_changes: Arc<AtomicBool>,
         switch_key: KeyCode,
-        layouts: crate::layout::LayoutTracker,
+        history: History,
     ) -> io::Result<Self> {
         let mut keyboards = Vec::new();
         let mut pointers = Vec::new();
@@ -185,7 +185,7 @@ impl Input {
         let mut input = Self {
             keyboards,
             pointers,
-            history: History::with_layouts(layouts),
+            history,
             focus_changes,
             switch_key,
             is_cancel_requested: false,

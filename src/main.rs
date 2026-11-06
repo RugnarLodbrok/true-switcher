@@ -34,7 +34,8 @@ fn run() -> io::Result<()> {
     let layouts = layout::LayoutTracker::start();
     let statistics = statistics::Statistics::start();
     let sound = sound::Sound::start(config.is_manual_switch_sound);
-    let mut input = input::Input::open(focus_service.changes(), config.switch_key, layouts)?;
+    let history = history::History::with_layouts(layouts).with_statistics(statistics.clone());
+    let mut input = input::Input::open(focus_service.changes(), config.switch_key, history)?;
 
     input.wait_for_keyboard_discovery(KEYBOARD_DISCOVERY_DELAY)?;
     eprintln!("Ready");

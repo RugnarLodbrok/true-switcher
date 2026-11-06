@@ -17,16 +17,27 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS switches (
     prev TEXT NOT NULL,
     a TEXT NOT NULL,
     b TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS typing_words (
+    word TEXT PRIMARY KEY,
+    count INTEGER NOT NULL
 )";
 
-#[derive(Debug, PartialEq, Eq)]
-struct Record {
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Record {
+    Switch(SwitchRecord),
+    TypingWord(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SwitchRecord {
     timestamp: i64,
     prev: String,
     a: String,
     b: String,
 }
 
+#[derive(Clone)]
 pub struct Statistics {
     sender: Sender<Record>,
 }
@@ -61,6 +72,20 @@ impl Statistics {
             eprintln!("true-switcher: skipping statistics: cannot convert word to text");
             return;
         };
+        self.send(Record::Switch(record));
+    }
+
+    pub fn record_word(&self, word: &Word) {
+        let Some(text) = word.text() else {
+            eprintln!(
+                "true-switcher: skipping typing statistics: cannot convert word to text (missing layout, mismatched strokes or unsupported character)"
+            );
+            return;
+        };
+        self.send(Record::TypingWord(text.to_lowercase()));
+    }
+
+    fn send(&self, record: Record) {
         if let Err(error) = self.sender.send(record) {
             eprintln!("true-switcher: statistics queue: {error}");
         }
@@ -83,8 +108,8 @@ fn make_record(
     word: Option<&Word>,
     target: &Layout,
     time: SystemTime,
-) -> Option<Record> {
-    Some(Record {
+) -> Option<SwitchRecord> {
+    Some(SwitchRecord {
         timestamp: time
             .duration_since(UNIX_EPOCH)
             .ok()?
@@ -126,10 +151,21 @@ fn store(record: &Record) -> Result<(), Box<dyn std::error::Error>> {
 
 fn insert(connection: &Connection, record: &Record) -> rusqlite::Result<()> {
     connection.execute_batch(SCHEMA)?;
-    connection.execute(
-        "INSERT INTO switches (timestamp, prev, a, b) VALUES (?1, ?2, ?3, ?4)",
-        params![record.timestamp, record.prev, record.a, record.b],
-    )?;
+    match record {
+        Record::Switch(record) => {
+            connection.execute(
+                "INSERT INTO switches (timestamp, prev, a, b) VALUES (?1, ?2, ?3, ?4)",
+                params![record.timestamp, record.prev, record.a, record.b],
+            )?;
+        }
+        Record::TypingWord(word) => {
+            connection.execute(
+                "INSERT INTO typing_words (word, count) VALUES (?1, 1)
+                 ON CONFLICT(word) DO UPDATE SET count = count + 1",
+                params![word],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -162,6 +198,174 @@ mod tests {
         }
     }
 
+    fn observed_history() -> (crate::history::History, Receiver<Record>) {
+        let (sent, received) = mpsc::channel();
+        let statistics = Statistics::start_with_writer(move |record| {
+            sent.send(record.clone())?;
+            Ok(())
+        });
+        let layouts = crate::layout::LayoutTracker::default();
+        layouts.set(Some(layout("us")));
+        (
+            crate::history::History::with_layouts(layouts).with_statistics(statistics),
+            received,
+        )
+    }
+
+    fn press(history: &mut crate::history::History, key: KeyCode) {
+        history.process(std::path::Path::new("keyboard"), key, 1);
+    }
+
+    fn finish_history(history: crate::history::History, received: Receiver<Record>) -> Vec<Record> {
+        drop(history);
+        let mut records = Vec::new();
+        loop {
+            match received.recv_timeout(TEST_TIMEOUT) {
+                Ok(record) => records.push(record),
+                Err(mpsc::RecvTimeoutError::Disconnected) => return records,
+                Err(error) => panic!("statistics worker did not finish: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn history_counts_final_words_once_only_when_they_leave() {
+        for separator in [
+            None,
+            Some(KeyCode::KEY_TAB),
+            Some(KeyCode::KEY_ENTER),
+            Some(KeyCode::KEY_KPENTER),
+        ] {
+            let (mut history, received) = observed_history();
+            let keys = [
+                KeyCode::KEY_G,
+                KeyCode::KEY_H,
+                KeyCode::KEY_B,
+                KeyCode::KEY_D,
+                KeyCode::KEY_T,
+                KeyCode::KEY_N,
+            ];
+            for key in keys {
+                press(&mut history, key);
+            }
+            history.set_latest_layout(Some(layout("ru")));
+            history.set_latest_layout(Some(layout("us")));
+            history.set_latest_layout(Some(layout("ru")));
+            press(&mut history, KeyCode::KEY_SPACE);
+            press(&mut history, KeyCode::KEY_SPACE);
+            for key in keys {
+                press(&mut history, key);
+            }
+            assert!(matches!(
+                received.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            if let Some(separator) = separator {
+                press(&mut history, separator);
+            } else {
+                history.reset();
+            }
+            history.reset();
+            assert_eq!(
+                finish_history(history, received),
+                [
+                    Record::TypingWord("привет".into()),
+                    Record::TypingWord("ghbdtn".into())
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn history_ignores_erased_words_and_counts_partially_erased_word() {
+        let (mut history, received) = observed_history();
+        for key in [
+            KeyCode::KEY_A,
+            KeyCode::KEY_SPACE,
+            KeyCode::KEY_B,
+            KeyCode::KEY_BACKSPACE,
+            KeyCode::KEY_BACKSPACE,
+            KeyCode::KEY_BACKSPACE,
+            KeyCode::KEY_C,
+            KeyCode::KEY_B,
+            KeyCode::KEY_BACKSPACE,
+        ] {
+            press(&mut history, key);
+        }
+        history.reset();
+        assert_eq!(
+            finish_history(history, received),
+            [Record::TypingWord("c".into())]
+        );
+    }
+
+    #[test]
+    fn typing_words_are_lowercase_keep_punctuation_and_skip_unknown_layouts() {
+        let (mut history, received) = observed_history();
+        press(&mut history, KeyCode::KEY_LEFTSHIFT);
+        press(&mut history, KeyCode::KEY_G);
+        history.process(std::path::Path::new("keyboard"), KeyCode::KEY_LEFTSHIFT, 0);
+        history.set_latest_layout(Some(layout("ru")));
+        press(&mut history, KeyCode::KEY_SPACE);
+        press(&mut history, KeyCode::KEY_A);
+        press(&mut history, KeyCode::KEY_COMMA);
+        press(&mut history, KeyCode::KEY_SPACE);
+        press(&mut history, KeyCode::KEY_B);
+        history.set_latest_layout(None);
+        press(&mut history, KeyCode::KEY_SPACE);
+        press(&mut history, KeyCode::KEY_C);
+        history.reset();
+        assert_eq!(
+            finish_history(history, received),
+            [
+                Record::TypingWord("п".into()),
+                Record::TypingWord("a,".into()),
+                Record::TypingWord("c".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn sqlite_adds_typing_counters_to_existing_database_and_preserves_switches() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE switches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER NOT NULL,
+                prev TEXT NOT NULL, a TEXT NOT NULL, b TEXT NOT NULL
+            );
+            INSERT INTO switches (timestamp, prev, a, b) VALUES (123, '', 'a', 'ф');",
+            )
+            .unwrap();
+        for text in ["привет", "привет", "привет,", "'\"; DROP TABLE switches;"] {
+            insert(&connection, &Record::TypingWord(text.into())).unwrap();
+        }
+        let mut statement = connection
+            .prepare("SELECT word, count FROM typing_words ORDER BY word")
+            .unwrap();
+        let counts: Vec<(String, i64)> = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            counts,
+            [
+                ("'\"; DROP TABLE switches;".into(), 1),
+                ("привет".into(), 2),
+                ("привет,".into(), 1),
+            ]
+        );
+        let switches: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM switches WHERE a = 'a' AND b = 'ф'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(switches, 1);
+    }
+
     #[test]
     fn records_original_previous_word_and_both_versions_of_corrected_word() {
         let previous = word("ru");
@@ -170,7 +374,7 @@ mod tests {
         let record = make_record(Some(&previous), Some(&original), &layout("ru"), time).unwrap();
         assert_eq!(
             record,
-            Record {
+            SwitchRecord {
                 timestamp: 123,
                 prev: "при".into(),
                 a: "ghb".into(),
@@ -212,20 +416,20 @@ mod tests {
     #[test]
     fn sqlite_preserves_unicode_quotes_timestamps_and_autoincrements_ids() {
         let connection = Connection::open_in_memory().unwrap();
-        let record = Record {
+        let record = SwitchRecord {
             timestamp: 123,
             prev: "привет".into(),
             a: "'\"; DROP TABLE switches;".into(),
             b: "слово".into(),
         };
-        insert(&connection, &record).unwrap();
-        insert(&connection, &record).unwrap();
+        insert(&connection, &Record::Switch(record.clone())).unwrap();
+        insert(&connection, &Record::Switch(record.clone())).unwrap();
         let stored = connection
             .query_row(
                 "SELECT timestamp, prev, a, b FROM switches WHERE id = 2",
                 [],
                 |row| {
-                    Ok(Record {
+                    Ok(SwitchRecord {
                         timestamp: row.get(0)?,
                         prev: row.get(1)?,
                         a: row.get(2)?,
@@ -236,7 +440,7 @@ mod tests {
             .unwrap();
         assert_eq!(stored, record);
         connection.execute("DELETE FROM switches", []).unwrap();
-        insert(&connection, &record).unwrap();
+        insert(&connection, &Record::Switch(record)).unwrap();
         let id: i64 = connection
             .query_row("SELECT id FROM switches", [], |row| row.get(0))
             .unwrap();
@@ -248,7 +452,7 @@ mod tests {
         let connection = Connection::open_in_memory().unwrap();
         connection.execute_batch("PRAGMA query_only = ON").unwrap();
         let record = make_record(None, None, &layout("us"), UNIX_EPOCH).unwrap();
-        assert!(insert(&connection, &record).is_err());
+        assert!(insert(&connection, &Record::Switch(record)).is_err());
     }
 
     #[test]
@@ -256,13 +460,7 @@ mod tests {
         for is_cancelled in [true, false] {
             let (sent, received) = mpsc::channel();
             let statistics = Statistics::start_with_writer(move |record| {
-                sent.send(Record {
-                    timestamp: record.timestamp,
-                    prev: record.prev.clone(),
-                    a: record.a.clone(),
-                    b: record.b.clone(),
-                })
-                .unwrap();
+                sent.send(record.clone()).unwrap();
                 Ok(())
             });
             let previous = word("ru");
@@ -278,7 +476,9 @@ mod tests {
             assert_eq!(result.is_ok(), is_cancelled);
             assert_eq!(
                 received.recv_timeout(TEST_TIMEOUT).unwrap(),
-                make_record(Some(&previous), Some(&original), &layout("ru"), time).unwrap()
+                Record::Switch(
+                    make_record(Some(&previous), Some(&original), &layout("ru"), time).unwrap()
+                )
             );
         }
     }

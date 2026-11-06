@@ -56,6 +56,7 @@ impl fmt::Display for Word {
 pub struct History {
     words: Vec<Word>,
     layouts: crate::layout::LayoutTracker,
+    statistics: Option<crate::statistics::Statistics>,
     // Track modifiers per keyboard: releasing Shift on one device must not
     // release a Shift still held on another one.
     modifiers: HashSet<(PathBuf, KeyCode)>,
@@ -67,6 +68,11 @@ impl History {
             layouts,
             ..Self::default()
         }
+    }
+
+    pub fn with_statistics(mut self, statistics: crate::statistics::Statistics) -> Self {
+        self.statistics = Some(statistics);
+        self
     }
 
     pub fn previous_word(&self) -> Option<&Word> {
@@ -146,7 +152,11 @@ impl History {
 
     /// Preserve held modifiers: resetting text history does not release keys.
     pub fn reset(&mut self) -> String {
-        self.words.clear();
+        for word in self.words.drain(..) {
+            if let Some(statistics) = &self.statistics {
+                statistics.record_word(&word);
+            }
+        }
         String::new()
     }
 

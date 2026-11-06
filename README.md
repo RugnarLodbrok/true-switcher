@@ -89,6 +89,12 @@ The database is stored at `$XDG_STATE_HOME/true-switcher/statistics.sqlite3`, or
 The `switches` table contains `id`, `timestamp` (Unix seconds), `prev` (the previous word as typed), `a` (the corrected word before switching), and `b` (the word in the new layout).
 Missing words are stored as empty strings. Records are skipped when the layout or text cannot be determined. Database errors are logged and do not stop the switcher.
 
+The same database stores typing frequencies in `typing_words`, with `word` (`TEXT PRIMARY KEY`) and `count` (`INTEGER NOT NULL`).
+Each word is counted once when it leaves the typing history, including when the whole history is reset. The first occurrence creates a counter of 1; subsequent occurrences increment it.
+Corrections update the word kept in history, so only its final version is counted. Words fully erased with Backspace are excluded.
+Words are converted to lowercase, preserving punctuation: `Привет` and `привет` share a counter, while `привет,` has a separate counter.
+Words that cannot be converted to text are skipped with a log message. Both tables are written by the existing statistics worker thread.
+
 ## Tests
 
 ```sh

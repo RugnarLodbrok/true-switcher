@@ -11,7 +11,7 @@ from typing import List
 
 ROOT = Path(__file__).resolve().parent.parent
 BINARY = Path('/usr/local/bin/true-switcher')
-ICON_NAME = 'mynaui--letter-t-diamond-solid.svg'
+ICON_NAME = 'icon.svg'
 ICON = Path('/usr/local/share/true-switcher/icons') / ICON_NAME
 SYSTEM_UNIT = Path('/etc/systemd/system/true-switcher.service')
 USER_UNIT = Path.home() / '.config/systemd/user/true-switcher-session.service'
