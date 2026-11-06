@@ -6,6 +6,7 @@ mod input;
 mod layout;
 pub mod output;
 mod statistics;
+mod tray;
 
 use std::io;
 use std::process::ExitCode;
@@ -15,12 +16,21 @@ use std::thread;
 use std::time::{Duration, SystemTime};
 
 fn run() -> io::Result<()> {
+    let config = config::load();
+    if let Some(warning) = &config.warning {
+        eprintln!("true-switcher: {warning}");
+    }
+    let _tray = tray::Tray::start(config.warning)
+        .map_err(|error| {
+            eprintln!("true-switcher: cannot start tray: {error}");
+        })
+        .ok();
     let desktop = environment::KdePlasma::new()?;
     let mut keyboard = output::KeyboardOutput::new()?;
     let focus_service = focus::FocusService::start()?;
     let layouts = layout::LayoutTracker::start();
     let statistics = statistics::Statistics::start();
-    let mut input = input::Input::open(focus_service.changes(), config::switch_key(), layouts)?;
+    let mut input = input::Input::open(focus_service.changes(), config.switch_key, layouts)?;
 
     // Give the desktop time to discover the uinput keyboard before accepting input.
     thread::sleep(Duration::from_millis(500));

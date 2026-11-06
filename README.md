@@ -61,6 +61,17 @@ make install
 
 The installer checks for `qdbus` using the system service's `PATH`, which may differ from your shell's `PATH`, and prints the selected executable. The program resolves the executable once at startup using its own `PATH` and logs the selected path.
 
+## Tray and configuration
+
+True Switcher shows an icon in the KDE Plasma system tray while the process is running.
+Its menu contains `Reload`, which restarts the system service `true-switcher.service` without waiting for the restart to finish. The icon briefly disappears and the new process reads `~/.config/true-switcher/config.toml` again.
+
+If the configuration cannot be read, or `switch_key` is missing or invalid, the program uses `KEY_PAUSE` and sends a desktop notification. A failed restart request is also logged and reported in a notification.
+The tray registers again when Plasma's tray service becomes available or changes its D-Bus owner.
+
+The installer copies the SVG from `icon/` to `/usr/local/share/true-switcher/icons/` and allows `restart` for this service in its Polkit rule. Runs from the source tree can use `icon/` directly; `Reload` always targets the installed system service.
+Existing installations need the updated binary, icon and Polkit rule; the installer currently does not support upgrading an existing installation.
+
 ## Switching statistics
 
 Each successful layout switch is recorded in SQLite, even if replaying the word is later cancelled or fails.
@@ -75,7 +86,7 @@ Missing words are stored as empty strings. Records are skipped when the layout o
 cargo test --bin true-switcher
 ```
 
-Installer command discovery tests use Python's standard library and temporary files:
+Installer tests cover command discovery and the tray icon's installation, removal and rollback using Python's standard library, temporary files and mocked system commands:
 
 ```sh
 python3 -m unittest discover -s installer -p 'test_*.py'

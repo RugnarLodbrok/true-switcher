@@ -10,11 +10,38 @@ const CONFIG_FILE: &str = "config.toml";
 const SWITCH_KEY_SETTING: &str = "switch_key";
 const DEFAULT_SWITCH_KEY: KeyCode = KeyCode::KEY_PAUSE;
 
-pub fn switch_key() -> KeyCode {
-    config_path()
-        .and_then(|path| fs::read_to_string(path).ok())
-        .and_then(|contents| parse_switch_key(&contents))
-        .unwrap_or(DEFAULT_SWITCH_KEY)
+pub struct Configuration {
+    pub switch_key: KeyCode,
+    pub warning: Option<String>,
+}
+
+pub fn load() -> Configuration {
+    let result = config_path()
+        .ok_or_else(|| "Cannot find user configuration: HOME is unset.".to_owned())
+        .and_then(|path| {
+            fs::read_to_string(&path)
+                .map_err(|error| format!("Cannot read {}: {error}", path.display()))
+        });
+    from_contents(result)
+}
+
+fn from_contents(contents: Result<String, String>) -> Configuration {
+    let result = contents.and_then(|contents| {
+        parse_switch_key(&contents)
+            .ok_or_else(|| "Missing or invalid switch_key in config.toml.".to_owned())
+    });
+    match result {
+        Ok(switch_key) => Configuration {
+            switch_key,
+            warning: None,
+        },
+        Err(error) => Configuration {
+            switch_key: DEFAULT_SWITCH_KEY,
+            warning: Some(format!(
+                "{error} Using KEY_PAUSE. Fix the configuration and select Reload in the tray menu."
+            )),
+        },
+    }
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -43,4 +70,34 @@ fn parse_switch_key(contents: &str) -> Option<KeyCode> {
         switch_key = Some(key);
     }
     switch_key
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_key_has_no_warning() {
+        let config = from_contents(Ok("switch_key = \"KEY_F12\" # comment".into()));
+        assert_eq!(config.switch_key, KeyCode::KEY_F12);
+        assert!(config.warning.is_none());
+    }
+
+    #[test]
+    fn missing_invalid_and_duplicate_keys_warn_and_fall_back() {
+        for contents in [
+            "",
+            "switch_key = \"invalid\"",
+            "switch_key = \"KEY_RESERVED\"",
+            "switch_key = KEY_F12",
+            "switch_key = \"KEY_F12\"\nswitch_key = \"KEY_PAUSE\"",
+        ] {
+            let config = from_contents(Ok(contents.into()));
+            assert_eq!(config.switch_key, DEFAULT_SWITCH_KEY);
+            assert!(config.warning.unwrap().contains("Using KEY_PAUSE"));
+        }
+        let config = from_contents(Err("Permission denied".into()));
+        assert_eq!(config.switch_key, DEFAULT_SWITCH_KEY);
+        assert!(config.warning.unwrap().contains("Permission denied"));
+    }
 }
