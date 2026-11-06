@@ -60,6 +60,7 @@ make install
 ```
 
 The installer checks for `qdbus` using the system service's `PATH`, which may differ from your shell's `PATH`, and prints the selected executable. The program resolves the executable once at startup using its own `PATH` and logs the selected path.
+After installation, the installer starts True Switcher and enables it to start automatically in future graphical sessions.
 
 ## Tray and configuration
 

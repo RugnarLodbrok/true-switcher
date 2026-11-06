@@ -16,6 +16,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
+const KEYBOARD_DISCOVERY_DELAY: Duration = Duration::from_millis(500);
+
 fn run() -> io::Result<()> {
     let config = config::load();
     if let Some(warning) = &config.warning {
@@ -34,8 +36,7 @@ fn run() -> io::Result<()> {
     let sound = sound::Sound::start(config.is_manual_switch_sound);
     let mut input = input::Input::open(focus_service.changes(), config.switch_key, layouts)?;
 
-    // Give the desktop time to discover the uinput keyboard before accepting input.
-    thread::sleep(Duration::from_millis(500));
+    input.wait_for_keyboard_discovery(KEYBOARD_DISCOVERY_DELAY)?;
     eprintln!("Ready");
 
     loop {

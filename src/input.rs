@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use evdev::{Device, EventType, InputEvent, KeyCode, SynchronizationCode, raw_stream::RawDevice};
 
@@ -204,6 +204,20 @@ impl Input {
             }
         }
         Ok(input)
+    }
+
+    pub fn wait_for_keyboard_discovery(&mut self, duration: Duration) -> io::Result<()> {
+        let deadline = Instant::now() + duration;
+        loop {
+            self.drain()?;
+            self.pending = None;
+            self.is_original_switch_key_held = false;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(());
+            }
+            thread::sleep(POLL_INTERVAL.min(remaining));
+        }
     }
 
     pub fn wait_for_request(&mut self) -> io::Result<()> {
@@ -752,6 +766,20 @@ mod tests {
 
     struct SimulatedSource(Rc<RefCell<SimulatedKeyboard>>);
 
+    #[derive(Default)]
+    struct SimulatedPointer {
+        events: Vec<InputEvent>,
+        reads: usize,
+    }
+
+    impl PointerSource for Rc<RefCell<SimulatedPointer>> {
+        fn events(&mut self) -> io::Result<Vec<InputEvent>> {
+            let mut pointer = self.borrow_mut();
+            pointer.reads += 1;
+            Ok(std::mem::take(&mut pointer.events))
+        }
+    }
+
     impl Source for SimulatedSource {
         fn events(&mut self) -> io::Result<Vec<InputEvent>> {
             Ok(std::mem::take(&mut self.0.borrow_mut().events))
@@ -843,6 +871,72 @@ mod tests {
             repair_prepared: BTreeSet::new(),
             is_captured: false,
         }
+    }
+
+    #[test]
+    fn discovery_drains_devices_and_ignores_switch_requests() {
+        let source = Rc::new(RefCell::new(SimulatedKeyboard::default()));
+        let pointer = Rc::new(RefCell::new(SimulatedPointer::default()));
+        let mut input = simulated_input(std::slice::from_ref(&source));
+        input.pending = None;
+        input.pointers.push(Pointer {
+            path: PathBuf::from("pointer"),
+            device: Box::new(pointer.clone()),
+        });
+        source.borrow_mut().events.extend([
+            InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTSHIFT.0, 1),
+            InputEvent::new(EventType::KEY.0, KeyCode::KEY_PAUSE.0, 1),
+            InputEvent::new(EventType::KEY.0, KeyCode::KEY_PAUSE.0, 0),
+        ]);
+        pointer
+            .borrow_mut()
+            .events
+            .push(InputEvent::new(EventType::RELATIVE.0, 0, 1));
+        input
+            .wait_for_keyboard_discovery(POLL_INTERVAL * 3)
+            .unwrap();
+        assert!(pointer.borrow().reads >= 2);
+        assert!(pointer.borrow().events.is_empty());
+        assert_eq!(input.pending, None);
+        assert!(!input.is_original_switch_key_held);
+        assert!(input.keyboards[0].held.contains(&KeyCode::KEY_LEFTSHIFT.0));
+        assert!(!input.keyboards[0].held.contains(&KeyCode::KEY_PAUSE.0));
+        source.borrow_mut().events.push(InputEvent::new(
+            EventType::KEY.0,
+            KeyCode::KEY_LEFTSHIFT.0,
+            0,
+        ));
+        source
+            .borrow_mut()
+            .events
+            .push(InputEvent::new(EventType::KEY.0, KeyCode::KEY_PAUSE.0, 1));
+        input.drain().unwrap();
+        assert_eq!(input.pending, Some(0));
+    }
+
+    #[test]
+    fn discovery_propagates_pointer_event_loss() {
+        let source = Rc::new(RefCell::new(SimulatedKeyboard::default()));
+        let pointer = Rc::new(RefCell::new(SimulatedPointer {
+            events: vec![InputEvent::new(
+                EventType::SYNCHRONIZATION.0,
+                SynchronizationCode::SYN_DROPPED.0,
+                0,
+            )],
+            ..Default::default()
+        }));
+        let mut input = simulated_input(std::slice::from_ref(&source));
+        input.pointers.push(Pointer {
+            path: PathBuf::from("pointer"),
+            device: Box::new(pointer),
+        });
+        assert!(
+            input
+                .wait_for_keyboard_discovery(POLL_INTERVAL)
+                .unwrap_err()
+                .to_string()
+                .contains("SYN_DROPPED")
+        );
     }
 
     #[test]

@@ -175,20 +175,19 @@ def _install_file(source: Path, destination: Path, privileged: bool) -> None:
 
 def _instructions(policy: bool, skip: bool) -> None:
     if policy and skip:
-        print('''The installer skipped SELinux labeling. Before starting True Switcher, apply the SELinux label defined by policy for this path and verify it:
+        print('''The installer skipped SELinux labeling. Apply the SELinux label defined by policy for this path and verify it:
 
 sudo restorecon -v /usr/local/bin/true-switcher
 matchpathcon -V /usr/local/bin/true-switcher
 
-If either command fails or reports a label mismatch, do not start True Switcher until the issue is resolved.''')
+If either command fails or reports a label mismatch, resolve the issue before restarting True Switcher.''')
     if policy:
         print('''[!] You have SELinux on your system. Now you have to do these manual checks to verify that is is not blocking TrueSwitcher:
     1. `getenforce` — If Disabled, stop here: SELinux checks and denials are absent, installation is fine.
     2. `matchpathcon -V /usr/local/bin/true-switcher` — expected exit status 0 and a matching label.
-    3. `systemctl --user start true-switcher-session.service` — expected success.
-    4. `systemctl --user is-active true-switcher-session.service` — expected active.
-    5. `systemctl is-active true-switcher.service` — expected active.
-    6. `sudo ausearch -m AVC,USER_AVC -ts recent` — check for denials related to this startup. A denial in Permissive would block the operation in Enforcing.''')
+    3. `systemctl --user is-active true-switcher-session.service` — expected active.
+    4. `systemctl is-active true-switcher.service` — expected active.
+    5. `sudo ausearch -m AVC,USER_AVC -ts recent` — check for denials related to this startup. A denial in Permissive would block the operation in Enforcing.''')
 
 
 def _install() -> None:
@@ -197,6 +196,7 @@ def _install() -> None:
     skip = os.environ.get('TRUE_SWITCHER_INSTALL_SELINUX_SKIP') == '1'
     created = []
     enable_attempted = False
+    start_attempted = False
     try:
         with tempfile.TemporaryDirectory() as temp:
             system, session, rule = _contents()
@@ -221,7 +221,16 @@ def _install() -> None:
             enable_attempted = True
             _systemctl('enable', USER_NAME, user=True)
             _systemctl('is-enabled', USER_NAME, user=True)
+            start_attempted = True
+            _systemctl('start', USER_NAME, user=True)
+            _systemctl('is-active', USER_NAME, user=True)
+            _systemctl('is-active', SYSTEM_NAME)
     except Exception:
+        if start_attempted:
+            for command in (['systemctl', '--user', 'stop', USER_NAME], ['sudo', 'systemctl', 'stop', SYSTEM_NAME]):
+                result = _run(command, check=False)
+                if result.returncode:
+                    print(f'Rollback stop failed: {result.stderr}', file=sys.stderr)
         if enable_attempted:
             _systemctl('disable', USER_NAME, user=True, check=False)
         for path, privileged in reversed(created):
@@ -233,7 +242,7 @@ def _install() -> None:
             if result.returncode:
                 print(f'Rollback reload failed: {result.stderr}', file=sys.stderr)
         raise
-    print('[SUCCESS] Autostart enabled. Start manually: systemctl --user start true-switcher-session.service')
+    print('[SUCCESS] True Switcher started and autostart enabled.')
     _instructions(policy, skip)
 
 
