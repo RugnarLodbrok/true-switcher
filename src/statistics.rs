@@ -128,9 +128,10 @@ fn write_records(
 }
 
 fn convert_record(pending: PendingRecord) -> Option<Record> {
-    let record = match pending {
+    match pending {
         PendingRecord::TypingWord(word) => word
             .text()
+            .ok()
             .map(|text| Record::TypingWord(text.to_lowercase())),
         PendingRecord::Switch {
             previous,
@@ -142,11 +143,7 @@ fn convert_record(pending: PendingRecord) -> Option<Record> {
             record.mode = mode;
             Record::Switch(record)
         }),
-    };
-    if record.is_none() {
-        log::warn!("true-switcher: skipping statistics: cannot convert word to text or timestamp");
     }
-    record
 }
 
 fn make_record(
@@ -155,22 +152,25 @@ fn make_record(
     target: &Layout,
     time: SystemTime,
 ) -> Option<SwitchRecord> {
+    let timestamp = time
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| duration.as_secs().try_into().ok());
+    let Some(timestamp) = timestamp else {
+        log::warn!("true-switcher: skipping statistics: invalid timestamp");
+        return None;
+    };
     Some(SwitchRecord {
         mode: SwitchMode::Manual,
-        timestamp: time
-            .duration_since(UNIX_EPOCH)
-            .ok()?
-            .as_secs()
-            .try_into()
-            .ok()?,
+        timestamp,
         prev: previous
-            .map(Word::text)
+            .map(|word| word.text().ok())
             .unwrap_or_else(|| Some(String::new()))?,
         a: word
-            .map(Word::text)
+            .map(|word| word.text().ok())
             .unwrap_or_else(|| Some(String::new()))?,
         b: word
-            .map(|word| target.text(word.strokes()))
+            .map(|word| target.to_text(word.strokes()).ok())
             .unwrap_or_else(|| Some(String::new()))?,
     })
 }
@@ -599,6 +599,22 @@ mod tests {
         assert!(make_record(Some(&unknown), None, &layout("ru"), UNIX_EPOCH).is_none());
         let invalid = layout("\0");
         assert!(make_record(None, Some(&word("us")), &invalid, UNIX_EPOCH).is_none());
+    }
+
+    #[test]
+    fn conversion_error_discards_typing_and_switch_records_in_full() {
+        let mut original = word("us");
+        original.entries[1].stroke.key = KeyCode::KEY_APOSTROPHE;
+        let target = Arc::new(Layout {
+            name: "us".into(),
+            variant: "intl".into(),
+            ..Default::default()
+        });
+        assert!(make_record(None, Some(&original), &target, UNIX_EPOCH).is_none());
+        original.entries[1].layout = Some(target);
+        assert!(make_record(None, Some(&original), &layout("ru"), UNIX_EPOCH).is_none());
+        assert!(make_record(Some(&original), None, &layout("ru"), UNIX_EPOCH).is_none());
+        assert!(convert_record(PendingRecord::TypingWord(original)).is_none());
     }
 
     #[test]

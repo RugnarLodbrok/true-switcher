@@ -1340,7 +1340,7 @@ patterns = ['^\.тф']
         ));
         sender.send(InputEventMessage::LayoutChanged(Some(layout("us"))));
         input.process_available_events().unwrap();
-        assert_eq!(input.latest_word().unwrap().text().as_deref(), Some("a"));
+        assert_eq!(input.latest_word().unwrap().text().as_deref(), Ok("a"));
         sender.send(InputEventMessage::LayoutChanged(Some(layout("ru"))));
         input.process_available_events().unwrap();
         assert!(input.latest_word().is_none());
@@ -1354,17 +1354,17 @@ patterns = ['^\.тф']
         input.is_captured = true;
         sender.send(InputEventMessage::LayoutChanged(Some(layout("ru"))));
         input.process_available_events().unwrap();
-        assert_eq!(input.latest_word().unwrap().text().as_deref(), Some("a"));
+        assert_eq!(input.latest_word().unwrap().text().as_deref(), Ok("a"));
         sender.send(InputEventMessage::CorrectionFinished {
             result: Ok(()),
             layout: Some(layout("ru")),
         });
         sender.send(InputEventMessage::LayoutChanged(Some(layout("ru"))));
         assert!(input.wait_for_correction().unwrap().unwrap().is_ok());
-        assert_eq!(input.latest_word().unwrap().text().as_deref(), Some("ф"));
+        assert_eq!(input.latest_word().unwrap().text().as_deref(), Ok("ф"));
         event_at(&mut input, 0, KeyCode::KEY_A, 0, Instant::now());
         input.leave().unwrap();
-        assert_eq!(input.latest_word().unwrap().text().as_deref(), Some("ф"));
+        assert_eq!(input.latest_word().unwrap().text().as_deref(), Ok("ф"));
     }
 
     #[test]
@@ -1400,7 +1400,7 @@ patterns = ['^\.тф']
         assert!(input.latest_word().is_none());
         input.is_captured = false;
         press(&mut input, KeyCode::KEY_B);
-        assert_eq!(input.latest_word().unwrap().text().as_deref(), Some("и"));
+        assert_eq!(input.latest_word().unwrap().text().as_deref(), Ok("и"));
     }
 
     #[test]
@@ -1623,12 +1623,12 @@ patterns = ['^\.тф']
         assert!(input.is_auto_request());
         let us = input.automatic_target().unwrap();
         assert_eq!(us.name, "us");
-        assert_eq!(input.latest_word().unwrap().text().as_deref(), Some(".т"));
+        assert_eq!(input.latest_word().unwrap().text().as_deref(), Ok(".т"));
         input.set_latest_layout(Some(us));
         input.pending = None;
         press(&mut input, KeyCode::KEY_A);
         assert_eq!(input.automatic_target().unwrap().name, "ru");
-        assert_eq!(input.latest_word().unwrap().text().as_deref(), Some("/na"));
+        assert_eq!(input.latest_word().unwrap().text().as_deref(), Ok("/na"));
     }
 
     #[test]

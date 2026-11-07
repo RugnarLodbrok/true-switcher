@@ -25,20 +25,26 @@ impl Word {
         self.entries.iter().map(|entry| &entry.stroke)
     }
 
-    pub fn text(&self) -> Option<String> {
+    pub fn text(&self) -> Result<String, crate::xkb::ConversionError> {
         let mut text = String::new();
         let mut start = 0;
         while start < self.entries.len() {
-            let layout = self.entries[start].layout.as_ref()?;
+            let layout = self.entries[start].layout.as_ref().ok_or_else(|| {
+                let error = crate::xkb::ConversionError::UnknownLayout {
+                    key: self.entries[start].stroke.key,
+                };
+                log::error!("true-switcher: text conversion: {error}");
+                error
+            })?;
             let end = (start + 1..self.entries.len())
                 .find(|&index| self.entries[index].layout.as_ref() != Some(layout))
                 .unwrap_or(self.entries.len());
             text.push_str(
-                &layout.text(self.entries[start..end].iter().map(|entry| &entry.stroke))?,
+                &layout.to_text(self.entries[start..end].iter().map(|entry| &entry.stroke))?,
             );
             start = end;
         }
-        Some(text)
+        Ok(text)
     }
 }
 

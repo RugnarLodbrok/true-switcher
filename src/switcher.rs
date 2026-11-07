@@ -1,4 +1,4 @@
-use crate::{config, environment, input, layout, output, sound, statistics, word};
+use crate::{config, input, kde, layout, output, sound, statistics, word};
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -51,11 +51,11 @@ impl Correction {
 }
 
 pub struct Switcher {
-    pub(crate) desktop: environment::KdePlasma,
+    pub(crate) desktop: kde::KdePlasma,
     pub(crate) keyboard: output::KeyboardOutput,
     pub(crate) statistics: statistics::Statistics,
     pub(crate) sound: sound::Sound,
-    pub(crate) layouts: layout::LayoutTracker,
+    pub(crate) layouts: kde::LayoutTracker,
 }
 
 impl Switcher {
@@ -133,7 +133,7 @@ impl Switcher {
 fn correct_word(
     correction: &Correction,
     keyboard: &mut output::KeyboardOutput,
-    desktop: &environment::KdePlasma,
+    desktop: &kde::KdePlasma,
     statistics: &statistics::Statistics,
     sound: &sound::Sound,
     is_cancelled: &AtomicBool,
@@ -185,7 +185,7 @@ fn record_switch(
     mode: SwitchMode,
 ) -> Option<Arc<layout::Layout>> {
     let time = SystemTime::now();
-    match layout::current_layout() {
+    match kde::current_layout() {
         Ok(target) => {
             statistics.record_switch_with_mode(previous, word, &target, time, mode);
             Some(target)

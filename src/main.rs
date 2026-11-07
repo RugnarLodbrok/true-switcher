@@ -1,10 +1,10 @@
 mod config;
-mod environment;
 mod focus;
 mod history;
 mod hold;
 mod input;
 mod input_events;
+mod kde;
 mod layout;
 pub mod output;
 mod sound;
@@ -13,6 +13,7 @@ mod switch_rules;
 mod switcher;
 mod tray;
 mod word;
+mod xkb;
 
 use std::io;
 use std::process::ExitCode;
@@ -33,14 +34,14 @@ fn run() -> io::Result<()> {
     log::set_max_level(config.log_level);
     let _tray = tray::Tray::start()?;
 
-    let desktop = environment::KdePlasma::new()?;
+    let desktop = kde::KdePlasma::new()?;
     let keyboard = output::KeyboardOutput::new()?;
     let statistics = statistics::Statistics::start();
     let sound = sound::Sound::start(config.manual_switch_sound || config.auto_switch_sound);
 
     let (sender, events) = input_events::InputEvents::new();
     let _focus_service = focus::FocusService::start(sender.clone())?;
-    let layouts = layout::LayoutTracker::start(sender.clone());
+    let layouts = kde::LayoutTracker::start(sender.clone());
 
     let mut input = input::Input::open(
         events,

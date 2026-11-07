@@ -147,7 +147,7 @@ mod tests {
         press(&mut history, KeyCode::KEY_SPACE);
         press(&mut history, KeyCode::KEY_BACKSPACE);
         press(&mut history, KeyCode::KEY_BACKSPACE);
-        assert_eq!(history.latest_word().unwrap().text().as_deref(), Some("ф"));
+        assert_eq!(history.latest_word().unwrap().text().as_deref(), Ok("ф"));
         assert_eq!(history.latest_word().unwrap().trailing_spaces, 2);
         assert!(history.previous_word().is_none());
         for _ in 0..4 {
@@ -168,7 +168,7 @@ mod tests {
         ] {
             press(&mut history, key);
         }
-        assert_eq!(history.reset()[0].text().as_deref(), Some("ab,"));
+        assert_eq!(history.reset()[0].text().as_deref(), Ok("ab,"));
     }
 
     #[test]
@@ -190,15 +190,18 @@ mod tests {
                 ..Default::default()
             })),
         );
-        assert_eq!(history.latest_word().unwrap().text().as_deref(), Some("Aи"));
+        assert_eq!(history.latest_word().unwrap().text().as_deref(), Ok("Aи"));
         history.process(KeyCode::KEY_C, false, None);
-        assert_eq!(history.latest_word().unwrap().text(), None);
+        assert!(matches!(
+            history.latest_word().unwrap().text(),
+            Err(crate::xkb::ConversionError::UnknownLayout { .. })
+        ));
         press(&mut history, KeyCode::KEY_BACKSPACE);
-        assert_eq!(history.latest_word().unwrap().text().as_deref(), Some("Aи"));
+        assert_eq!(history.latest_word().unwrap().text().as_deref(), Ok("Aи"));
         history.set_latest_layout(Some(Arc::new(Layout {
             name: "us".into(),
             ..Default::default()
         })));
-        assert_eq!(history.latest_word().unwrap().text().as_deref(), Some("Ab"));
+        assert_eq!(history.latest_word().unwrap().text().as_deref(), Ok("Ab"));
     }
 }

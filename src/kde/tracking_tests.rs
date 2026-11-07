@@ -10,25 +10,6 @@ const CONFIG: &str = "[Layout]\nLayoutList=us,ru\nVariantList=,phonetic\nModel=p
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[test]
-fn accepts_only_identifiers_in_xkb_layout_section() {
-    let registry = "! model\n pc105 PC\n! layout\n us English\n gb British\n ru Russian\n! variant\n phonetic ru: Phonetic\n";
-    for name in ["us", "gb", "ru"] {
-        validate_identifier(registry, name).unwrap();
-    }
-    for name in [
-        "en",
-        "us,ru",
-        "ru(phonetic)",
-        "phonetic",
-        "pc105",
-        "",
-        "../us",
-    ] {
-        assert!(validate_identifier(registry, name).is_err());
-    }
-}
-
-#[test]
 fn uses_first_duplicate_layout_with_its_configured_variant() {
     let names = vec![
         ("ru".into(), String::new(), String::new()),
@@ -47,7 +28,7 @@ fn uses_first_duplicate_layout_with_its_configured_variant() {
 fn reads_running_kde_layout() {
     let layout = current_layout().expect("read layout from the running KDE session");
     assert!(!layout.name.is_empty());
-    assert!(layout.text(&strokes()).is_some());
+    assert!(layout.to_text(&strokes()).is_ok());
 }
 
 fn strokes() -> Vec<Stroke> {
@@ -62,54 +43,12 @@ fn strokes() -> Vec<Stroke> {
 }
 
 #[test]
-fn converts_shift_and_layout_without_changing_physical_keys() {
-    let us = Layout {
-        name: "us".into(),
-        ..Layout::default()
-    };
-    let ru = Layout {
-        name: "ru".into(),
-        ..Layout::default()
-    };
-    assert_eq!(us.text(&strokes()).as_deref(), Some("Ghb"));
-    assert_eq!(ru.text(&strokes()).as_deref(), Some("При"));
-    assert_eq!(
-        us.text(&[Stroke {
-            key: KeyCode::KEY_COMMA,
-            shift: true
-        }])
-        .as_deref(),
-        Some("<")
-    );
-}
-
-#[test]
-fn rejects_unconvertible_keys_and_invalid_layout() {
-    let us = Layout {
-        name: "us".into(),
-        ..Layout::default()
-    };
-    assert_eq!(
-        us.text(&[Stroke {
-            key: KeyCode::KEY_ENTER,
-            shift: false
-        }]),
-        None
-    );
-    let invalid = Layout {
-        name: "\0".into(),
-        ..us
-    };
-    assert_eq!(invalid.text(&strokes()), None);
-}
-
-#[test]
 fn configuration_preserves_variant_model_and_options_and_rejects_mismatch() {
     let layout = configured_layout(CONFIG, 1, "ru").unwrap();
     assert_eq!(layout.name, "ru");
     assert_eq!(layout.variant, "phonetic");
     assert_eq!(layout.model, "pc105");
-    assert_eq!(layout.text(&strokes()).as_deref(), Some("Гхб"));
+    assert_eq!(layout.to_text(&strokes()).as_deref(), Ok("Гхб"));
     assert!(configured_layout(CONFIG, 0, "ru").is_none());
     assert!(configured_layout(CONFIG, 2, "us").is_none());
     let contents = "[Other]\nLayoutList=ru\n[Layout]\nLayoutList=us\nOptions=shift:both_capslock\n";

@@ -17,7 +17,7 @@ pub struct AutoSwitchRules {
 
 impl AutoSwitchRules {
     pub fn new(settings: &Configuration) -> io::Result<Self> {
-        Self::compile(settings, crate::layout::target_layout)
+        Self::compile(settings, crate::kde::target_layout)
     }
 
     pub(crate) fn compile(
@@ -45,7 +45,7 @@ impl AutoSwitchRules {
             if rule.target.name == current.name {
                 return None;
             }
-            let text = rule.target.text(word.strokes())?;
+            let text = rule.target.to_text(word.strokes()).ok()?;
             rule.patterns.is_match(&text).then(|| rule.target.clone())
         })
     }
@@ -90,6 +90,26 @@ mod tests {
             AutoSwitchRules::compile(&settings, |_| Err(io::Error::other("absent layout")))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn conversion_failure_continues_rules_without_using_partial_text() {
+        let settings = parse_config("auto_switch = true\n[[switch_rules]]\ntarget = 'us'\npatterns = ['^a']\n[[switch_rules]]\ntarget = 'gb'\npatterns = ['^a']\n[[switch_rules]]\ntarget = 'ru'\npatterns = ['^ф']").unwrap();
+        let switch = AutoSwitchRules::compile(&settings, |name| {
+            Ok(Arc::new(Layout {
+                name: name.into(),
+                variant: if name == "us" {
+                    "intl".into()
+                } else {
+                    String::new()
+                },
+                ..Default::default()
+            }))
+        })
+        .unwrap();
+        let word = word(&[KeyCode::KEY_A, KeyCode::KEY_APOSTROPHE]);
+        let current = resolve("de").unwrap();
+        assert_eq!(switch.target(&word, &current).unwrap().name, "gb");
     }
 
     #[test]
