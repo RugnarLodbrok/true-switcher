@@ -233,7 +233,7 @@ impl Input {
         }
     }
 
-    pub fn wait_for_request(&mut self) -> io::Result<()> {
+    pub fn wait_for_switch_request(&mut self) -> io::Result<()> {
         while self.pending.is_none() {
             self.drain()?;
             thread::sleep(POLL_INTERVAL);
@@ -1039,8 +1039,9 @@ mod tests {
         let mut input = simulated_input(&[source]);
         input.pending = None;
         input.is_original_switch_key_held = false;
-        let settings = crate::switch_rules::Settings::parse(
+        let settings = crate::config::from_contents(
             r#"
+switch_key = 'KEY_PAUSE'
 auto_switch = true
 [[switch_rules]]
 target = 'us'

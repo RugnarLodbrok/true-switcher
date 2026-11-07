@@ -1,4 +1,3 @@
-mod switch_rules;
 mod config;
 mod environment;
 mod focus;
@@ -8,6 +7,7 @@ mod layout;
 pub mod output;
 mod sound;
 mod statistics;
+mod switch_rules;
 mod tray;
 
 use std::io;
@@ -65,31 +65,29 @@ struct Switcher {
 }
 
 fn run() -> io::Result<()> {
-    let prepared = config::load().and_then(|config| {
-        switch_rules::AutoSwitchRules::new(&config.auto_switch)
-            .map(|auto_switch| (config, auto_switch))
-            .map_err(|error| format!("Configuration: {error}"))
-    });
-    let (config, auto_switch) = match prepared {
+    let (config, auto_switch) = match prepare_configuration() {
         Ok(prepared) => prepared,
         Err(error) => {
             eprintln!("true-switcher: {error}");
             return tray::Tray::run_error(error);
         }
     };
-    let auto_settings = &config.auto_switch;
+
     let _tray = tray::Tray::start()?;
+
     let desktop = environment::KdePlasma::new()?;
     let keyboard = output::KeyboardOutput::new()?;
+    let statistics = statistics::Statistics::start();
+    let sound = sound::Sound::start(config.manual_switch_sound || config.auto_switch_sound);
+
     let focus_service = focus::FocusService::start()?;
     let layouts = layout::LayoutTracker::start();
-    let statistics = statistics::Statistics::start();
-    let sound =
-        sound::Sound::start(config.is_manual_switch_sound || auto_settings.is_sound_enabled);
+
     let history = history::History::with_layouts(layouts)
         .with_statistics(statistics.clone())
         .with_auto_switch(auto_switch);
     let mut input = input::Input::open(focus_service.changes(), config.switch_key, history)?;
+
     let mut switcher = Switcher {
         desktop,
         keyboard,
@@ -100,23 +98,41 @@ fn run() -> io::Result<()> {
     input.wait_for_keyboard_discovery(KEYBOARD_DISCOVERY_DELAY)?;
     eprintln!("Ready");
 
-    loop {
-        input.wait_for_request()?;
-        if !input.enter()? {
-            continue;
-        }
-        if let Some(correction) = Correction::from_input(
-            &input,
-            auto_settings.is_sound_enabled,
-            config.is_manual_switch_sound,
-        ) {
-            switcher.correct(&mut input, &correction)?;
-        }
-        input.leave()?;
-    }
+    switcher.process_requests(&mut input, &config)
+}
+
+fn prepare_configuration() -> Result<(config::Configuration, switch_rules::AutoSwitchRules), String>
+{
+    config::load().and_then(|config| {
+        switch_rules::AutoSwitchRules::new(&config)
+            .map(|auto_switch| (config, auto_switch))
+            .map_err(|error| format!("Configuration: {error}"))
+    })
 }
 
 impl Switcher {
+    fn process_requests(
+        &mut self,
+        input: &mut input::Input,
+        config: &config::Configuration,
+    ) -> io::Result<()> {
+        loop {
+            input.wait_for_switch_request()?;
+
+            if !input.enter()? {
+                continue;
+            }
+
+            if let Some(correction) =
+                Correction::from_input(input, config.auto_switch_sound, config.manual_switch_sound)
+            {
+                self.correct(input, &correction)?;
+            }
+
+            input.leave()?;
+        }
+    }
+
     fn correct(&mut self, input: &mut input::Input, correction: &Correction) -> io::Result<()> {
         let is_cancelled = AtomicBool::new(input.read_captured()?);
         thread::scope(|scope| -> io::Result<()> {
