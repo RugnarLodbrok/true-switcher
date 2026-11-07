@@ -53,7 +53,7 @@ pub struct Statistics {
 
 impl Statistics {
     pub fn start() -> Self {
-        Self::start_with_writer(store)
+        Self::start_with_writer(database_writer(open_database))
     }
 
     fn start_with_writer(
@@ -163,16 +163,30 @@ fn database_path(
         .ok_or_else(|| io::Error::other("XDG_STATE_HOME and HOME are unset"))
 }
 
-fn store(record: &Record) -> Result<(), Box<dyn std::error::Error>> {
+fn database_writer(
+    mut open: impl FnMut() -> Result<Connection, Box<dyn std::error::Error>>,
+) -> impl FnMut(&Record) -> Result<(), Box<dyn std::error::Error>> {
+    let mut connection = None;
+    move |record| {
+        if connection.is_none() {
+            let opened = open()?;
+            prepare_schema(&opened)?;
+            connection = Some(opened);
+        }
+        insert(connection.as_ref().unwrap(), record)?;
+        Ok(())
+    }
+}
+
+fn open_database() -> Result<Connection, Box<dyn std::error::Error>> {
     let path = database_path(env::var_os("XDG_STATE_HOME"), env::var_os("HOME"))?;
     fs::create_dir_all(path.parent().ok_or("database directory is missing")?)?;
     let connection = Connection::open(path)?;
     connection.busy_timeout(std::time::Duration::ZERO)?;
-    insert(&connection, record)?;
-    Ok(())
+    Ok(connection)
 }
 
-fn insert(connection: &Connection, record: &Record) -> rusqlite::Result<()> {
+fn prepare_schema(connection: &Connection) -> rusqlite::Result<()> {
     connection.execute_batch(SCHEMA)?;
     let has_mode = connection
         .prepare("PRAGMA table_info(switches)")?
@@ -184,6 +198,10 @@ fn insert(connection: &Connection, record: &Record) -> rusqlite::Result<()> {
         connection
             .execute_batch("ALTER TABLE switches ADD COLUMN mode INTEGER NOT NULL DEFAULT 0")?;
     }
+    Ok(())
+}
+
+fn insert(connection: &Connection, record: &Record) -> rusqlite::Result<()> {
     match record {
         Record::Switch(record) => {
             connection.execute(
@@ -219,9 +237,35 @@ mod tests {
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
     #[test]
+    fn database_writer_retries_initialization_and_reuses_connection() {
+        for is_open_error in [true, false] {
+            let attempts = std::rc::Rc::new(std::cell::Cell::new(0));
+            let open_attempts = attempts.clone();
+            let mut writer = database_writer(move || {
+                let attempt = open_attempts.get() + 1;
+                open_attempts.set(attempt);
+                if attempt == 1 && is_open_error {
+                    return Err(io::Error::other("open failed").into());
+                }
+                let connection = Connection::open_in_memory()?;
+                if attempt == 1 {
+                    connection.execute_batch("PRAGMA query_only = ON")?;
+                }
+                Ok(connection)
+            });
+            let record = Record::TypingWord("example".into());
+            assert!(writer(&record).is_err());
+            writer(&record).unwrap();
+            writer(&record).unwrap();
+            assert_eq!(attempts.get(), 2);
+        }
+    }
+
+    #[test]
     fn migrates_old_switches_as_manual_and_stores_auto_mode() {
         let connection = Connection::open_in_memory().unwrap();
         connection.execute_batch("CREATE TABLE switches (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER NOT NULL, prev TEXT NOT NULL, a TEXT NOT NULL, b TEXT NOT NULL); INSERT INTO switches (timestamp, prev, a, b) VALUES (1, '', 'old', 'old');").unwrap();
+        prepare_schema(&connection).unwrap();
         let mut record = make_record(None, None, &layout("us"), UNIX_EPOCH).unwrap();
         record.mode = SwitchMode::Auto;
         insert(&connection, &Record::Switch(record)).unwrap();
@@ -399,6 +443,7 @@ mod tests {
             INSERT INTO switches (timestamp, prev, a, b) VALUES (123, '', 'a', 'ф');",
             )
             .unwrap();
+        prepare_schema(&connection).unwrap();
         for text in ["привет", "привет", "привет,", "'\"; DROP TABLE switches;"] {
             insert(&connection, &Record::TypingWord(text.into())).unwrap();
         }
@@ -479,6 +524,7 @@ mod tests {
     #[test]
     fn sqlite_preserves_unicode_quotes_timestamps_and_autoincrements_ids() {
         let connection = Connection::open_in_memory().unwrap();
+        prepare_schema(&connection).unwrap();
         let record = SwitchRecord {
             mode: SwitchMode::Manual,
             timestamp: 123,
@@ -585,6 +631,7 @@ mod tests {
     fn database_error_does_not_stop_replay_or_later_writes() {
         let (sent, received) = mpsc::channel();
         let connection = Connection::open_in_memory().unwrap();
+        prepare_schema(&connection).unwrap();
         connection.execute_batch("PRAGMA query_only = ON").unwrap();
         let statistics = Statistics::start_with_writer(move |record| {
             let result = insert(&connection, record);
