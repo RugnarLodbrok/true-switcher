@@ -236,7 +236,7 @@ impl Input {
     pub fn wait_for_keyboard_discovery(&mut self, duration: Duration) -> io::Result<()> {
         let deadline = Instant::now() + duration;
         loop {
-            self.drain()?;
+            self.process_available_events()?;
             self.pending = None;
             self.is_auto_request = false;
             self.automatic_target = None;
@@ -245,18 +245,15 @@ impl Input {
             if remaining.is_zero() {
                 return Ok(());
             }
-            self.wait(Some(deadline))?;
+            self.wait_for_events(Some(deadline))?;
         }
     }
 
     pub fn wait_for_switch_request(&mut self) -> io::Result<()> {
-        while self.pending.is_none() {
-            self.drain()?;
-            if self.pending.is_none() {
-                self.wait(None)?;
-            }
+        if self.pending.is_some() {
+            return Ok(());
         }
-        Ok(())
+        self.process_events_until(|input| input.pending.is_some())
     }
 
     pub fn enter(&mut self) -> io::Result<bool> {
@@ -279,11 +276,11 @@ impl Input {
                 is_switch_key_reset = true;
                 self.is_original_switch_key_held = false;
             }
-            self.drain()?;
+            self.process_available_events()?;
             self.grab()?;
-            self.drain()?;
+            self.process_available_events()?;
             self.snapshot()?;
-            self.drain()?;
+            self.process_available_events()?;
             let presses = self.recording.take().unwrap().presses;
             eprintln!("ENTRY attempt={attempt} recorded {presses:?}");
             if self.pending.is_none() {
@@ -325,16 +322,16 @@ impl Input {
     }
 
     pub fn read_captured(&mut self) -> io::Result<bool> {
-        self.drain()?;
+        self.process_available_events()?;
         Ok(self.take_cancel_request())
     }
 
     pub fn leave(&mut self) -> io::Result<()> {
         eprintln!("WAIT_RELEASES begin");
         loop {
-            self.drain()?;
+            self.process_available_events()?;
             self.release_modifiers()?;
-            self.drain()?;
+            self.process_available_events()?;
             if self
                 .keyboards
                 .iter()
@@ -342,53 +339,68 @@ impl Input {
             {
                 break;
             }
-            self.wait(None)?;
+            self.wait_for_events(None)?;
         }
         self.ungrab()?;
         self.is_captured = false;
         self.release_locks()?;
-        self.drain()?;
+        self.process_available_events()?;
         eprintln!("WAIT_RELEASES complete");
         Ok(())
     }
 
     fn wait_ordinary(&mut self) -> io::Result<bool> {
         eprintln!("WAIT_ORDINARY begin");
-        loop {
-            self.drain()?;
-            let Some(switch_source) = self.pending else {
-                return Ok(false);
-            };
-            let is_held = self.keyboards.iter().enumerate().any(|(index, keyboard)| {
-                keyboard.held.iter().any(|&code| {
-                    !MODIFIERS.contains(&KeyCode::new(code))
-                        && !(self.is_original_switch_key_held
-                            && index == switch_source
-                            && code == self.switch_key.0)
-                })
-            });
-            if !is_held {
-                return Ok(true);
-            }
-            self.wait(None)?;
-        }
+        self.process_events_until(|input| !input.is_ordinary_key_held())?;
+        Ok(self.pending.is_some())
     }
 
-    fn drain(&mut self) -> io::Result<()> {
+    fn is_ordinary_key_held(&self) -> bool {
+        let Some(switch_source) = self.pending else {
+            return false;
+        };
+        self.keyboards.iter().enumerate().any(|(index, keyboard)| {
+            keyboard.held.iter().any(|&code| {
+                !MODIFIERS.contains(&KeyCode::new(code))
+                    && !(self.is_original_switch_key_held
+                        && index == switch_source
+                        && code == self.switch_key.0)
+            })
+        })
+    }
+
+    fn process_events_until(&mut self, is_ready: impl Fn(&Self) -> bool) -> io::Result<()> {
+        self.process_available_events()?;
+        while !is_ready(self) {
+            self.wait_for_events(None)?;
+        }
+        Ok(())
+    }
+
+    fn process_available_events(&mut self) -> io::Result<()> {
+        self.drain_events()?;
+        self.synchronize_history();
+        self.update_back_off(Instant::now());
+        Ok(())
+    }
+
+    fn drain_events(&mut self) -> io::Result<()> {
         while let Some(event) = self.events.available()? {
             self.process_message(event)?;
         }
+        Ok(())
+    }
+
+    fn synchronize_history(&mut self) {
         if !self.is_captured && self.recording.is_none() {
             self.history.synchronize_layout();
             if self.history.latest_word().is_none() {
                 self.automatic_target = None;
             }
         }
-        self.update_back_off(Instant::now());
-        Ok(())
     }
 
-    fn wait(&mut self, deadline: Option<Instant>) -> io::Result<()> {
+    fn wait_for_events(&mut self, deadline: Option<Instant>) -> io::Result<()> {
         let hold_deadline = if self.is_backing_off {
             None
         } else {
@@ -398,7 +410,7 @@ impl Input {
         if let Some(event) = self.events.wait(deadline)? {
             self.process_message(event)?;
         }
-        self.drain()
+        self.process_available_events()
     }
 
     fn process_message(&mut self, event: InputEventMessage) -> io::Result<()> {
@@ -430,7 +442,7 @@ impl Input {
 
     pub fn wait_for_correction(&mut self) -> io::Result<Option<io::Result<()>>> {
         if self.correction_result.is_none() {
-            self.wait(None)?;
+            self.wait_for_events(None)?;
         }
         Ok(self.correction_result.take())
     }
@@ -764,7 +776,7 @@ impl Input {
                 error.get_or_insert(err);
             }
         }
-        if let Err(err) = self.drain() {
+        if let Err(err) = self.process_available_events() {
             error.get_or_insert(err);
         }
         if let Err(err) = self.ungrab() {
@@ -798,7 +810,7 @@ impl Drop for Input {
     fn drop(&mut self) {
         eprintln!("CLEANUP begin");
         if self.recording.is_some() {
-            let _ = self.drain();
+            let _ = self.process_available_events();
             let _ = self.snapshot();
             self.repair
                 .extend(self.recording.take().unwrap_or_default().presses);
@@ -1152,6 +1164,57 @@ patterns = ['^\.тф']
     }
 
     #[test]
+    fn existing_switch_request_returns_without_consuming_events() {
+        let (mut input, sender) = channel_input();
+        sender.send(InputEventMessage::FocusChanged);
+
+        input.wait_for_switch_request().unwrap();
+
+        assert_eq!(input.pending, Some(0));
+        assert!(matches!(
+            input.events.available().unwrap(),
+            Some(InputEventMessage::FocusChanged)
+        ));
+    }
+
+    #[test]
+    fn switch_request_wait_processes_the_entire_event_batch() {
+        let (mut input, sender) = channel_input();
+        input.pending = None;
+        input.is_original_switch_key_held = false;
+        let worker = thread::spawn(move || {
+            for value in [1, 0] {
+                sender.send(InputEventMessage::Keyboard(
+                    0,
+                    InputEvent::new(EventType::KEY.0, KeyCode::KEY_PAUSE.0, value),
+                ));
+            }
+        });
+        worker.join().unwrap();
+
+        input.wait_for_switch_request().unwrap();
+
+        assert_eq!(input.pending, Some(0));
+        assert!(!input.is_original_switch_key_held);
+        assert!(!input.keyboards[0].held.contains(&KeyCode::KEY_PAUSE.0));
+        assert!(input.events.available().unwrap().is_none());
+    }
+
+    #[test]
+    fn switch_request_wait_propagates_device_errors() {
+        let (mut input, sender) = channel_input();
+        input.pending = None;
+        sender.send(InputEventMessage::DeviceError(io::Error::other(
+            "device disconnected",
+        )));
+
+        assert_eq!(
+            input.wait_for_switch_request().unwrap_err().to_string(),
+            "device disconnected"
+        );
+    }
+
+    #[test]
     fn queued_layouts_are_applied_in_order_and_duplicate_layouts_keep_history() {
         let (mut input, sender) = channel_input();
         sender.send(InputEventMessage::LayoutChanged(Some(layout("us"))));
@@ -1160,10 +1223,10 @@ patterns = ['^\.тф']
             InputEvent::new(EventType::KEY.0, KeyCode::KEY_A.0, 1),
         ));
         sender.send(InputEventMessage::LayoutChanged(Some(layout("us"))));
-        input.drain().unwrap();
+        input.process_available_events().unwrap();
         assert_eq!(input.latest_word().unwrap().text().as_deref(), Some("a"));
         sender.send(InputEventMessage::LayoutChanged(Some(layout("ru"))));
-        input.drain().unwrap();
+        input.process_available_events().unwrap();
         assert!(input.latest_word().is_none());
     }
 
@@ -1174,7 +1237,7 @@ patterns = ['^\.тф']
         press(&mut input, KeyCode::KEY_A);
         input.is_captured = true;
         sender.send(InputEventMessage::LayoutChanged(Some(layout("ru"))));
-        input.drain().unwrap();
+        input.process_available_events().unwrap();
         assert_eq!(input.latest_word().unwrap().text().as_deref(), Some("a"));
         sender.send(InputEventMessage::CorrectionFinished {
             result: Ok(()),
@@ -1248,7 +1311,7 @@ patterns = ['^\.тф']
             "device disconnected",
         )));
         assert_eq!(
-            input.wait(None).unwrap_err().to_string(),
+            input.wait_for_events(None).unwrap_err().to_string(),
             "device disconnected"
         );
     }
@@ -1264,7 +1327,7 @@ patterns = ['^\.тф']
             Instant::now() - HOLD_TIMEOUT - TEST_STEP,
         );
         assert!(!input.is_backing_off);
-        input.wait(None).unwrap();
+        input.wait_for_events(None).unwrap();
         assert!(input.is_backing_off);
         assert!(input.latest_word().is_none());
     }
@@ -1318,7 +1381,7 @@ patterns = ['^\.тф']
             1,
             Instant::now() - HOLD_TIMEOUT - TEST_STEP,
         );
-        input.drain().unwrap();
+        input.process_available_events().unwrap();
         assert!(input.is_backing_off);
         assert!(input.latest_word().is_none());
     }
@@ -1516,7 +1579,7 @@ patterns = ['^\.тф']
             .borrow_mut()
             .events
             .push(InputEvent::new(EventType::KEY.0, KeyCode::KEY_PAUSE.0, 1));
-        input.drain().unwrap();
+        input.process_available_events().unwrap();
         assert_eq!(input.pending, Some(0));
     }
 
