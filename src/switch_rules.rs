@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use regex::RegexSet;
 
-use crate::{config::Configuration, history::Word, layout::Layout};
+use crate::{config::Configuration, layout::Layout, word::Word};
 
 struct CompiledRule {
     target: Arc<Layout>,
@@ -54,7 +54,7 @@ impl AutoSwitchRules {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::{Stroke, WordStroke};
+    use crate::word::{Stroke, WordStroke};
     use evdev::KeyCode;
 
     fn parse_config(text: &str) -> Result<Configuration, String> {

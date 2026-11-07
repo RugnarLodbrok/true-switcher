@@ -35,7 +35,7 @@ pub struct Layout {
 impl Layout {
     pub fn text<'a>(
         &self,
-        strokes: impl IntoIterator<Item = &'a crate::history::Stroke>,
+        strokes: impl IntoIterator<Item = &'a crate::word::Stroke>,
     ) -> Option<String> {
         if [&self.name, &self.variant, &self.model, &self.options]
             .iter()

@@ -98,6 +98,10 @@ pub struct Input {
     keyboards: Vec<Keyboard>,
     pointers: Vec<Pointer>,
     history: History,
+    statistics: Option<crate::statistics::Statistics>,
+    auto_switch: crate::switch_rules::AutoSwitchRules,
+    layout: Option<Arc<crate::layout::Layout>>,
+    observed_layout: Option<Arc<crate::layout::Layout>>,
     events: InputEvents,
     holds: HoldDetector,
     correction_result: Option<io::Result<()>>,
@@ -120,12 +124,17 @@ impl Input {
         events: InputEvents,
         sender: InputEventSender,
         switch_key: KeyCode,
-        history: History,
+        statistics: crate::statistics::Statistics,
+        auto_switch: crate::switch_rules::AutoSwitchRules,
     ) -> io::Result<Self> {
         let mut input = Self {
             keyboards: Vec::new(),
             pointers: Vec::new(),
-            history,
+            history: History::default(),
+            statistics: Some(statistics),
+            auto_switch,
+            layout: None,
+            observed_layout: None,
             events,
             holds: HoldDetector::default(),
             correction_result: None,
@@ -143,13 +152,6 @@ impl Input {
             automatic_target: None,
         };
         input.discover_devices(&sender)?;
-        for keyboard in &input.keyboards {
-            for &code in &keyboard.held {
-                if MODIFIERS.contains(&KeyCode::new(code)) {
-                    input.history.process(&keyboard.path, KeyCode::new(code), 1);
-                }
-            }
-        }
         Ok(input)
     }
 
@@ -301,7 +303,7 @@ impl Input {
         }
     }
 
-    pub fn latest_word(&self) -> Option<&crate::history::Word> {
+    pub fn latest_word(&self) -> Option<&crate::word::Word> {
         self.history.latest_word()
     }
 
@@ -314,11 +316,15 @@ impl Input {
         self.automatic_target.clone()
     }
 
-    pub fn previous_word(&self) -> Option<&crate::history::Word> {
+    pub fn previous_word(&self) -> Option<&crate::word::Word> {
         self.history.previous_word()
     }
 
     pub fn set_latest_layout(&mut self, layout: Option<Arc<crate::layout::Layout>>) {
+        if layout.is_some() {
+            self.layout = layout.clone();
+            self.observed_layout = layout.clone();
+        }
         self.history.set_latest_layout(layout);
     }
 
@@ -394,7 +400,7 @@ impl Input {
 
     fn synchronize_history(&mut self) {
         if !self.is_captured && self.recording.is_none() {
-            self.history.synchronize_layout();
+            self.synchronize_layout();
             if self.history.latest_word().is_none() {
                 self.automatic_target = None;
             }
@@ -421,19 +427,18 @@ impl Input {
             InputEventMessage::DeviceError(error) => return Err(error),
             InputEventMessage::FocusChanged => self.request_history_reset(),
             InputEventMessage::LayoutChanged(layout) => {
-                self.history
-                    .accept_layout(layout, self.is_captured || self.recording.is_some());
+                self.accept_layout(layout, self.is_captured || self.recording.is_some());
                 if self.history.latest_word().is_none() {
                     self.automatic_target = None;
                 }
             }
             InputEventMessage::CorrectionFinished { result, layout } => {
-                self.history.accept_layout(layout.clone(), true);
+                self.accept_layout(layout.clone(), true);
                 if result.is_ok() && !self.is_correction_cancelled {
                     self.set_latest_layout(layout);
                 } else {
-                    self.history.accept_layout(layout, false);
-                    self.history.reset();
+                    self.accept_layout(layout, false);
+                    self.reset_history();
                 }
                 self.correction_result = Some(result);
             }
@@ -483,18 +488,14 @@ impl Input {
         if value == 2 && !is_shift(key) {
             self.start_back_off();
         }
-        let path = self.keyboards[index].path.clone();
         if self.is_backing_off {
-            if MODIFIERS.contains(&key) {
-                self.history.process(&path, key, value);
-            }
             if value == 0 {
                 self.request_history_reset();
             }
             self.update_back_off(now);
             return Ok(());
         }
-        self.process_history_event(index, &path, key, value)
+        self.process_history_event(index, key, value)
     }
 
     fn track_key(&mut self, index: usize, event: InputEvent) {
@@ -518,17 +519,14 @@ impl Input {
         }
     }
 
-    fn process_history_event(
-        &mut self,
-        index: usize,
-        path: &Path,
-        key: KeyCode,
-        value: i32,
-    ) -> io::Result<()> {
-        let is_tab_separator = key == KeyCode::KEY_TAB && !self.has_shortcut_modifier();
+    fn process_history_event(&mut self, index: usize, key: KeyCode, value: i32) -> io::Result<()> {
+        let is_hard_separator = matches!(
+            key,
+            KeyCode::KEY_TAB | KeyCode::KEY_ENTER | KeyCode::KEY_KPENTER
+        ) && !self.has_shortcut_modifier();
         let is_pointer_click = value == 1 && is_pointer_press(key.0);
         if (self.should_reset_for_key(key, value) || is_pointer_click)
-            && (!is_tab_separator || self.is_captured)
+            && (!is_hard_separator || self.is_captured)
         {
             self.request_history_reset();
         }
@@ -547,7 +545,30 @@ impl Input {
             }
             return Ok(());
         }
-        let events = self.history.process(path, key, value);
+        self.process_text_event(index, key, value, is_hard_separator);
+        Ok(())
+    }
+
+    fn process_text_event(
+        &mut self,
+        index: usize,
+        key: KeyCode,
+        value: i32,
+        is_hard_separator: bool,
+    ) {
+        if matches!(value, 1 | 2) && !self.has_shortcut_modifier() {
+            if is_hard_separator {
+                self.reset_history();
+            } else {
+                let is_shift = self.keyboards.iter().any(|keyboard| {
+                    keyboard
+                        .held
+                        .iter()
+                        .any(|&code| is_shift(KeyCode::new(code)))
+                });
+                self.history.process(key, is_shift, self.layout.clone());
+            }
+        }
         if matches!(value, 1 | 2) && (key == KeyCode::KEY_BACKSPACE || key == KeyCode::KEY_SPACE) {
             self.automatic_target = None;
         }
@@ -556,22 +577,21 @@ impl Input {
             && !self.has_shortcut_modifier()
             && (self.pending.is_none() || self.is_auto_request)
         {
-            self.automatic_target = self.history.automatic_target();
+            self.automatic_target = self
+                .history
+                .latest_word()
+                .filter(|word| word.trailing_spaces == 0)
+                .and_then(|word| {
+                    self.layout
+                        .as_ref()
+                        .and_then(|layout| self.auto_switch.target(word, layout))
+                });
             if self.automatic_target.is_some() {
                 self.pending = Some(index);
                 self.is_auto_request = true;
                 self.is_original_switch_key_held = false;
             }
         }
-        for event in events {
-            match event {
-                crate::history::HistoryEvent::WordCompleted(word)
-                | crate::history::HistoryEvent::WordRestored(word) => log::trace!("{word}"),
-                crate::history::HistoryEvent::LastWordRemoved
-                | crate::history::HistoryEvent::Reset => log::trace!(""),
-            }
-        }
-        Ok(())
     }
 
     fn process_pointer(&mut self, index: usize, event: InputEvent) -> io::Result<()> {
@@ -630,7 +650,7 @@ impl Input {
 
     fn request_history_reset(&mut self) {
         self.automatic_target = None;
-        self.history.reset();
+        self.reset_history();
         if self.is_captured {
             self.is_cancel_requested = true;
             self.is_correction_cancelled = true;
@@ -663,7 +683,32 @@ impl Input {
     }
 
     pub fn reset_history(&mut self) {
-        self.history.reset();
+        for word in self.history.reset() {
+            if let Some(statistics) = &self.statistics {
+                statistics.record_word(word);
+            }
+        }
+    }
+
+    fn accept_layout(&mut self, layout: Option<Arc<crate::layout::Layout>>, is_deferred: bool) {
+        self.layout = layout;
+        if !is_deferred {
+            self.synchronize_layout();
+        }
+    }
+
+    fn synchronize_layout(&mut self) {
+        let Some(current) = self.layout.clone() else {
+            return;
+        };
+        if self
+            .observed_layout
+            .as_ref()
+            .is_some_and(|old| old != &current)
+        {
+            self.reset_history();
+        }
+        self.observed_layout = Some(current);
     }
 
     pub fn take_cancel_request(&mut self) -> bool {
@@ -693,9 +738,6 @@ impl Input {
         self.holds.update(index, key.0, value, Instant::now());
         if value == 0 {
             keyboard.held.remove(&key.0);
-            if MODIFIERS.contains(&key) {
-                self.history.process(&keyboard.path, key, 0);
-            }
         } else {
             keyboard.held.insert(key.0);
         }
@@ -947,7 +989,7 @@ fn is_repair_key(key: KeyCode) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::hold::HOLD_TIMEOUT;
     use std::cell::RefCell;
@@ -1089,6 +1131,10 @@ mod tests {
             keyboards,
             pointers: Vec::new(),
             history: History::default(),
+            statistics: None,
+            auto_switch: Default::default(),
+            layout: None,
+            observed_layout: None,
             events,
             holds,
             correction_result: None,
@@ -1105,6 +1151,22 @@ mod tests {
             is_auto_request: false,
             automatic_target: None,
         }
+    }
+
+    pub(crate) fn statistics_input(statistics: crate::statistics::Statistics) -> Input {
+        let source = Rc::new(RefCell::new(SimulatedKeyboard::default()));
+        let mut input = simulated_input(&[source]);
+        input.pending = None;
+        input.is_original_switch_key_held = false;
+        input.statistics = Some(statistics);
+        input.accept_layout(Some(layout("us")), false);
+        input
+    }
+
+    pub(crate) fn statistics_event(input: &mut Input, key: KeyCode, value: i32) {
+        input
+            .process(0, InputEvent::new(EventType::KEY.0, key.0, value))
+            .unwrap();
     }
 
     fn auto_input() -> Input {
@@ -1132,8 +1194,8 @@ patterns = ['^\.тф']
             }))
         })
         .unwrap();
-        input.history = History::default().with_auto_switch(switch);
-        input.history.accept_layout(
+        input.auto_switch = switch;
+        input.accept_layout(
             Some(Arc::new(crate::layout::Layout {
                 name: "ru".into(),
                 ..Default::default()
@@ -1167,6 +1229,54 @@ patterns = ['^\.тф']
         let input = simulated_input(std::slice::from_ref(&source));
         let sender = source.borrow().events.sender.as_ref().unwrap().clone();
         (input, sender)
+    }
+
+    #[test]
+    fn shift_on_other_keyboard_survives_release_and_history_reset() {
+        let first = Rc::new(RefCell::new(SimulatedKeyboard::default()));
+        let second = Rc::new(RefCell::new(SimulatedKeyboard::default()));
+        let mut input = simulated_input(&[first, second]);
+        input.pending = None;
+        let now = Instant::now();
+        event_at(&mut input, 0, KeyCode::KEY_LEFTSHIFT, 1, now);
+        event_at(&mut input, 1, KeyCode::KEY_RIGHTSHIFT, 1, now);
+        event_at(&mut input, 0, KeyCode::KEY_LEFTSHIFT, 0, now);
+        press(&mut input, KeyCode::KEY_A);
+        assert!(input.latest_word().unwrap().entries[0].stroke.shift);
+        input.reset_history();
+        press(&mut input, KeyCode::KEY_B);
+        event_at(&mut input, 1, KeyCode::KEY_RIGHTSHIFT, 0, now);
+        press(&mut input, KeyCode::KEY_C);
+        let entries = &input.latest_word().unwrap().entries;
+        assert!(entries[0].stroke.shift);
+        assert!(!entries[1].stroke.shift);
+    }
+
+    #[test]
+    fn initial_held_shift_is_used_and_capture_tracks_release() {
+        let source = Rc::new(RefCell::new(SimulatedKeyboard::default()));
+        source.borrow_mut().held.insert(KeyCode::KEY_LEFTSHIFT.0);
+        let mut input = simulated_input(&[source]);
+        input.pending = None;
+        press(&mut input, KeyCode::KEY_A);
+        assert!(input.latest_word().unwrap().entries[0].stroke.shift);
+        input.is_captured = true;
+        statistics_event(&mut input, KeyCode::KEY_LEFTSHIFT, 0);
+        input.is_captured = false;
+        press(&mut input, KeyCode::KEY_B);
+        assert!(!input.latest_word().unwrap().entries[1].stroke.shift);
+    }
+
+    #[test]
+    fn unknown_layout_keeps_history_and_last_known_layout_for_comparison() {
+        let mut input = auto_input();
+        press(&mut input, KeyCode::KEY_A);
+        input.accept_layout(None, false);
+        press(&mut input, KeyCode::KEY_B);
+        assert_eq!(input.latest_word().unwrap().entries.len(), 2);
+        assert!(input.latest_word().unwrap().entries[1].layout.is_none());
+        input.accept_layout(Some(layout("us")), false);
+        assert!(input.latest_word().is_none());
     }
 
     #[test]
@@ -1239,7 +1349,7 @@ patterns = ['^\.тф']
     #[test]
     fn completion_replaces_deferred_layout_and_late_duplicate_preserves_corrected_word() {
         let (mut input, sender) = channel_input();
-        input.history.accept_layout(Some(layout("us")), false);
+        input.accept_layout(Some(layout("us")), false);
         press(&mut input, KeyCode::KEY_A);
         input.is_captured = true;
         sender.send(InputEventMessage::LayoutChanged(Some(layout("ru"))));
@@ -1260,7 +1370,7 @@ patterns = ['^\.тф']
     #[test]
     fn layout_change_after_completion_is_reconciled_when_capture_ends() {
         let (mut input, sender) = channel_input();
-        input.history.accept_layout(Some(layout("us")), false);
+        input.accept_layout(Some(layout("us")), false);
         press(&mut input, KeyCode::KEY_A);
         input.is_captured = true;
         sender.send(InputEventMessage::CorrectionFinished {

@@ -1,5 +1,5 @@
 use super::*;
-use crate::history::Stroke;
+use crate::word::Stroke;
 use evdev::KeyCode;
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};

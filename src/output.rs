@@ -5,7 +5,8 @@ use evdev::{
     uinput::{VirtualDevice, VirtualDeviceBuilder},
 };
 
-use crate::history::{Stroke, Word, is_text_key};
+use crate::history::is_text_key;
+use crate::word::{Stroke, Word};
 
 const DEVICE_PHYS: &std::ffi::CStr = c"true-switcher/keyboard";
 const DEVICE_NAME: &str = "true-switcher-keyboard";
@@ -233,7 +234,7 @@ mod tests {
                 },
             ]
             .into_iter()
-            .map(|stroke| crate::history::WordStroke {
+            .map(|stroke| crate::word::WordStroke {
                 stroke,
                 layout: None,
             })
@@ -323,7 +324,7 @@ mod tests {
                 2
             ]
             .into_iter()
-            .map(|stroke| crate::history::WordStroke {
+            .map(|stroke| crate::word::WordStroke {
                 stroke,
                 layout: None,
             })
@@ -390,7 +391,7 @@ mod tests {
                 },
             ]
             .into_iter()
-            .map(|stroke| crate::history::WordStroke {
+            .map(|stroke| crate::word::WordStroke {
                 stroke,
                 layout: None,
             })

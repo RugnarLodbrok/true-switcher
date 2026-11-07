@@ -1,125 +1,14 @@
-use std::collections::HashSet;
-use std::fmt;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-
+use crate::layout::Layout;
+use crate::word::{Stroke, Word, WordStroke};
 use evdev::KeyCode;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Stroke {
-    pub key: KeyCode,
-    pub shift: bool,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Word {
-    pub entries: Vec<WordStroke>,
-    pub trailing_spaces: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WordStroke {
-    pub stroke: Stroke,
-    pub layout: Option<Arc<crate::layout::Layout>>,
-}
-
-impl Word {
-    pub fn strokes(&self) -> impl Iterator<Item = &Stroke> {
-        self.entries.iter().map(|entry| &entry.stroke)
-    }
-
-    pub fn text(&self) -> Option<String> {
-        let mut text = String::new();
-        let mut start = 0;
-        while start < self.entries.len() {
-            let layout = self.entries[start].layout.as_ref()?;
-            let end = (start + 1..self.entries.len())
-                .find(|&index| self.entries[index].layout.as_ref() != Some(layout))
-                .unwrap_or(self.entries.len());
-            text.push_str(
-                &layout.text(self.entries[start..end].iter().map(|entry| &entry.stroke))?,
-            );
-            start = end;
-        }
-        Some(text)
-    }
-}
-
-impl fmt::Display for Word {
-    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (index, stroke) in self.strokes().enumerate() {
-            if index > 0 {
-                write!(output, " ")?;
-            }
-            if stroke.shift {
-                write!(output, "Shift+")?;
-            }
-            write!(output, "{:?}", stroke.key)?;
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum HistoryEvent {
-    WordCompleted(Word),
-    WordRestored(Word),
-    LastWordRemoved,
-    Reset,
-}
+use std::sync::Arc;
 
 #[derive(Default)]
 pub struct History {
     words: Vec<Word>,
-    layout: Option<Arc<crate::layout::Layout>>,
-    statistics: Option<crate::statistics::Statistics>,
-    observed_layout: Option<Arc<crate::layout::Layout>>,
-    auto_switch: crate::switch_rules::AutoSwitchRules,
-    // Track modifiers per keyboard: releasing Shift on one device must not
-    // release a Shift still held on another one.
-    modifiers: HashSet<(PathBuf, KeyCode)>,
 }
 
 impl History {
-    pub fn with_statistics(mut self, statistics: crate::statistics::Statistics) -> Self {
-        self.statistics = Some(statistics);
-        self
-    }
-
-    pub fn with_auto_switch(mut self, auto_switch: crate::switch_rules::AutoSwitchRules) -> Self {
-        self.auto_switch = auto_switch;
-        self
-    }
-
-    pub fn automatic_target(&self) -> Option<Arc<crate::layout::Layout>> {
-        let word = self
-            .latest_word()
-            .filter(|word| word.trailing_spaces == 0)?;
-        self.auto_switch
-            .target(word, self.layout.as_ref()?.as_ref())
-    }
-
-    pub fn accept_layout(&mut self, layout: Option<Arc<crate::layout::Layout>>, is_deferred: bool) {
-        self.layout = layout;
-        if !is_deferred {
-            self.synchronize_layout();
-        }
-    }
-
-    pub fn synchronize_layout(&mut self) {
-        let Some(current) = self.layout.clone() else {
-            return;
-        };
-        if self
-            .observed_layout
-            .as_ref()
-            .is_some_and(|old| old != &current)
-        {
-            self.reset();
-        }
-        self.observed_layout = Some(current);
-    }
-
     pub fn previous_word(&self) -> Option<&Word> {
         self.words
             .len()
@@ -127,11 +16,11 @@ impl History {
             .and_then(|index| self.words.get(index))
     }
 
-    pub fn set_latest_layout(&mut self, layout: Option<Arc<crate::layout::Layout>>) {
-        if layout.is_some() {
-            self.layout = layout.clone();
-            self.observed_layout = layout.clone();
-        }
+    pub fn latest_word(&self) -> Option<&Word> {
+        self.words.last()
+    }
+
+    pub fn set_latest_layout(&mut self, layout: Option<Arc<Layout>>) {
         if let Some(word) = self.words.last_mut() {
             for entry in &mut word.entries {
                 entry.layout = layout.clone();
@@ -139,50 +28,17 @@ impl History {
         }
     }
 
-    pub fn latest_word(&self) -> Option<&Word> {
-        self.words.last()
-    }
-
-    /// A repeat is another stroke, not a held key in the stored word.
-    pub fn process(&mut self, device: &Path, key: KeyCode, value: i32) -> Vec<HistoryEvent> {
-        if !matches!(value, 0..=2) {
-            return Vec::new();
-        }
-        if is_modifier(key) {
-            if value == 0 {
-                self.modifiers.remove(&(device.to_owned(), key));
-            } else {
-                self.modifiers.insert((device.to_owned(), key));
-            }
-            return Vec::new();
-        }
-        if value == 0 || self.modifiers.iter().any(|(_, key)| !is_shift(*key)) {
-            return Vec::new();
-        }
-
+    pub fn process(&mut self, key: KeyCode, is_shift: bool, layout: Option<Arc<Layout>>) {
         match key {
-            KeyCode::KEY_TAB | KeyCode::KEY_ENTER | KeyCode::KEY_KPENTER => {
-                let mut lines = Vec::new();
-                if let Some(word) = self.words.last().filter(|word| word.trailing_spaces == 0) {
-                    lines.push(HistoryEvent::WordCompleted(word.clone()));
-                }
-                // These separators cannot be crossed by a correction.
-                self.reset();
-                lines.push(HistoryEvent::Reset);
-                lines
-            }
             KeyCode::KEY_SPACE => {
-                let Some(word) = self.words.last_mut() else {
-                    return Vec::new();
-                };
-                word.trailing_spaces += 1;
-                if word.trailing_spaces == 1 {
-                    vec![HistoryEvent::WordCompleted(word.clone())]
-                } else {
-                    Vec::new()
+                if let Some(word) = self.words.last_mut() {
+                    word.trailing_spaces += 1;
+                    if word.trailing_spaces == 1 {
+                        log::trace!("{word}");
+                    }
                 }
             }
-            KeyCode::KEY_BACKSPACE => self.backspace().into_iter().collect(),
+            KeyCode::KEY_BACKSPACE => self.backspace(),
             key if is_text_key(key) => {
                 if self
                     .words
@@ -191,63 +47,44 @@ impl History {
                 {
                     self.words.push(Word::default());
                 }
-                let shift = self.modifiers.iter().any(|(_, key)| is_shift(*key));
-                let word = self.words.last_mut().unwrap();
-                word.entries.push(WordStroke {
-                    stroke: Stroke { key, shift },
-                    layout: self.layout.clone(),
+                self.words.last_mut().unwrap().entries.push(WordStroke {
+                    stroke: Stroke {
+                        key,
+                        shift: is_shift,
+                    },
+                    layout,
                 });
-                Vec::new()
             }
-            _ => Vec::new(),
+            _ => {}
         }
     }
 
-    /// Preserve held modifiers: resetting text history does not release keys.
-    pub fn reset(&mut self) {
-        for word in self.words.drain(..) {
-            if let Some(statistics) = &self.statistics {
-                statistics.record_word(&word);
-            }
+    pub fn reset(&mut self) -> Vec<Word> {
+        if let Some(word) = self.words.last().filter(|word| word.trailing_spaces == 0) {
+            log::trace!("{word}");
         }
+        log::trace!("");
+        std::mem::take(&mut self.words)
     }
 
-    fn backspace(&mut self) -> Option<HistoryEvent> {
-        let word = self.words.last_mut()?;
+    fn backspace(&mut self) {
+        let Some(word) = self.words.last_mut() else {
+            return;
+        };
         if word.trailing_spaces > 0 {
             word.trailing_spaces -= 1;
-            return None;
+            return;
         }
         word.entries.pop();
         if word.entries.is_empty() {
             self.words.pop();
-            return Some(
-                self.words
-                    .last()
-                    .cloned()
-                    .map(HistoryEvent::WordRestored)
-                    .unwrap_or(HistoryEvent::LastWordRemoved),
-            );
+            if let Some(word) = self.words.last() {
+                log::trace!("{word}");
+            } else {
+                log::trace!("");
+            }
         }
-        None
     }
-}
-
-fn is_shift(key: KeyCode) -> bool {
-    matches!(key, KeyCode::KEY_LEFTSHIFT | KeyCode::KEY_RIGHTSHIFT)
-}
-
-fn is_modifier(key: KeyCode) -> bool {
-    is_shift(key)
-        || matches!(
-            key,
-            KeyCode::KEY_LEFTCTRL
-                | KeyCode::KEY_RIGHTCTRL
-                | KeyCode::KEY_LEFTALT
-                | KeyCode::KEY_RIGHTALT
-                | KeyCode::KEY_LEFTMETA
-                | KeyCode::KEY_RIGHTMETA
-        )
 }
 
 pub(crate) fn is_text_key(key: KeyCode) -> bool {
@@ -264,237 +101,104 @@ pub(crate) fn is_text_key(key: KeyCode) -> bool {
 mod tests {
     use super::*;
 
-    fn layout(name: &str) -> Arc<crate::layout::Layout> {
-        Arc::new(crate::layout::Layout {
-            name: name.into(),
-            ..Default::default()
-        })
-    }
-
-    #[test]
-    fn previous_word_keeps_its_layout_and_backspace_removes_the_latest_stroke() {
-        let mut history = History::default();
-        history.accept_layout(Some(layout("us")), false);
-        press(&mut history, KeyCode::KEY_A);
-        press(&mut history, KeyCode::KEY_SPACE);
-        history.set_latest_layout(Some(layout("ru")));
-        press(&mut history, KeyCode::KEY_A);
-        press(&mut history, KeyCode::KEY_B);
-        assert_eq!(
-            history.previous_word().unwrap().text().as_deref(),
-            Some("ф")
-        );
-        assert_eq!(history.latest_word().unwrap().text().as_deref(), Some("фи"));
-        press(&mut history, KeyCode::KEY_BACKSPACE);
-        assert_eq!(history.latest_word().unwrap().text().as_deref(), Some("ф"));
-        history.set_latest_layout(Some(layout("us")));
-        assert_eq!(history.latest_word().unwrap().text().as_deref(), Some("a"));
-    }
-
-    #[test]
-    fn manual_layout_changes_reset_history() {
-        let mut history = History::default();
-        history.accept_layout(Some(layout("us")), false);
-        press(&mut history, KeyCode::KEY_A);
-        history.accept_layout(Some(layout("ru")), false);
-        press(&mut history, KeyCode::KEY_A);
-        assert_eq!(history.latest_word().unwrap().text().as_deref(), Some("ф"));
-        assert!(history.previous_word().is_none());
-        history.accept_layout(None, false);
-        press(&mut history, KeyCode::KEY_B);
-        assert!(history.latest_word().unwrap().text().is_none());
-    }
-
-    #[test]
-    fn word_preserves_mixed_and_unknown_layouts_per_stroke() {
-        let mut word = Word {
-            entries: vec![
-                WordStroke {
-                    stroke: Stroke {
-                        key: KeyCode::KEY_A,
-                        shift: true,
-                    },
-                    layout: Some(layout("us")),
-                },
-                WordStroke {
-                    stroke: Stroke {
-                        key: KeyCode::KEY_B,
-                        shift: false,
-                    },
-                    layout: Some(layout("ru")),
-                },
-            ],
-            trailing_spaces: 2,
-        };
-        assert_eq!(word.text().as_deref(), Some("Aи"));
-        word.entries[1].layout = None;
-        assert_eq!(word.text(), None);
-        word.entries.pop();
-        assert_eq!(word.text().as_deref(), Some("A"));
-        word.entries.clear();
-        assert_eq!(word.text().as_deref(), Some(""));
-    }
-
-    fn event(history: &mut History, key: KeyCode, value: i32) -> Vec<String> {
-        history
-            .process(Path::new("keyboard"), key, value)
-            .into_iter()
-            .map(|event| match event {
-                HistoryEvent::WordCompleted(word) | HistoryEvent::WordRestored(word) => {
-                    word.to_string()
-                }
-                HistoryEvent::LastWordRemoved | HistoryEvent::Reset => String::new(),
-            })
-            .collect()
-    }
-
-    fn press(history: &mut History, key: KeyCode) -> Vec<String> {
-        event(history, key, 1)
-    }
-
-    #[test]
-    fn reports_completion_restoration_removal_and_reset_as_distinct_events() {
-        let mut history = History::default();
-        let device = Path::new("keyboard");
-        history.process(device, KeyCode::KEY_A, 1);
-        let first = history.latest_word().unwrap().clone();
-        assert_eq!(
-            history.process(device, KeyCode::KEY_SPACE, 1),
-            [HistoryEvent::WordCompleted(Word {
-                trailing_spaces: 1,
-                ..first.clone()
-            })]
-        );
-        history.process(device, KeyCode::KEY_B, 1);
-        assert_eq!(
-            history.process(device, KeyCode::KEY_BACKSPACE, 1),
-            [HistoryEvent::WordRestored(Word {
-                trailing_spaces: 1,
-                ..first
-            })]
-        );
-        history.process(device, KeyCode::KEY_BACKSPACE, 1);
-        assert_eq!(
-            history.process(device, KeyCode::KEY_BACKSPACE, 1),
-            [HistoryEvent::LastWordRemoved]
-        );
-        assert_eq!(
-            history.process(device, KeyCode::KEY_ENTER, 1),
-            [HistoryEvent::Reset]
+    fn press(history: &mut History, key: KeyCode) {
+        history.process(
+            key,
+            false,
+            Some(Arc::new(Layout {
+                name: "us".into(),
+                ..Default::default()
+            })),
         );
     }
 
     #[test]
-    fn completes_physical_word_with_punctuation_and_keeps_all_spaces() {
-        let mut history = History::default();
-        assert!(press(&mut history, KeyCode::KEY_G).is_empty());
-        press(&mut history, KeyCode::KEY_COMMA);
-        assert_eq!(press(&mut history, KeyCode::KEY_SPACE), ["KEY_G KEY_COMMA"]);
-        assert!(event(&mut history, KeyCode::KEY_SPACE, 2).is_empty());
-        assert_eq!(history.words[0].trailing_spaces, 2);
-        assert_eq!(history.words[0].entries.len(), 2);
-    }
-
-    #[test]
-    fn repeats_are_strokes_and_releases_do_not_type() {
-        let mut history = History::default();
-        press(&mut history, KeyCode::KEY_A);
-        event(&mut history, KeyCode::KEY_A, 2);
-        event(&mut history, KeyCode::KEY_A, 0);
-        assert_eq!(press(&mut history, KeyCode::KEY_SPACE), ["KEY_A KEY_A"]);
-        press(&mut history, KeyCode::KEY_BACKSPACE);
-        event(&mut history, KeyCode::KEY_BACKSPACE, 2);
-        assert_eq!(history.words[0].entries.len(), 1);
-        assert_eq!(event(&mut history, KeyCode::KEY_BACKSPACE, 2), [""]);
-    }
-
-    #[test]
-    fn erasing_latest_word_restores_previous_word_and_its_spaces() {
+    fn reset_returns_final_words_in_order_once() {
         let mut history = History::default();
         press(&mut history, KeyCode::KEY_A);
         press(&mut history, KeyCode::KEY_SPACE);
         press(&mut history, KeyCode::KEY_SPACE);
         press(&mut history, KeyCode::KEY_B);
-        press(&mut history, KeyCode::KEY_SPACE);
-        assert!(press(&mut history, KeyCode::KEY_BACKSPACE).is_empty());
-        assert_eq!(press(&mut history, KeyCode::KEY_BACKSPACE), ["KEY_A"]);
-        assert_eq!(history.words[0].trailing_spaces, 2);
-        press(&mut history, KeyCode::KEY_BACKSPACE);
-        press(&mut history, KeyCode::KEY_BACKSPACE);
-        assert_eq!(press(&mut history, KeyCode::KEY_BACKSPACE), [""]);
-        assert!(press(&mut history, KeyCode::KEY_BACKSPACE).is_empty());
-    }
-
-    #[test]
-    fn typing_after_erasing_separator_continues_previous_word() {
-        let mut history = History::default();
-        press(&mut history, KeyCode::KEY_A);
-        press(&mut history, KeyCode::KEY_SPACE);
-        press(&mut history, KeyCode::KEY_BACKSPACE);
-        press(&mut history, KeyCode::KEY_B);
-        assert_eq!(press(&mut history, KeyCode::KEY_SPACE), ["KEY_A KEY_B"]);
-        assert_eq!(history.words.len(), 1);
-    }
-
-    #[test]
-    fn shift_is_saved_per_stroke_and_tracked_across_devices() {
-        let mut history = History::default();
-        let second = Path::new("second-keyboard");
-        press(&mut history, KeyCode::KEY_LEFTSHIFT);
-        history.process(second, KeyCode::KEY_LEFTSHIFT, 1);
-        press(&mut history, KeyCode::KEY_A);
-        event(&mut history, KeyCode::KEY_LEFTSHIFT, 0);
-        event(&mut history, KeyCode::KEY_A, 2);
-        history.process(second, KeyCode::KEY_LEFTSHIFT, 0);
-        press(&mut history, KeyCode::KEY_B);
+        let words = history.reset();
         assert_eq!(
-            press(&mut history, KeyCode::KEY_SPACE),
-            ["Shift+KEY_A Shift+KEY_A KEY_B"]
-        );
-        assert_eq!(
-            history.words[0]
-                .strokes()
-                .map(|stroke| stroke.shift)
+            words
+                .iter()
+                .map(|word| word.text().unwrap())
                 .collect::<Vec<_>>(),
-            [true, true, false]
+            ["a", "b"]
         );
+        assert_eq!(words[0].trailing_spaces, 2);
+        assert_eq!(words[1].trailing_spaces, 0);
+        assert!(history.reset().is_empty());
+        assert!(history.latest_word().is_none());
     }
 
     #[test]
-    fn hard_separators_complete_then_forget_words() {
-        for separator in [KeyCode::KEY_TAB, KeyCode::KEY_ENTER, KeyCode::KEY_KPENTER] {
-            let mut history = History::default();
-            press(&mut history, KeyCode::KEY_A);
-            press(&mut history, KeyCode::KEY_SPACE);
-            press(&mut history, KeyCode::KEY_B);
-            assert_eq!(press(&mut history, separator), ["KEY_B", ""]);
-            assert!(press(&mut history, KeyCode::KEY_BACKSPACE).is_empty());
-            press(&mut history, KeyCode::KEY_C);
-            press(&mut history, KeyCode::KEY_SPACE);
-            assert_eq!(press(&mut history, separator), [""]);
-        }
-    }
-
-    #[test]
-    fn reset_forgets_text_but_preserves_held_shift() {
+    fn backspace_restores_previous_word_with_its_layout_and_spaces() {
         let mut history = History::default();
-        press(&mut history, KeyCode::KEY_LEFTSHIFT);
         press(&mut history, KeyCode::KEY_A);
-        history.reset();
+        history.set_latest_layout(Some(Arc::new(Layout {
+            name: "ru".into(),
+            ..Default::default()
+        })));
+        press(&mut history, KeyCode::KEY_SPACE);
+        press(&mut history, KeyCode::KEY_SPACE);
         press(&mut history, KeyCode::KEY_B);
-        assert_eq!(press(&mut history, KeyCode::KEY_SPACE), ["Shift+KEY_B"]);
+        press(&mut history, KeyCode::KEY_SPACE);
+        press(&mut history, KeyCode::KEY_BACKSPACE);
+        press(&mut history, KeyCode::KEY_BACKSPACE);
+        assert_eq!(history.latest_word().unwrap().text().as_deref(), Some("ф"));
+        assert_eq!(history.latest_word().unwrap().trailing_spaces, 2);
+        assert!(history.previous_word().is_none());
+        for _ in 0..4 {
+            press(&mut history, KeyCode::KEY_BACKSPACE);
+        }
+        assert!(history.reset().is_empty());
     }
 
     #[test]
-    fn shortcuts_caps_lock_and_non_text_keys_do_not_become_strokes() {
+    fn typing_after_erasing_separator_continues_the_word() {
         let mut history = History::default();
-        press(&mut history, KeyCode::KEY_LEFTCTRL);
-        press(&mut history, KeyCode::KEY_C);
-        event(&mut history, KeyCode::KEY_LEFTCTRL, 0);
-        press(&mut history, KeyCode::KEY_CAPSLOCK);
-        press(&mut history, KeyCode::KEY_F1);
-        press(&mut history, KeyCode::KEY_PAUSE);
-        press(&mut history, KeyCode::KEY_A);
-        assert_eq!(press(&mut history, KeyCode::KEY_SPACE), ["KEY_A"]);
+        for key in [
+            KeyCode::KEY_A,
+            KeyCode::KEY_SPACE,
+            KeyCode::KEY_BACKSPACE,
+            KeyCode::KEY_B,
+            KeyCode::KEY_COMMA,
+        ] {
+            press(&mut history, key);
+        }
+        assert_eq!(history.reset()[0].text().as_deref(), Some("ab,"));
+    }
+
+    #[test]
+    fn layout_and_shift_are_preserved_per_stroke() {
+        let mut history = History::default();
+        history.process(
+            KeyCode::KEY_A,
+            true,
+            Some(Arc::new(Layout {
+                name: "us".into(),
+                ..Default::default()
+            })),
+        );
+        history.process(
+            KeyCode::KEY_B,
+            false,
+            Some(Arc::new(Layout {
+                name: "ru".into(),
+                ..Default::default()
+            })),
+        );
+        assert_eq!(history.latest_word().unwrap().text().as_deref(), Some("Aи"));
+        history.process(KeyCode::KEY_C, false, None);
+        assert_eq!(history.latest_word().unwrap().text(), None);
+        press(&mut history, KeyCode::KEY_BACKSPACE);
+        assert_eq!(history.latest_word().unwrap().text().as_deref(), Some("Aи"));
+        history.set_latest_layout(Some(Arc::new(Layout {
+            name: "us".into(),
+            ..Default::default()
+        })));
+        assert_eq!(history.latest_word().unwrap().text().as_deref(), Some("Ab"));
     }
 }

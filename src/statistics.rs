@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, params};
 
-use crate::{history::Word, layout::Layout};
+use crate::{layout::Layout, switcher::SwitchMode, word::Word};
 
 const DATABASE_PATH: &str = "true-switcher/statistics.sqlite3";
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS switches (
@@ -39,16 +39,20 @@ struct SwitchRecord {
     b: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(i64)]
-pub enum SwitchMode {
-    Manual = 0,
-    Auto = 1,
+enum PendingRecord {
+    Switch {
+        previous: Option<Word>,
+        word: Option<Word>,
+        target: Layout,
+        time: SystemTime,
+        mode: SwitchMode,
+    },
+    TypingWord(Word),
 }
 
 #[derive(Clone)]
 pub struct Statistics {
-    sender: Sender<Record>,
+    sender: Sender<PendingRecord>,
 }
 
 impl Statistics {
@@ -89,25 +93,20 @@ impl Statistics {
         time: SystemTime,
         mode: SwitchMode,
     ) {
-        let Some(mut record) = make_record(previous, word, target, time) else {
-            log::warn!("true-switcher: skipping statistics: cannot convert word to text");
-            return;
-        };
-        record.mode = mode;
-        self.send(Record::Switch(record));
+        self.send(PendingRecord::Switch {
+            previous: previous.cloned(),
+            word: word.cloned(),
+            target: target.clone(),
+            time,
+            mode,
+        });
     }
 
-    pub fn record_word(&self, word: &Word) {
-        let Some(text) = word.text() else {
-            log::warn!(
-                "true-switcher: skipping typing statistics: cannot convert word to text (missing layout or unsupported character)"
-            );
-            return;
-        };
-        self.send(Record::TypingWord(text.to_lowercase()));
+    pub fn record_word(&self, word: Word) {
+        self.send(PendingRecord::TypingWord(word));
     }
 
-    fn send(&self, record: Record) {
+    fn send(&self, record: PendingRecord) {
         if let Err(error) = self.sender.send(record) {
             log::error!("true-switcher: statistics queue: {error}");
         }
@@ -115,14 +114,39 @@ impl Statistics {
 }
 
 fn write_records(
-    receiver: Receiver<Record>,
+    receiver: Receiver<PendingRecord>,
     mut writer: impl FnMut(&Record) -> Result<(), Box<dyn std::error::Error>>,
 ) {
-    for record in receiver {
+    for pending in receiver {
+        let Some(record) = convert_record(pending) else {
+            continue;
+        };
         if let Err(error) = writer(&record) {
             log::error!("true-switcher: statistics database: {error}");
         }
     }
+}
+
+fn convert_record(pending: PendingRecord) -> Option<Record> {
+    let record = match pending {
+        PendingRecord::TypingWord(word) => word
+            .text()
+            .map(|text| Record::TypingWord(text.to_lowercase())),
+        PendingRecord::Switch {
+            previous,
+            word,
+            target,
+            time,
+            mode,
+        } => make_record(previous.as_ref(), word.as_ref(), &target, time).map(|mut record| {
+            record.mode = mode;
+            Record::Switch(record)
+        }),
+    };
+    if record.is_none() {
+        log::warn!("true-switcher: skipping statistics: cannot convert word to text or timestamp");
+    }
+    record
 }
 
 fn make_record(
@@ -229,12 +253,82 @@ fn insert(connection: &Connection, record: &Record) -> rusqlite::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::Stroke;
+    use crate::word::Stroke;
     use evdev::KeyCode;
     use std::sync::Arc;
     use std::time::Duration;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn queues_owned_snapshots_before_conversion_even_for_unknown_layouts() {
+        let (sender, receiver) = mpsc::channel();
+        let statistics = Statistics { sender };
+        let mut original = word("us");
+        original.entries[0].layout = None;
+        statistics.record_word(original.clone());
+        statistics.record_switch_with_mode(
+            None,
+            Some(&original),
+            &layout("ru"),
+            UNIX_EPOCH,
+            SwitchMode::Auto,
+        );
+        original.entries.clear();
+        let typing = receiver.recv().unwrap();
+        let PendingRecord::TypingWord(snapshot) = typing else {
+            panic!("expected typing snapshot")
+        };
+        assert_eq!(snapshot.entries.len(), 3);
+        assert!(snapshot.entries[0].layout.is_none());
+        assert!(convert_record(PendingRecord::TypingWord(snapshot)).is_none());
+        let switch = receiver.recv().unwrap();
+        let PendingRecord::Switch {
+            word: Some(snapshot),
+            time,
+            mode,
+            ..
+        } = &switch
+        else {
+            panic!("expected switch snapshot")
+        };
+        assert_eq!(snapshot.entries.len(), 3);
+        assert_eq!(*time, UNIX_EPOCH);
+        assert_eq!(*mode, SwitchMode::Auto);
+        assert!(convert_record(switch).is_none());
+    }
+
+    #[test]
+    fn worker_skips_unconvertible_snapshots_and_preserves_event_time_and_mode() {
+        let (sent, received) = mpsc::channel();
+        let statistics = Statistics::start_with_writer(move |record| {
+            assert_eq!(std::thread::current().name(), Some("statistics"));
+            sent.send(record.clone())?;
+            Ok(())
+        });
+        let mut unknown = word("us");
+        unknown.entries[0].layout = None;
+        statistics.record_word(unknown);
+        statistics.record_switch_with_mode(
+            None,
+            Some(&word("us")),
+            &layout("ru"),
+            UNIX_EPOCH + Duration::from_secs(123),
+            SwitchMode::Auto,
+        );
+        drop(statistics);
+        let Record::Switch(record) = received.recv_timeout(TEST_TIMEOUT).unwrap() else {
+            panic!("expected switch record")
+        };
+        assert_eq!(record.timestamp, 123);
+        assert_eq!(record.mode, SwitchMode::Auto);
+        assert_eq!(record.a, "ghb");
+        assert_eq!(record.b, "при");
+        assert!(matches!(
+            received.recv_timeout(TEST_TIMEOUT),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
+    }
 
     #[test]
     fn database_writer_retries_initialization_and_reuses_connection() {
@@ -298,7 +392,7 @@ mod tests {
     fn word(name: &str) -> Word {
         let entries = [KeyCode::KEY_G, KeyCode::KEY_H, KeyCode::KEY_B]
             .into_iter()
-            .map(|key| crate::history::WordStroke {
+            .map(|key| crate::word::WordStroke {
                 stroke: Stroke { key, shift: false },
                 layout: Some(layout(name)),
             })
@@ -309,22 +403,21 @@ mod tests {
         }
     }
 
-    fn observed_history() -> (crate::history::History, Receiver<Record>) {
+    fn observed_history() -> (crate::input::Input, Receiver<Record>) {
         let (sent, received) = mpsc::channel();
         let statistics = Statistics::start_with_writer(move |record| {
             sent.send(record.clone())?;
             Ok(())
         });
-        let mut history = crate::history::History::default().with_statistics(statistics);
-        history.accept_layout(Some(layout("us")), false);
+        let history = crate::input::tests::statistics_input(statistics);
         (history, received)
     }
 
-    fn press(history: &mut crate::history::History, key: KeyCode) {
-        history.process(std::path::Path::new("keyboard"), key, 1);
+    fn press(history: &mut crate::input::Input, key: KeyCode) {
+        crate::input::tests::statistics_event(history, key, 1);
     }
 
-    fn finish_history(history: crate::history::History, received: Receiver<Record>) -> Vec<Record> {
+    fn finish_history(history: crate::input::Input, received: Receiver<Record>) -> Vec<Record> {
         drop(history);
         let mut records = Vec::new();
         loop {
@@ -371,9 +464,9 @@ mod tests {
             if let Some(separator) = separator {
                 press(&mut history, separator);
             } else {
-                history.reset();
+                history.reset_history();
             }
-            history.reset();
+            history.reset_history();
             assert_eq!(
                 finish_history(history, received),
                 [
@@ -400,7 +493,7 @@ mod tests {
         ] {
             press(&mut history, key);
         }
-        history.reset();
+        history.reset_history();
         assert_eq!(
             finish_history(history, received),
             [Record::TypingWord("c".into())]
@@ -412,7 +505,7 @@ mod tests {
         let (mut history, received) = observed_history();
         press(&mut history, KeyCode::KEY_LEFTSHIFT);
         press(&mut history, KeyCode::KEY_G);
-        history.process(std::path::Path::new("keyboard"), KeyCode::KEY_LEFTSHIFT, 0);
+        crate::input::tests::statistics_event(&mut history, KeyCode::KEY_LEFTSHIFT, 0);
         history.set_latest_layout(Some(layout("ru")));
         press(&mut history, KeyCode::KEY_SPACE);
         press(&mut history, KeyCode::KEY_A);
@@ -422,7 +515,7 @@ mod tests {
         history.set_latest_layout(None);
         press(&mut history, KeyCode::KEY_SPACE);
         press(&mut history, KeyCode::KEY_C);
-        history.reset();
+        history.reset_history();
         assert_eq!(
             finish_history(history, received),
             [
@@ -579,7 +672,7 @@ mod tests {
             let previous = word("ru");
             let original = word("us");
             let time = UNIX_EPOCH + Duration::from_secs(123);
-            let result = crate::switch_and_replay(
+            let result = crate::switcher::switch_and_replay(
                 || Ok(()),
                 || {},
                 || statistics.record_switch(Some(&previous), Some(&original), &layout("ru"), time),
@@ -607,7 +700,7 @@ mod tests {
             finished.send(()).unwrap();
             Ok(())
         });
-        crate::switch_and_replay(
+        crate::switcher::switch_and_replay(
             || Ok(()),
             || {},
             || {
@@ -643,7 +736,7 @@ mod tests {
         });
         for is_expected_success in [false, true] {
             let mut is_replayed = false;
-            crate::switch_and_replay(
+            crate::switcher::switch_and_replay(
                 || Ok(()),
                 || {},
                 || {
@@ -670,7 +763,7 @@ mod tests {
         drop(receiver);
         let statistics = Statistics { sender };
         let mut is_replayed = false;
-        crate::switch_and_replay(
+        crate::switcher::switch_and_replay(
             || Ok(()),
             || {},
             || statistics.record_switch(None, None, &layout("us"), UNIX_EPOCH),
