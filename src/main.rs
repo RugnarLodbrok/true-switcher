@@ -65,17 +65,20 @@ struct Switcher {
 }
 
 fn run() -> io::Result<()> {
-    let config = config::load();
-    let auto_settings = config.auto_switch.map_err(io::Error::other)?;
-    let auto_switch = auto_switch::AutoSwitch::new(&auto_settings)?;
-    if let Some(warning) = &config.warning {
-        eprintln!("true-switcher: {warning}");
-    }
-    let _tray = tray::Tray::start(config.warning)
-        .map_err(|error| {
-            eprintln!("true-switcher: cannot start tray: {error}");
-        })
-        .ok();
+    let prepared = config::load().and_then(|config| {
+        auto_switch::AutoSwitch::new(&config.auto_switch)
+            .map(|auto_switch| (config, auto_switch))
+            .map_err(|error| format!("Configuration: {error}"))
+    });
+    let (config, auto_switch) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            eprintln!("true-switcher: {error}");
+            return tray::Tray::run_error(error);
+        }
+    };
+    let auto_settings = &config.auto_switch;
+    let _tray = tray::Tray::start()?;
     let desktop = environment::KdePlasma::new()?;
     let keyboard = output::KeyboardOutput::new()?;
     let focus_service = focus::FocusService::start()?;

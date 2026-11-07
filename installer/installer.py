@@ -13,6 +13,8 @@ ROOT = Path(__file__).resolve().parent.parent
 BINARY = Path('/usr/local/bin/true-switcher')
 ICON_NAME = 'icon.svg'
 ICON = Path('/usr/local/share/true-switcher/icons') / ICON_NAME
+ERROR_ICON_NAME = 'icon_error.svg'
+ERROR_ICON = ICON.parent / ERROR_ICON_NAME
 SYSTEM_UNIT = Path('/etc/systemd/system/true-switcher.service')
 USER_UNIT = Path.home() / '.config/systemd/user/true-switcher-session.service'
 USER_CONFIG = Path.home() / '.config/true-switcher/config.toml'
@@ -91,6 +93,8 @@ def _preflight() -> bool:
         raise RuntimeError('Build the executable target/release/true-switcher first.')
     if not (ROOT / 'icon' / ICON_NAME).is_file():
         raise RuntimeError('Missing tray icon: ' + str(ROOT / 'icon' / ICON_NAME))
+    if not (ROOT / 'icon' / ERROR_ICON_NAME).is_file():
+        raise RuntimeError('Missing tray icon: ' + str(ROOT / 'icon' / ERROR_ICON_NAME))
     print(f'qdbus executable: {_find_qdbus()}')
     if os.environ.get('XDG_SESSION_TYPE') != 'wayland' or 'KDE' not in os.environ.get('XDG_CURRENT_DESKTOP', '').split(':'):
         raise RuntimeError('An active KDE Wayland session is required.')
@@ -98,7 +102,7 @@ def _preflight() -> bool:
     _systemctl('show-environment')
     for target in ('graphical-session.target', 'plasma-workspace.target'):
         _systemctl('is-active', '--quiet', target, user=True)
-    for path, is_privileged in ((BINARY, True), (ICON, True), (SYSTEM_UNIT, True), (USER_UNIT, False), (POLKIT, True)):
+    for path, is_privileged in ((BINARY, True), (ICON, True), (ERROR_ICON, True), (SYSTEM_UNIT, True), (USER_UNIT, False), (POLKIT, True)):
         if _path_exists(path, is_privileged):
             raise RuntimeError('Installation path already exists: ' + str(path))
     for name, user in ((SYSTEM_NAME, False), (USER_NAME, True)):
@@ -205,7 +209,7 @@ def _install() -> None:
                 path = Path(temp) / name
                 path.write_text(content, encoding='utf-8')
                 sources.append(path)
-            for source, dest, privileged in ((ROOT / 'target/release/true-switcher', BINARY, True), (ROOT / 'icon' / ICON_NAME, ICON, True), (sources[0], SYSTEM_UNIT, True), (sources[1], USER_UNIT, False), (sources[2], POLKIT, True)):
+            for source, dest, privileged in ((ROOT / 'target/release/true-switcher', BINARY, True), (ROOT / 'icon' / ICON_NAME, ICON, True), (ROOT / 'icon' / ERROR_ICON_NAME, ERROR_ICON, True), (sources[0], SYSTEM_UNIT, True), (sources[1], USER_UNIT, False), (sources[2], POLKIT, True)):
                 created.append((dest, privileged))
                 _install_file(source, dest, privileged)
             if policy and not skip:
@@ -260,7 +264,7 @@ def _uninstall() -> None:
             # Missing units are already removed; other failures must be reported.
             if 'not loaded' not in result.stderr and 'not found' not in result.stderr and 'does not exist' not in result.stderr:
                 failures.append(f'{label}: {result.stderr.strip()}')
-    for path, is_privileged in ((USER_UNIT, False), (SYSTEM_UNIT, True), (POLKIT, True), (ICON, True), (BINARY, True)):
+    for path, is_privileged in ((USER_UNIT, False), (SYSTEM_UNIT, True), (POLKIT, True), (ERROR_ICON, True), (ICON, True), (BINARY, True)):
         try:
             is_present = _path_exists(path, is_privileged)
         except RuntimeError as error:

@@ -18,57 +18,76 @@ const WATCHER_PATH: &str = "/StatusNotifierWatcher";
 const NOTIFICATIONS: &str = "org.freedesktop.Notifications";
 const NOTIFICATIONS_PATH: &str = "/org/freedesktop/Notifications";
 const ICON_NAME: &str = "icon";
+const ERROR_ICON_NAME: &str = "icon_error";
 const INSTALLED_ICONS: &str = "/usr/local/share/true-switcher/icons";
 const SOURCE_ICONS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/icon");
 const RETRY_DELAY: Duration = Duration::from_secs(1);
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 const DEFAULT_NOTIFICATION_TIMEOUT: i32 = -1;
 
 type Pixmaps = Vec<(i32, i32, Vec<u8>)>;
 
-pub struct Tray {
-    _connection: Connection,
-}
+pub struct Tray;
 
 impl Tray {
-    pub fn start(warning: Option<String>) -> io::Result<Self> {
-        let connection = Connection::session().map_err(io::Error::other)?;
-        export(&connection, menu::Menu::new()).map_err(io::Error::other)?;
-        let worker = connection.clone();
+    pub fn start() -> io::Result<Self> {
         thread::Builder::new()
             .name("system-tray".into())
-            .spawn(move || {
-                maintain(&worker, warning);
-            })?;
-        Ok(Self {
-            _connection: connection,
-        })
+            .spawn(maintain)?;
+        Ok(Self)
+    }
+
+    pub fn run_error(error: String) -> io::Result<()> {
+        let connection = Connection::session().map_err(io::Error::other)?;
+        export(&connection, menu::Menu::new(), Some(error.clone())).map_err(io::Error::other)?;
+        let mut owner = None;
+        register(&connection, &mut owner)
+            .map_err(|error| io::Error::other(format!("tray registration: {error}")))?;
+        notify(&connection, "Configuration error", &error)
+            .map_err(|error| io::Error::other(format!("notification: {error}")))?;
+        loop {
+            thread::sleep(RETRY_DELAY);
+            register(&connection, &mut owner)
+                .map_err(|error| io::Error::other(format!("tray registration: {error}")))?;
+            DBusProxy::new(&connection)
+                .and_then(|proxy| {
+                    proxy
+                        .get_name_owner(NOTIFICATIONS.try_into()?)
+                        .map(|_| ())
+                        .map_err(Into::into)
+                })
+                .map_err(|error| io::Error::other(format!("notification service: {error}")))?;
+        }
     }
 }
 
-fn export(connection: &Connection, menu: menu::Menu) -> zbus::Result<()> {
-    connection.object_server().at(ITEM_PATH, Item)?;
+fn export(connection: &Connection, menu: menu::Menu, error: Option<String>) -> zbus::Result<()> {
+    connection.object_server().at(ITEM_PATH, Item { error })?;
     connection.object_server().at(MENU_PATH, menu)?;
     Ok(())
 }
 
-fn maintain(connection: &Connection, mut warning: Option<String>) {
-    let mut owner = None;
-    let mut is_error_reported = false;
+fn maintain() {
+    let mut delay = RETRY_DELAY;
     loop {
-        match register(connection, &mut owner) {
-            Ok(()) => is_error_reported = false,
+        match maintain_connection(&mut delay) {
+            Ok(()) => delay = RETRY_DELAY,
             Err(error) => {
-                if !is_error_reported {
-                    eprintln!("true-switcher: tray registration: {error}");
-                }
-                is_error_reported = true;
+                eprintln!("true-switcher: tray registration: {error}");
+                thread::sleep(delay);
+                delay = (delay * 2).min(MAX_RETRY_DELAY);
             }
         }
-        if let Some(body) = warning.as_deref()
-            && notify(connection, "Configuration warning", body).is_ok()
-        {
-            warning = None;
-        }
+    }
+}
+
+fn maintain_connection(delay: &mut Duration) -> zbus::Result<()> {
+    let connection = Connection::session()?;
+    export(&connection, menu::Menu::new(), None)?;
+    let mut owner = None;
+    loop {
+        register(&connection, &mut owner)?;
+        *delay = RETRY_DELAY;
         thread::sleep(RETRY_DELAY);
     }
 }
@@ -122,7 +141,9 @@ fn notify(connection: &Connection, summary: &str, body: &str) -> zbus::Result<()
     Ok(())
 }
 
-struct Item;
+struct Item {
+    error: Option<String>,
+}
 
 #[zbus::interface(name = "org.kde.StatusNotifierItem")]
 impl Item {
@@ -158,7 +179,11 @@ impl Item {
 
     #[zbus(property)]
     fn icon_name(&self) -> &str {
-        ICON_NAME
+        if self.error.is_some() {
+            ERROR_ICON_NAME
+        } else {
+            ICON_NAME
+        }
     }
 
     #[zbus(property)]
@@ -194,10 +219,12 @@ impl Item {
     #[zbus(property, name = "ToolTip")]
     fn tool_tip(&self) -> (&str, Pixmaps, &str, &str) {
         (
-            ICON_NAME,
+            self.icon_name(),
             Vec::new(),
             APP_TITLE,
-            "Reload to apply configuration changes",
+            self.error
+                .as_deref()
+                .unwrap_or("Reload to apply configuration changes"),
         )
     }
 

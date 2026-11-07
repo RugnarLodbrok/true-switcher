@@ -70,7 +70,7 @@ impl Watcher {
 fn registers_when_watcher_appears_and_after_it_is_replaced() {
     let bus = TestBus::start();
     let tray = bus.connect();
-    export(&tray, menu::Menu::new()).unwrap();
+    export(&tray, menu::Menu::new(), None).unwrap();
     let mut owner = None;
     assert!(register(&tray, &mut owner).is_err());
     let (watcher, registrations) = bus.watcher();
@@ -96,6 +96,7 @@ fn exports_icon_and_reload_menu_and_dispatches_only_clicks() {
                 Ok(())
             }),
         },
+        None,
     )
     .unwrap();
     let client = bus.connect();
@@ -137,6 +138,35 @@ fn exports_icon_and_reload_menu_and_dispatches_only_clicks() {
             .is_err()
     );
     assert!(received.try_recv().is_err());
+}
+
+#[test]
+fn error_item_exposes_error_icon_and_details() {
+    let bus = TestBus::start();
+    let tray = bus.connect();
+    let error = "Invalid switch_key";
+    export(&tray, menu::Menu::new(), Some(error.into())).unwrap();
+    let client = bus.connect();
+    let item = Proxy::new(
+        &client,
+        tray.unique_name().unwrap().as_str(),
+        ITEM_PATH,
+        ITEM_INTERFACE,
+    )
+    .unwrap();
+    assert_eq!(
+        item.get_property::<String>("IconName").unwrap(),
+        ERROR_ICON_NAME
+    );
+    let tooltip: (String, Pixmaps, String, String) = item.get_property("ToolTip").unwrap();
+    assert_eq!(tooltip.0, ERROR_ICON_NAME);
+    assert_eq!(tooltip.3, error);
+    assert_eq!(
+        item.get_property::<ObjectPath<'_>>("Menu")
+            .unwrap()
+            .as_str(),
+        MENU_PATH
+    );
 }
 
 struct Notifications(mpsc::Sender<(String, String)>);
@@ -187,6 +217,7 @@ fn sends_warning_and_reports_failed_reload_as_notification() {
         menu::Menu {
             restart: Arc::new(|| Err(io::Error::other("Permission denied"))),
         },
+        None,
     )
     .unwrap();
     let client = bus.connect();
