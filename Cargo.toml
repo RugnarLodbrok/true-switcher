@@ -13,6 +13,7 @@ path = "src-learn/main.rs"
 evdev = "0.13.2"
 libpulse-binding = "2"
 libpulse-simple-binding = "2"
+regex = "1.13.1"
 rusqlite = { version = "0.41.1", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 toml = "1"

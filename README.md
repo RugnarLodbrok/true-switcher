@@ -79,14 +79,35 @@ Change `false` to `true` to enable sound. When the option is missing, sound is d
 The tray registers again when Plasma's tray service becomes available or changes its D-Bus owner.
 
 The installer copies the SVG from `icon/` to `/usr/local/share/true-switcher/icons/` and allows `restart` for this service in its Polkit rule. Runs from the source tree can use `icon/` directly; `Reload` always targets the installed system service.
-Existing installations need the updated binary, icon and Polkit rule; the installer currently does not support upgrading an existing installation.
+Use `make update-installed` to rebuild and update the installed binary, stopping and starting the system service around the update. This does not update the installed icon, service units or Polkit rule.
+
+## Automatic switching
+
+Automatic switching is disabled by default. Add these settings to `~/.config/true-switcher/config.toml` and select `Reload`:
+
+```toml
+auto_switch = true
+auto_switch_sound = true
+
+[[switch_rules]]
+target = "us"
+patterns = ['^/[a-z]']
+```
+
+After each typed character, the current word is converted to each rule's `target` layout and matched against its `patterns`. The first matching rule corrects the word and selects that layout, without waiting for a separator. For example, `.т` typed in Russian becomes `/n` with this rule. The word can switch again when later characters match another target. Rules for the current layout are skipped; Backspace does not trigger matching.
+
+Patterns use the Rust `regex` syntax. Matching can occur anywhere in the converted word; use `^` to anchor the beginning. `target` must be a single XKB layout identifier, such as `us`, `gb`, or `ru`. Language codes such as `en` are invalid. If KDE has multiple entries with the same identifier, the first entry and its configured variant are used. A separate `variant` field is not supported.
+
+Invalid patterns, invalid layout identifiers, and targets absent from KDE cause startup to fail with a logged error, including when `auto_switch = false`. `switch_rules` defaults to an empty list. `auto_switch_sound` defaults to `true` and controls the existing switch sound independently of `manual_switch_sound`.
+
+Manual layout changes reset typing history. Punctuation remains part of a word; Space ends a word, while Tab and Enter end the word and reset history.
 
 ## Switching statistics
 
 Each successful layout switch is recorded in SQLite, even if replaying the word is later cancelled or fails.
 The database is stored at `$XDG_STATE_HOME/true-switcher/statistics.sqlite3`, or `~/.local/state/true-switcher/statistics.sqlite3` when `XDG_STATE_HOME` is unset or empty.
 
-The `switches` table contains `id`, `timestamp` (Unix seconds), `prev` (the previous word as typed), `a` (the corrected word before switching), and `b` (the word in the new layout).
+The `switches` table contains `id`, `timestamp` (Unix seconds), `prev` (the previous word as typed), `a` (the corrected word before switching), `b` (the word in the new layout), and `mode` (`0` for manual corrections, `1` for automatic corrections). Existing databases gain `mode` automatically; old records receive `0`.
 Missing words are stored as empty strings. Records are skipped when the layout or text cannot be determined. Database errors are logged and do not stop the switcher.
 
 The same database stores typing frequencies in `typing_words`, with `word` (`TEXT PRIMARY KEY`) and `count` (`INTEGER NOT NULL`).

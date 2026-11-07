@@ -11,6 +11,39 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 const TEST_POLL: Duration = Duration::from_millis(5);
 
 #[test]
+fn accepts_only_identifiers_in_xkb_layout_section() {
+    let registry = "! model\n pc105 PC\n! layout\n us English\n gb British\n ru Russian\n! variant\n phonetic ru: Phonetic\n";
+    for name in ["us", "gb", "ru"] {
+        validate_identifier(registry, name).unwrap();
+    }
+    for name in [
+        "en",
+        "us,ru",
+        "ru(phonetic)",
+        "phonetic",
+        "pc105",
+        "",
+        "../us",
+    ] {
+        assert!(validate_identifier(registry, name).is_err());
+    }
+}
+
+#[test]
+fn uses_first_duplicate_layout_with_its_configured_variant() {
+    let names = vec![
+        ("ru".into(), String::new(), String::new()),
+        ("ru".into(), String::new(), String::new()),
+    ];
+    let contents = "[Layout]\nLayoutList=ru,ru\nVariantList=phonetic,\n";
+    assert_eq!(
+        configured_target(&names, contents, "ru").unwrap().variant,
+        "phonetic"
+    );
+    assert!(configured_target(&names, contents, "us").is_err());
+}
+
+#[test]
 #[ignore = "requires a running KDE session and its kxkbrc"]
 fn reads_running_kde_layout() {
     let layout = current_layout().expect("read layout from the running KDE session");

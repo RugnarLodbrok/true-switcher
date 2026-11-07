@@ -1,11 +1,11 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use evdev::{Device, EventType, InputEvent, KeyCode, SynchronizationCode, raw_stream::RawDevice};
 
@@ -13,6 +13,7 @@ use crate::history::History;
 use crate::output::is_own_keyboard;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
+const HOLD_TIMEOUT: Duration = Duration::from_millis(300);
 const MODIFIERS: [KeyCode; 8] = [
     KeyCode::KEY_LEFTSHIFT,
     KeyCode::KEY_RIGHTSHIFT,
@@ -57,6 +58,7 @@ struct Keyboard {
     path: PathBuf,
     device: Box<dyn Source>,
     held: BTreeSet<u16>,
+    held_since: BTreeMap<u16, Instant>,
 }
 
 struct Pointer {
@@ -122,6 +124,9 @@ pub struct Input {
     repair: BTreeSet<(usize, u16)>,
     repair_prepared: BTreeSet<(usize, u16)>,
     is_captured: bool,
+    is_backing_off: bool,
+    is_auto_request: bool,
+    automatic_target: Option<Arc<crate::layout::Layout>>,
 }
 
 impl Input {
@@ -162,12 +167,15 @@ impl Input {
             }
             if is_keyboard(&probe) {
                 let device = open_device(&path)?;
-                let held = device.get_key_state()?.iter().map(|key| key.0).collect();
+                let held: BTreeSet<_> = device.get_key_state()?.iter().map(|key| key.0).collect();
+                let now = Instant::now();
+                let held_since = held.iter().map(|&code| (code, now)).collect();
                 eprintln!("OPEN {} {:?} held={held:?}", path.display(), device.name());
                 keyboards.push(Keyboard {
                     path,
                     device: Box::new(device),
                     held,
+                    held_since,
                 });
             }
         }
@@ -195,6 +203,9 @@ impl Input {
             repair: BTreeSet::new(),
             repair_prepared: BTreeSet::new(),
             is_captured: false,
+            is_backing_off: false,
+            is_auto_request: false,
+            automatic_target: None,
         };
         for keyboard in &input.keyboards {
             for &code in &keyboard.held {
@@ -211,6 +222,8 @@ impl Input {
         loop {
             self.drain()?;
             self.pending = None;
+            self.is_auto_request = false;
+            self.automatic_target = None;
             self.is_original_switch_key_held = false;
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -228,11 +241,13 @@ impl Input {
         Ok(())
     }
 
-    pub fn enter(&mut self) -> io::Result<()> {
+    pub fn enter(&mut self) -> io::Result<bool> {
         let mut is_switch_key_reset = false;
         let mut attempt = 0_u64;
         loop {
-            self.wait_ordinary()?;
+            if !self.wait_ordinary()? {
+                return Ok(false);
+            }
             attempt += 1;
             eprintln!("ENTRY attempt={attempt} begin");
             self.recording = Some(EntryRecording::default());
@@ -253,11 +268,16 @@ impl Input {
             self.drain()?;
             let presses = self.recording.take().unwrap().presses;
             eprintln!("ENTRY attempt={attempt} recorded {presses:?}");
+            if self.pending.is_none() {
+                self.repair = presses;
+                self.rollback()?;
+                return Ok(false);
+            }
             if presses.is_empty() {
                 self.is_captured = true;
                 self.pending = None;
                 eprintln!("ENTRY accepted");
-                return Ok(());
+                return Ok(true);
             }
             self.repair = presses;
             self.rollback()?;
@@ -266,6 +286,15 @@ impl Input {
 
     pub fn latest_word(&self) -> Option<&crate::history::Word> {
         self.history.latest_word()
+    }
+
+    pub fn is_auto_request(&self) -> bool {
+        self.is_auto_request
+    }
+
+    pub fn automatic_target(&self) -> Option<Arc<crate::layout::Layout>> {
+        self.history.latest_word()?;
+        self.automatic_target.clone()
     }
 
     pub fn previous_word(&self) -> Option<&crate::history::Word> {
@@ -304,11 +333,13 @@ impl Input {
         Ok(())
     }
 
-    fn wait_ordinary(&mut self) -> io::Result<()> {
+    fn wait_ordinary(&mut self) -> io::Result<bool> {
         eprintln!("WAIT_ORDINARY begin");
         loop {
             self.drain()?;
-            let switch_source = self.pending.unwrap();
+            let Some(switch_source) = self.pending else {
+                return Ok(false);
+            };
             let is_held = self.keyboards.iter().enumerate().any(|(index, keyboard)| {
                 keyboard.held.iter().any(|&code| {
                     !MODIFIERS.contains(&KeyCode::new(code))
@@ -318,13 +349,19 @@ impl Input {
                 })
             });
             if !is_held {
-                return Ok(());
+                return Ok(true);
             }
             thread::sleep(POLL_INTERVAL);
         }
     }
 
     fn drain(&mut self) -> io::Result<()> {
+        if !self.is_captured && self.recording.is_none() {
+            self.history.synchronize_layout();
+            if self.history.latest_word().is_none() {
+                self.automatic_target = None;
+            }
+        }
         loop {
             let mut count = 0;
             for index in 0..self.keyboards.len() {
@@ -347,6 +384,7 @@ impl Input {
             }
             count += self.drain_pointers()?;
             self.process_focus_change();
+            self.update_back_off(Instant::now());
             if count == 0 {
                 return Ok(());
             }
@@ -354,6 +392,18 @@ impl Input {
     }
 
     fn process(&mut self, index: usize, event: InputEvent) -> io::Result<()> {
+        let now = Instant::now();
+        let time = event.timestamp();
+        let elapsed = SystemTime::now().duration_since(time).ok();
+        let now = if time == SystemTime::UNIX_EPOCH {
+            now
+        } else {
+            elapsed.and_then(|age| now.checked_sub(age)).unwrap_or(now)
+        };
+        self.process_at(index, event, now)
+    }
+
+    fn process_at(&mut self, index: usize, event: InputEvent, now: Instant) -> io::Result<()> {
         if event.event_type() == EventType::SYNCHRONIZATION
             && event.code() == SynchronizationCode::SYN_DROPPED.0
         {
@@ -367,28 +417,58 @@ impl Input {
         }
         let key = KeyCode::new(event.code());
         let value = event.value();
-        let (path, is_grabbed) = {
-            let keyboard = &mut self.keyboards[index];
-            eprintln!(
-                "EVDEV {} {key:?} value={value} kernel_time={:?} grabbed={}",
-                keyboard.path.display(),
-                event.timestamp(),
-                keyboard.device.is_grabbed()
-            );
-            match value {
-                0 => {
-                    keyboard.held.remove(&key.0);
-                }
-                1 | 2 => {
-                    keyboard.held.insert(key.0);
-                }
-                _ => {}
-            }
-            (keyboard.path.clone(), keyboard.device.is_grabbed())
-        };
+        self.update_back_off(now);
+        self.track_key(index, event, now);
         if let Some(recording) = &mut self.recording {
             recording.record(index, key.0, value);
         }
+        if value == 2 && !is_shift(key) {
+            self.start_back_off();
+        }
+        let path = self.keyboards[index].path.clone();
+        if self.is_backing_off {
+            if MODIFIERS.contains(&key) {
+                self.history.process(&path, key, value);
+            }
+            if value == 0 {
+                self.request_history_reset();
+            }
+            self.update_back_off(now);
+            return Ok(());
+        }
+        self.process_history_event(index, &path, key, value)
+    }
+
+    fn track_key(&mut self, index: usize, event: InputEvent, now: Instant) {
+        let keyboard = &mut self.keyboards[index];
+        let key = KeyCode::new(event.code());
+        let value = event.value();
+        eprintln!(
+            "EVDEV {} {key:?} value={value} kernel_time={:?} grabbed={}",
+            keyboard.path.display(),
+            event.timestamp(),
+            keyboard.device.is_grabbed()
+        );
+        match value {
+            0 => {
+                keyboard.held.remove(&key.0);
+                keyboard.held_since.remove(&key.0);
+            }
+            1 | 2 => {
+                keyboard.held.insert(key.0);
+                keyboard.held_since.entry(key.0).or_insert(now);
+            }
+            _ => {}
+        }
+    }
+
+    fn process_history_event(
+        &mut self,
+        index: usize,
+        path: &Path,
+        key: KeyCode,
+        value: i32,
+    ) -> io::Result<()> {
         let is_tab_separator = key == KeyCode::KEY_TAB && !self.has_shortcut_modifier();
         let is_pointer_click = value == 1 && is_pointer_press(key.0);
         if (self.should_reset_for_key(key, value) || is_pointer_click)
@@ -396,7 +476,7 @@ impl Input {
         {
             self.request_history_reset();
         }
-        if self.is_captured || is_grabbed {
+        if self.is_captured || self.keyboards[index].device.is_grabbed() {
             return Ok(());
         }
         if key == self.switch_key {
@@ -406,11 +486,27 @@ impl Input {
             if value == 1 && self.pending.is_none() && !self.has_other_switch_modifiers(index, key)
             {
                 self.pending = Some(index);
+                self.is_auto_request = false;
                 self.is_original_switch_key_held = true;
             }
             return Ok(());
         }
-        let lines = self.history.process(&path, key, value);
+        let lines = self.history.process(path, key, value);
+        if matches!(value, 1 | 2) && (key == KeyCode::KEY_BACKSPACE || key == KeyCode::KEY_SPACE) {
+            self.automatic_target = None;
+        }
+        if matches!(value, 1 | 2)
+            && crate::history::is_text_key(key)
+            && !self.has_shortcut_modifier()
+            && (self.pending.is_none() || self.is_auto_request)
+        {
+            self.automatic_target = self.history.automatic_target();
+            if self.automatic_target.is_some() {
+                self.pending = Some(index);
+                self.is_auto_request = true;
+                self.is_original_switch_key_held = false;
+            }
+        }
         if !lines.is_empty() {
             let stdout = io::stdout();
             let mut output = stdout.lock();
@@ -501,9 +597,39 @@ impl Input {
     }
 
     fn request_history_reset(&mut self) {
+        self.automatic_target = None;
         self.history.reset();
         if self.is_captured {
             self.is_cancel_requested = true;
+        }
+    }
+
+    fn start_back_off(&mut self) {
+        if self.is_backing_off {
+            return;
+        }
+        self.is_backing_off = true;
+        self.request_history_reset();
+        self.pending = None;
+        self.is_auto_request = false;
+        self.is_original_switch_key_held = false;
+    }
+
+    fn update_back_off(&mut self, now: Instant) {
+        if self.keyboards.iter().any(|keyboard| {
+            keyboard.held_since.iter().any(|(&code, &since)| {
+                !is_shift(KeyCode::new(code)) && now.saturating_duration_since(since) > HOLD_TIMEOUT
+            })
+        }) {
+            self.start_back_off();
+        }
+        if self.is_backing_off
+            && self
+                .keyboards
+                .iter()
+                .all(|keyboard| keyboard.held.is_empty())
+        {
+            self.is_backing_off = false;
         }
     }
 
@@ -537,11 +663,16 @@ impl Input {
         result?;
         if value == 0 {
             keyboard.held.remove(&key.0);
+            keyboard.held_since.remove(&key.0);
             if MODIFIERS.contains(&key) {
                 self.history.process(&keyboard.path, key, 0);
             }
         } else {
             keyboard.held.insert(key.0);
+            keyboard
+                .held_since
+                .entry(key.0)
+                .or_insert_with(Instant::now);
         }
         Ok(())
     }
@@ -592,6 +723,12 @@ impl Input {
     fn snapshot(&mut self) -> io::Result<()> {
         for (index, keyboard) in self.keyboards.iter_mut().enumerate() {
             keyboard.held = keyboard.device.keys()?;
+            keyboard
+                .held_since
+                .retain(|code, _| keyboard.held.contains(code));
+            for &code in &keyboard.held {
+                keyboard.held_since.entry(code).or_insert_with(Instant::now);
+            }
             if let Some(recording) = &mut self.recording {
                 recording
                     .presses
@@ -644,6 +781,10 @@ impl Input {
         }
         error.map_or(Ok(()), Err)
     }
+}
+
+fn is_shift(key: KeyCode) -> bool {
+    matches!(key, KeyCode::KEY_LEFTSHIFT | KeyCode::KEY_RIGHTSHIFT)
 }
 
 impl Drop for Input {
@@ -760,6 +901,7 @@ mod tests {
         is_grabbed: bool,
         grab_count: usize,
         is_entry_interrupted: bool,
+        is_entry_repeated: bool,
         is_grab_failed: bool,
         is_repair_release_failed: bool,
     }
@@ -824,6 +966,16 @@ mod tests {
             }
             keyboard.is_grabbed = true;
             keyboard.grab_count += 1;
+            if keyboard.is_entry_repeated {
+                keyboard.is_entry_repeated = false;
+                for value in [1, 2, 0] {
+                    keyboard.events.push(InputEvent::new(
+                        EventType::KEY.0,
+                        KeyCode::KEY_A.0,
+                        value,
+                    ));
+                }
+            }
             if keyboard.is_entry_interrupted {
                 keyboard.is_entry_interrupted = false;
                 for value in [1, 0] {
@@ -855,6 +1007,12 @@ mod tests {
                 path: PathBuf::from(format!("keyboard-{index}")),
                 device: Box::new(SimulatedSource(source.clone())),
                 held: source.borrow().held.clone(),
+                held_since: source
+                    .borrow()
+                    .held
+                    .iter()
+                    .map(|&code| (code, Instant::now()))
+                    .collect(),
             })
             .collect();
         Input {
@@ -870,7 +1028,261 @@ mod tests {
             repair: BTreeSet::new(),
             repair_prepared: BTreeSet::new(),
             is_captured: false,
+            is_backing_off: false,
+            is_auto_request: false,
+            automatic_target: None,
         }
+    }
+
+    fn auto_input() -> Input {
+        let source = Rc::new(RefCell::new(SimulatedKeyboard::default()));
+        let mut input = simulated_input(&[source]);
+        input.pending = None;
+        input.is_original_switch_key_held = false;
+        let settings = crate::auto_switch::Settings::parse(
+            r#"
+auto_switch = true
+[[switch_rules]]
+target = 'us'
+patterns = ['^/[a-z]']
+[[switch_rules]]
+target = 'ru'
+patterns = ['^\.тф']
+"#,
+        )
+        .unwrap();
+        let switch = crate::auto_switch::AutoSwitch::compile(&settings, |name| {
+            Ok(Arc::new(crate::layout::Layout {
+                name: name.into(),
+                ..Default::default()
+            }))
+        })
+        .unwrap();
+        let layouts = crate::layout::LayoutTracker::default();
+        layouts.set(Some(Arc::new(crate::layout::Layout {
+            name: "ru".into(),
+            ..Default::default()
+        })));
+        input.history = History::with_layouts(layouts).with_auto_switch(switch);
+        input
+    }
+
+    fn press(input: &mut Input, key: KeyCode) {
+        input
+            .process(0, InputEvent::new(EventType::KEY.0, key.0, 1))
+            .unwrap();
+    }
+
+    fn event_at(input: &mut Input, source: usize, key: KeyCode, value: i32, now: Instant) {
+        input
+            .process_at(source, InputEvent::new(EventType::KEY.0, key.0, value), now)
+            .unwrap();
+    }
+
+    #[test]
+    fn repeats_reset_both_words_cancel_manual_requests_and_do_not_write_to_devices() {
+        for key in [
+            KeyCode::KEY_A,
+            KeyCode::KEY_SPACE,
+            KeyCode::KEY_KP1,
+            KeyCode::KEY_LEFTCTRL,
+            KeyCode::KEY_RIGHTALT,
+            KeyCode::KEY_PAUSE,
+        ] {
+            let source = Rc::new(RefCell::new(SimulatedKeyboard::default()));
+            let mut input = simulated_input(std::slice::from_ref(&source));
+            let now = Instant::now();
+            for key in [KeyCode::KEY_A, KeyCode::KEY_SPACE, KeyCode::KEY_B] {
+                event_at(&mut input, 0, key, 1, now);
+                event_at(&mut input, 0, key, 0, now);
+            }
+            assert!(input.previous_word().is_some());
+            event_at(&mut input, 0, key, 1, now);
+            event_at(&mut input, 0, key, 2, now);
+            assert!(input.is_backing_off, "{key:?}");
+            assert!(input.latest_word().is_none());
+            assert!(input.previous_word().is_none());
+            assert!(input.pending.is_none());
+            assert!(!input.is_original_switch_key_held);
+            assert!(source.borrow().writes.is_empty());
+            event_at(&mut input, 0, key, 0, now);
+            assert!(!input.is_backing_off);
+            event_at(&mut input, 0, KeyCode::KEY_C, 1, now);
+            assert_eq!(input.latest_word().unwrap().strokes.len(), 1);
+        }
+    }
+
+    #[test]
+    fn hold_timeout_runs_without_events_and_is_individual_for_each_key() {
+        let mut input = auto_input();
+        let now = Instant::now();
+        event_at(&mut input, 0, KeyCode::KEY_A, 1, now);
+        event_at(&mut input, 0, KeyCode::KEY_B, 1, now + HOLD_TIMEOUT / 2);
+        event_at(&mut input, 0, KeyCode::KEY_A, 0, now + HOLD_TIMEOUT / 2);
+        input.update_back_off(now + HOLD_TIMEOUT);
+        assert!(!input.is_backing_off);
+        input.keyboards[0].held_since.insert(
+            KeyCode::KEY_B.0,
+            Instant::now() - HOLD_TIMEOUT - POLL_INTERVAL,
+        );
+        input.drain().unwrap();
+        assert!(input.is_backing_off);
+        assert!(input.latest_word().is_none());
+    }
+
+    #[test]
+    fn long_release_resets_history_even_without_an_intermediate_timer_check() {
+        let mut input = auto_input();
+        let now = Instant::now();
+        event_at(&mut input, 0, KeyCode::KEY_A, 1, now);
+        event_at(
+            &mut input,
+            0,
+            KeyCode::KEY_A,
+            0,
+            now + HOLD_TIMEOUT + POLL_INTERVAL,
+        );
+        assert!(input.latest_word().is_none());
+        assert!(!input.is_backing_off);
+    }
+
+    #[test]
+    fn shift_alone_never_triggers_back_off_but_all_keyboards_must_be_released() {
+        let first = Rc::new(RefCell::new(SimulatedKeyboard::default()));
+        let second = Rc::new(RefCell::new(SimulatedKeyboard::default()));
+        let mut input = simulated_input(&[first, second]);
+        let now = Instant::now();
+        for key in [KeyCode::KEY_LEFTSHIFT, KeyCode::KEY_RIGHTSHIFT] {
+            event_at(&mut input, 1, key, 1, now);
+            event_at(&mut input, 1, key, 2, now);
+        }
+        let later = now + HOLD_TIMEOUT + POLL_INTERVAL;
+        input.update_back_off(later);
+        assert!(!input.is_backing_off);
+        event_at(&mut input, 0, KeyCode::KEY_A, 1, later);
+        event_at(&mut input, 0, KeyCode::KEY_A, 2, later);
+        event_at(&mut input, 0, KeyCode::KEY_A, 0, later);
+        event_at(&mut input, 0, KeyCode::KEY_B, 1, later);
+        event_at(&mut input, 0, KeyCode::KEY_B, 0, later);
+        event_at(&mut input, 0, KeyCode::KEY_PAUSE, 1, later);
+        event_at(&mut input, 0, KeyCode::KEY_PAUSE, 0, later);
+        assert!(input.is_backing_off);
+        assert!(input.pending.is_none());
+        assert!(input.latest_word().is_none());
+        event_at(&mut input, 1, KeyCode::KEY_LEFTSHIFT, 0, later);
+        assert!(input.is_backing_off);
+        event_at(&mut input, 1, KeyCode::KEY_RIGHTSHIFT, 0, later);
+        assert!(!input.is_backing_off);
+        event_at(&mut input, 0, KeyCode::KEY_C, 1, later);
+        assert!(!input.latest_word().unwrap().strokes[0].shift);
+    }
+
+    #[test]
+    fn back_off_cancels_automatic_and_captured_corrections() {
+        let mut input = auto_input();
+        press(&mut input, KeyCode::KEY_SLASH);
+        press(&mut input, KeyCode::KEY_N);
+        assert!(input.automatic_target().is_some());
+        input.is_captured = true;
+        input
+            .process(0, InputEvent::new(EventType::KEY.0, KeyCode::KEY_N.0, 2))
+            .unwrap();
+        assert!(input.pending.is_none());
+        assert!(input.automatic_target().is_none());
+        assert!(!input.is_auto_request());
+        assert!(input.read_captured().unwrap());
+    }
+
+    #[test]
+    fn back_off_cancels_entry_waiting_for_an_ordinary_key_without_grabbing() {
+        let source = Rc::new(RefCell::new(SimulatedKeyboard::default()));
+        let mut input = simulated_input(std::slice::from_ref(&source));
+        press(&mut input, KeyCode::KEY_A);
+        source
+            .borrow_mut()
+            .events
+            .push(InputEvent::new(EventType::KEY.0, KeyCode::KEY_A.0, 2));
+        assert!(!input.enter().unwrap());
+        assert_eq!(source.borrow().grab_count, 0);
+        assert!(source.borrow().writes.is_empty());
+    }
+
+    #[test]
+    fn back_off_during_entry_repairs_input_and_releases_capture() {
+        let source = Rc::new(RefCell::new(SimulatedKeyboard {
+            is_entry_repeated: true,
+            ..Default::default()
+        }));
+        let mut input = simulated_input(std::slice::from_ref(&source));
+        assert!(!input.enter().unwrap());
+        assert!(!input.is_captured);
+        assert!(input.pending.is_none());
+        assert!(!source.borrow().is_grabbed);
+        assert!(source.borrow().writes.contains(&(KeyCode::KEY_A, 1, true)));
+        assert!(source.borrow().writes.contains(&(KeyCode::KEY_A, 0, false)));
+    }
+
+    #[test]
+    fn timeout_applies_to_space_numpad_modifiers_and_the_switch_key() {
+        for key in [
+            KeyCode::KEY_SPACE,
+            KeyCode::KEY_KP1,
+            KeyCode::KEY_LEFTCTRL,
+            KeyCode::KEY_RIGHTMETA,
+            KeyCode::KEY_PAUSE,
+        ] {
+            let mut input = auto_input();
+            let now = Instant::now();
+            event_at(&mut input, 0, key, 1, now);
+            input.update_back_off(now + HOLD_TIMEOUT);
+            assert!(!input.is_backing_off);
+            input.update_back_off(now + HOLD_TIMEOUT + POLL_INTERVAL);
+            assert!(input.is_backing_off, "{key:?}");
+            assert!(input.pending.is_none());
+        }
+    }
+
+    #[test]
+    fn auto_switches_before_separator_and_can_switch_same_word_again() {
+        let mut input = auto_input();
+        press(&mut input, KeyCode::KEY_SLASH);
+        assert!(input.pending.is_none());
+        press(&mut input, KeyCode::KEY_N);
+        assert!(input.is_auto_request());
+        let us = input.automatic_target().unwrap();
+        assert_eq!(us.name, "us");
+        assert_eq!(input.latest_word().unwrap().text().as_deref(), Some(".т"));
+        input.set_latest_layout(Some(us));
+        input.pending = None;
+        press(&mut input, KeyCode::KEY_A);
+        assert_eq!(input.automatic_target().unwrap().name, "ru");
+        assert_eq!(input.latest_word().unwrap().text().as_deref(), Some("/na"));
+    }
+
+    #[test]
+    fn backspace_does_not_check_patterns_and_separators_cancel_pending_auto_switch() {
+        for separator in [
+            KeyCode::KEY_BACKSPACE,
+            KeyCode::KEY_SPACE,
+            KeyCode::KEY_TAB,
+            KeyCode::KEY_ENTER,
+            KeyCode::KEY_LEFT,
+        ] {
+            let mut input = auto_input();
+            press(&mut input, KeyCode::KEY_SLASH);
+            press(&mut input, KeyCode::KEY_N);
+            press(&mut input, separator);
+            assert!(input.automatic_target().is_none());
+        }
+        let mut input = auto_input();
+        for key in [KeyCode::KEY_SLASH, KeyCode::KEY_N, KeyCode::KEY_A] {
+            press(&mut input, key);
+        }
+        input.pending = None;
+        input.automatic_target = None;
+        press(&mut input, KeyCode::KEY_BACKSPACE);
+        assert!(input.pending.is_none());
+        assert!(input.automatic_target().is_none());
     }
 
     #[test]

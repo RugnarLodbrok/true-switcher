@@ -14,6 +14,7 @@ pub struct Configuration {
     pub switch_key: KeyCode,
     pub is_manual_switch_sound: bool,
     pub warning: Option<String>,
+    pub auto_switch: Result<crate::auto_switch::Settings, String>,
 }
 
 pub fn load() -> Configuration {
@@ -27,6 +28,10 @@ pub fn load() -> Configuration {
 }
 
 fn from_contents(contents: Result<String, String>) -> Configuration {
+    let auto_switch = contents.as_ref().map_or_else(
+        |_| Ok(crate::auto_switch::Settings::default()),
+        |text| crate::auto_switch::Settings::parse(&without_switch_key(text)),
+    );
     let is_manual_switch_sound = contents
         .as_ref()
         .ok()
@@ -44,11 +49,13 @@ fn from_contents(contents: Result<String, String>) -> Configuration {
     });
     match result {
         Ok(switch_key) => Configuration {
+            auto_switch,
             switch_key,
             is_manual_switch_sound,
             warning: None,
         },
         Err(error) => Configuration {
+            auto_switch,
             switch_key: DEFAULT_SWITCH_KEY,
             is_manual_switch_sound,
             warning: Some(format!(
@@ -56,6 +63,23 @@ fn from_contents(contents: Result<String, String>) -> Configuration {
             )),
         },
     }
+}
+
+fn without_switch_key(contents: &str) -> String {
+    let mut is_root = true;
+    contents
+        .lines()
+        .filter(|line| {
+            if line.trim_start().starts_with('[') {
+                is_root = false;
+            }
+            !is_root
+                || line
+                    .split_once('=')
+                    .is_none_or(|(key, _)| key.trim() != SWITCH_KEY_SETTING)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -123,6 +147,7 @@ mod tests {
             let config = from_contents(Ok(contents.into()));
             assert_eq!(config.switch_key, DEFAULT_SWITCH_KEY);
             assert!(config.warning.unwrap().contains("Using KEY_PAUSE"));
+            assert!(config.auto_switch.is_ok());
         }
         let config = from_contents(Err("Permission denied".into()));
         assert_eq!(config.switch_key, DEFAULT_SWITCH_KEY);

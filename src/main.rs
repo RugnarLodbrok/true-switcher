@@ -1,3 +1,4 @@
+mod auto_switch;
 mod config;
 mod environment;
 mod focus;
@@ -18,8 +19,55 @@ use std::time::{Duration, SystemTime};
 
 const KEYBOARD_DISCOVERY_DELAY: Duration = Duration::from_millis(500);
 
+struct Correction {
+    previous: Option<history::Word>,
+    word: Option<history::Word>,
+    target: Option<Arc<layout::Layout>>,
+    mode: statistics::SwitchMode,
+    is_sound_enabled: bool,
+}
+
+impl Correction {
+    fn from_input(
+        input: &input::Input,
+        is_auto_sound: bool,
+        is_manual_sound: bool,
+    ) -> Option<Self> {
+        let is_auto = input.is_auto_request();
+        let target = if is_auto {
+            Some(input.automatic_target()?)
+        } else {
+            None
+        };
+        Some(Self {
+            previous: input.previous_word().cloned(),
+            word: input.latest_word().cloned(),
+            target,
+            mode: if is_auto {
+                statistics::SwitchMode::Auto
+            } else {
+                statistics::SwitchMode::Manual
+            },
+            is_sound_enabled: if is_auto {
+                is_auto_sound
+            } else {
+                is_manual_sound
+            },
+        })
+    }
+}
+
+struct Switcher {
+    desktop: environment::KdePlasma,
+    keyboard: output::KeyboardOutput,
+    statistics: statistics::Statistics,
+    sound: sound::Sound,
+}
+
 fn run() -> io::Result<()> {
     let config = config::load();
+    let auto_settings = config.auto_switch.map_err(io::Error::other)?;
+    let auto_switch = auto_switch::AutoSwitch::new(&auto_settings)?;
     if let Some(warning) = &config.warning {
         eprintln!("true-switcher: {warning}");
     }
@@ -29,32 +77,53 @@ fn run() -> io::Result<()> {
         })
         .ok();
     let desktop = environment::KdePlasma::new()?;
-    let mut keyboard = output::KeyboardOutput::new()?;
+    let keyboard = output::KeyboardOutput::new()?;
     let focus_service = focus::FocusService::start()?;
     let layouts = layout::LayoutTracker::start();
     let statistics = statistics::Statistics::start();
-    let sound = sound::Sound::start(config.is_manual_switch_sound);
-    let history = history::History::with_layouts(layouts).with_statistics(statistics.clone());
+    let sound =
+        sound::Sound::start(config.is_manual_switch_sound || auto_settings.is_sound_enabled);
+    let history = history::History::with_layouts(layouts)
+        .with_statistics(statistics.clone())
+        .with_auto_switch(auto_switch);
     let mut input = input::Input::open(focus_service.changes(), config.switch_key, history)?;
+    let mut switcher = Switcher {
+        desktop,
+        keyboard,
+        statistics,
+        sound,
+    };
 
     input.wait_for_keyboard_discovery(KEYBOARD_DISCOVERY_DELAY)?;
     eprintln!("Ready");
 
     loop {
         input.wait_for_request()?;
-        input.enter()?;
+        if !input.enter()? {
+            continue;
+        }
+        if let Some(correction) = Correction::from_input(
+            &input,
+            auto_settings.is_sound_enabled,
+            config.is_manual_switch_sound,
+        ) {
+            switcher.correct(&mut input, &correction)?;
+        }
+        input.leave()?;
+    }
+}
+
+impl Switcher {
+    fn correct(&mut self, input: &mut input::Input, correction: &Correction) -> io::Result<()> {
         let is_cancelled = AtomicBool::new(input.read_captured()?);
-        let word = input.latest_word().cloned();
-        let previous = input.previous_word().cloned();
         thread::scope(|scope| -> io::Result<()> {
             let worker = scope.spawn(|| {
                 correct_word(
-                    previous.as_ref(),
-                    word.as_ref(),
-                    &mut keyboard,
-                    &desktop,
-                    &statistics,
-                    &sound,
+                    correction,
+                    &mut self.keyboard,
+                    &self.desktop,
+                    &self.statistics,
+                    &self.sound,
                     &is_cancelled,
                 )
             });
@@ -86,14 +155,12 @@ fn run() -> io::Result<()> {
                 input.set_latest_layout(layout.clone());
             }
             result.map(|_| ())
-        })?;
-        input.leave()?;
+        })
     }
 }
 
 fn correct_word(
-    previous: Option<&history::Word>,
-    word: Option<&history::Word>,
+    correction: &Correction,
     keyboard: &mut output::KeyboardOutput,
     desktop: &environment::KdePlasma,
     statistics: &statistics::Statistics,
@@ -104,19 +171,33 @@ fn correct_word(
         return Ok(None);
     }
     eprintln!("SYNTHETIC erase");
-    if let Some(word) = word {
+    if let Some(word) = &correction.word {
         keyboard.erase(word.strokes.len() + word.trailing_spaces)?;
     }
     if is_cancelled.load(Ordering::Relaxed) {
         return Ok(None);
     }
     switch_and_replay(
-        || desktop.switch_to_next_layout(),
-        || sound.play(),
-        || record_switch(statistics, previous, word),
+        || match &correction.target {
+            Some(target) => desktop.switch_to_layout(&target.name),
+            None => desktop.switch_to_next_layout(),
+        },
+        || {
+            if correction.is_sound_enabled {
+                sound.play();
+            }
+        },
+        || {
+            record_switch(
+                statistics,
+                correction.previous.as_ref(),
+                correction.word.as_ref(),
+                correction.mode,
+            )
+        },
         || {
             eprintln!("SYNTHETIC replay");
-            if let Some(word) = word {
+            if let Some(word) = &correction.word {
                 keyboard.replay(word)?;
             }
             Ok(())
@@ -129,11 +210,12 @@ fn record_switch(
     statistics: &statistics::Statistics,
     previous: Option<&history::Word>,
     word: Option<&history::Word>,
+    mode: statistics::SwitchMode,
 ) -> Option<Arc<layout::Layout>> {
     let time = SystemTime::now();
     match layout::current_layout() {
         Ok(target) => {
-            statistics.record_switch(previous, word, &target, time);
+            statistics.record_switch_with_mode(previous, word, &target, time, mode);
             Some(target)
         }
         Err(error) => {

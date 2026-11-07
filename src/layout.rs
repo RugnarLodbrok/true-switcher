@@ -16,6 +16,8 @@ const INTERFACE: &str = "org.kde.KeyboardLayouts";
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 const EVDEV_KEYCODE_OFFSET: u32 = 8;
 const CONFIG_FILE: &str = "kxkbrc";
+const XKB_DIRECTORY: &str = "/usr/share/X11/xkb";
+const XKB_LAYOUT_REGISTRY: &str = "rules/evdev.lst";
 
 #[cfg(test)]
 mod tests;
@@ -188,6 +190,64 @@ pub fn current_layout() -> io::Result<Arc<Layout>> {
     let connection = Connection::session().map_err(io::Error::other)?;
     let proxy = Proxy::new(&connection, SERVICE, PATH, INTERFACE).map_err(io::Error::other)?;
     query(&proxy, &read_configuration)
+}
+
+pub fn target_layout(name: &str) -> io::Result<Arc<Layout>> {
+    let root = env::var_os("XKB_CONFIG_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(XKB_DIRECTORY));
+    let registry = fs::read_to_string(root.join(XKB_LAYOUT_REGISTRY))?;
+    validate_identifier(&registry, name)?;
+    let connection = Connection::session().map_err(io::Error::other)?;
+    let proxy = Proxy::new(&connection, SERVICE, PATH, INTERFACE).map_err(io::Error::other)?;
+    let names: Vec<(String, String, String)> = proxy
+        .call("getLayoutsList", &())
+        .map_err(io::Error::other)?;
+    configured_target(&names, &read_configuration()?, name)
+}
+
+fn configured_target(
+    names: &[(String, String, String)],
+    contents: &str,
+    name: &str,
+) -> io::Result<Arc<Layout>> {
+    let index = names
+        .iter()
+        .position(|entry| entry.0 == name)
+        .ok_or_else(|| {
+            io::Error::other(format!("Layout {name:?} is absent from KDE configuration"))
+        })?;
+    configured_layout(contents, index, name)
+        .map(Arc::new)
+        .ok_or_else(|| io::Error::other(format!("Cannot match KDE layout {name:?} to kxkbrc")))
+}
+
+pub fn layout_index(name: &str) -> io::Result<usize> {
+    let connection = Connection::session().map_err(io::Error::other)?;
+    let proxy = Proxy::new(&connection, SERVICE, PATH, INTERFACE).map_err(io::Error::other)?;
+    let names: Vec<(String, String, String)> = proxy
+        .call("getLayoutsList", &())
+        .map_err(io::Error::other)?;
+    names
+        .iter()
+        .position(|entry| entry.0 == name)
+        .ok_or_else(|| {
+            io::Error::other(format!("Layout {name:?} is absent from KDE configuration"))
+        })
+}
+
+fn validate_identifier(registry: &str, name: &str) -> io::Result<()> {
+    let mut is_layout_section = false;
+    for line in registry.lines().map(str::trim) {
+        if line.starts_with('!') {
+            is_layout_section = line == "! layout";
+        } else if is_layout_section && line.split_whitespace().next() == Some(name) {
+            return Ok(());
+        }
+    }
+    Err(io::Error::other(format!(
+        "Invalid XKB layout identifier: {name:?}"
+    )))
 }
 
 fn read_configuration() -> io::Result<String> {

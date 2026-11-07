@@ -49,6 +49,13 @@ test:
 install uninstall:
 	./installer/installer.sh $@
 
-.PHONY: build
+.PHONY: build update-installed
 build:
 	cargo build --release --bin true-switcher
+
+update-installed: build
+	test -f /usr/local/bin/true-switcher
+	sudo systemctl stop true-switcher.service
+	sudo install -m 755 target/release/true-switcher /usr/local/bin/true-switcher
+	if command -v restorecon >/dev/null 2>&1; then sudo restorecon /usr/local/bin/true-switcher; fi
+	sudo systemctl start true-switcher.service

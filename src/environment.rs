@@ -23,12 +23,18 @@ impl KdePlasma {
 
     /// Let KDE select the next layout in its configured order, including wraparound.
     pub fn switch_to_next_layout(&self) -> io::Result<()> {
+        self.call_layout_method("org.kde.KeyboardLayouts.switchToNextLayout", &[])
+    }
+
+    pub fn switch_to_layout(&self, name: &str) -> io::Result<()> {
+        let index = crate::layout::layout_index(name)?.to_string();
+        self.call_layout_method("org.kde.KeyboardLayouts.setLayout", &[&index])
+    }
+
+    fn call_layout_method(&self, method: &str, arguments: &[&str]) -> io::Result<()> {
         let output = Command::new(&self.qdbus)
-            .args([
-                "org.kde.keyboard",
-                "/Layouts",
-                "org.kde.KeyboardLayouts.switchToNextLayout",
-            ])
+            .args(["org.kde.keyboard", "/Layouts", method])
+            .args(arguments)
             .output()
             .map_err(|error| {
                 io::Error::new(
@@ -50,6 +56,10 @@ impl KdePlasma {
                 self.qdbus.display(),
                 output.status
             )));
+        }
+
+        if String::from_utf8_lossy(&output.stdout).trim() == "false" {
+            return Err(io::Error::other("KDE rejected the layout switch"));
         }
 
         Ok(())

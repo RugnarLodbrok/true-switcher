@@ -16,7 +16,8 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS switches (
     timestamp INTEGER NOT NULL,
     prev TEXT NOT NULL,
     a TEXT NOT NULL,
-    b TEXT NOT NULL
+    b TEXT NOT NULL,
+    mode INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS typing_words (
     word TEXT PRIMARY KEY,
@@ -31,10 +32,18 @@ enum Record {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SwitchRecord {
+    mode: SwitchMode,
     timestamp: i64,
     prev: String,
     a: String,
     b: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(i64)]
+pub enum SwitchMode {
+    Manual = 0,
+    Auto = 1,
 }
 
 #[derive(Clone)]
@@ -61,6 +70,7 @@ impl Statistics {
         Self { sender }
     }
 
+    #[cfg(test)]
     pub fn record_switch(
         &self,
         previous: Option<&Word>,
@@ -68,10 +78,22 @@ impl Statistics {
         target: &Layout,
         time: SystemTime,
     ) {
-        let Some(record) = make_record(previous, word, target, time) else {
+        self.record_switch_with_mode(previous, word, target, time, SwitchMode::Manual);
+    }
+
+    pub fn record_switch_with_mode(
+        &self,
+        previous: Option<&Word>,
+        word: Option<&Word>,
+        target: &Layout,
+        time: SystemTime,
+        mode: SwitchMode,
+    ) {
+        let Some(mut record) = make_record(previous, word, target, time) else {
             eprintln!("true-switcher: skipping statistics: cannot convert word to text");
             return;
         };
+        record.mode = mode;
         self.send(Record::Switch(record));
     }
 
@@ -110,6 +132,7 @@ fn make_record(
     time: SystemTime,
 ) -> Option<SwitchRecord> {
     Some(SwitchRecord {
+        mode: SwitchMode::Manual,
         timestamp: time
             .duration_since(UNIX_EPOCH)
             .ok()?
@@ -151,11 +174,27 @@ fn store(record: &Record) -> Result<(), Box<dyn std::error::Error>> {
 
 fn insert(connection: &Connection, record: &Record) -> rusqlite::Result<()> {
     connection.execute_batch(SCHEMA)?;
+    let has_mode = connection
+        .prepare("PRAGMA table_info(switches)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|name| name == "mode");
+    if !has_mode {
+        connection
+            .execute_batch("ALTER TABLE switches ADD COLUMN mode INTEGER NOT NULL DEFAULT 0")?;
+    }
     match record {
         Record::Switch(record) => {
             connection.execute(
-                "INSERT INTO switches (timestamp, prev, a, b) VALUES (?1, ?2, ?3, ?4)",
-                params![record.timestamp, record.prev, record.a, record.b],
+                "INSERT INTO switches (timestamp, prev, a, b, mode) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    record.timestamp,
+                    record.prev,
+                    record.a,
+                    record.b,
+                    record.mode as i64
+                ],
             )?;
         }
         Record::TypingWord(word) => {
@@ -178,6 +217,32 @@ mod tests {
     use std::time::Duration;
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn migrates_old_switches_as_manual_and_stores_auto_mode() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch("CREATE TABLE switches (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER NOT NULL, prev TEXT NOT NULL, a TEXT NOT NULL, b TEXT NOT NULL); INSERT INTO switches (timestamp, prev, a, b) VALUES (1, '', 'old', 'old');").unwrap();
+        let mut record = make_record(None, None, &layout("us"), UNIX_EPOCH).unwrap();
+        record.mode = SwitchMode::Auto;
+        insert(&connection, &Record::Switch(record)).unwrap();
+        let modes: Vec<i64> = connection
+            .prepare("SELECT mode FROM switches ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(modes, [0, 1]);
+        let record = make_record(None, None, &layout("us"), UNIX_EPOCH).unwrap();
+        insert(&connection, &Record::Switch(record)).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT mode FROM switches WHERE id = 3", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
 
     fn layout(name: &str) -> Arc<Layout> {
         Arc::new(Layout {
@@ -270,7 +335,7 @@ mod tests {
                 finish_history(history, received),
                 [
                     Record::TypingWord("привет".into()),
-                    Record::TypingWord("ghbdtn".into())
+                    Record::TypingWord("привет".into())
                 ]
             );
         }
@@ -319,8 +384,8 @@ mod tests {
             finish_history(history, received),
             [
                 Record::TypingWord("п".into()),
-                Record::TypingWord("a,".into()),
-                Record::TypingWord("c".into())
+                Record::TypingWord("фб".into()),
+                Record::TypingWord("с".into())
             ]
         );
     }
@@ -375,6 +440,7 @@ mod tests {
         assert_eq!(
             record,
             SwitchRecord {
+                mode: SwitchMode::Manual,
                 timestamp: 123,
                 prev: "при".into(),
                 a: "ghb".into(),
@@ -417,6 +483,7 @@ mod tests {
     fn sqlite_preserves_unicode_quotes_timestamps_and_autoincrements_ids() {
         let connection = Connection::open_in_memory().unwrap();
         let record = SwitchRecord {
+            mode: SwitchMode::Manual,
             timestamp: 123,
             prev: "привет".into(),
             a: "'\"; DROP TABLE switches;".into(),
@@ -430,6 +497,7 @@ mod tests {
                 [],
                 |row| {
                     Ok(SwitchRecord {
+                        mode: SwitchMode::Manual,
                         timestamp: row.get(0)?,
                         prev: row.get(1)?,
                         a: row.get(2)?,

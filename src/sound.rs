@@ -41,10 +41,10 @@ impl Sound {
     }
 
     pub fn play(&self) {
-        if let Some(sender) = &self.sender {
-            if let Err(error) = sender.send(()) {
-                eprintln!("true-switcher: sound worker unavailable: {error}");
-            }
+        if let Some(sender) = &self.sender
+            && let Err(error) = sender.send(())
+        {
+            eprintln!("true-switcher: sound worker unavailable: {error}");
         }
     }
 }
@@ -75,7 +75,7 @@ fn play(samples: &[u8]) -> Result<(), libpulse_binding::error::PAErr> {
         "true-switcher",
         stream::Direction::Playback,
         None,
-        "manual switch",
+        "layout switch",
         &spec,
         None,
         None,

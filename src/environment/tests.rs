@@ -104,6 +104,25 @@ fn invokes_selected_command_with_kde_arguments() {
 }
 
 #[test]
+fn selects_layout_by_index_and_reports_kde_rejection() {
+    let directory = TestDirectory::new();
+    directory.executable(
+        "qdbus6",
+        "[ \"$#\" -eq 4 ] && [ \"$3\" = org.kde.KeyboardLayouts.setLayout ] && [ \"$4\" = 2 ]",
+    );
+    let desktop = directory.desktop();
+    desktop
+        .call_layout_method("org.kde.KeyboardLayouts.setLayout", &["2"])
+        .unwrap();
+    directory.executable("qdbus6", "printf false");
+    assert!(
+        desktop
+            .call_layout_method("org.kde.KeyboardLayouts.setLayout", &["2"])
+            .is_err()
+    );
+}
+
+#[test]
 fn preserves_symlink_name_when_invoking_command() {
     let directory = TestDirectory::new();
     let target = directory.executable("qt-tool", "[ \"${0##*/}\" = qdbus-qt6 ]");
