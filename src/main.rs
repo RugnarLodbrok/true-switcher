@@ -1,4 +1,4 @@
-mod auto_switch;
+mod switch_rules;
 mod config;
 mod environment;
 mod focus;
@@ -66,7 +66,7 @@ struct Switcher {
 
 fn run() -> io::Result<()> {
     let prepared = config::load().and_then(|config| {
-        auto_switch::AutoSwitch::new(&config.auto_switch)
+        switch_rules::AutoSwitchRules::new(&config.auto_switch)
             .map(|auto_switch| (config, auto_switch))
             .map_err(|error| format!("Configuration: {error}"))
     });

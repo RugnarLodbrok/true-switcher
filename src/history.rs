@@ -58,7 +58,7 @@ pub struct History {
     layouts: crate::layout::LayoutTracker,
     statistics: Option<crate::statistics::Statistics>,
     observed_layout: Option<Arc<crate::layout::Layout>>,
-    auto_switch: crate::auto_switch::AutoSwitch,
+    auto_switch: crate::switch_rules::AutoSwitchRules,
     // Track modifiers per keyboard: releasing Shift on one device must not
     // release a Shift still held on another one.
     modifiers: HashSet<(PathBuf, KeyCode)>,
@@ -77,7 +77,7 @@ impl History {
         self
     }
 
-    pub fn with_auto_switch(mut self, auto_switch: crate::auto_switch::AutoSwitch) -> Self {
+    pub fn with_auto_switch(mut self, auto_switch: crate::switch_rules::AutoSwitchRules) -> Self {
         self.auto_switch = auto_switch;
         self
     }

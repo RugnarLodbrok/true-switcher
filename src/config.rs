@@ -13,7 +13,7 @@ const MANUAL_SOUND_SETTING: &str = "manual_switch_sound";
 pub struct Configuration {
     pub switch_key: KeyCode,
     pub is_manual_switch_sound: bool,
-    pub auto_switch: crate::auto_switch::Settings,
+    pub auto_switch: crate::switch_rules::Settings,
 }
 
 pub fn load() -> Result<Configuration, String> {
@@ -42,7 +42,7 @@ fn from_contents(contents: &str) -> Result<Configuration, String> {
             .as_bool()
             .ok_or_else(|| format!("Invalid {MANUAL_SOUND_SETTING}: expected a boolean"))?,
     };
-    let auto_switch = crate::auto_switch::Settings::parse(contents)?;
+    let auto_switch = crate::switch_rules::Settings::parse(contents)?;
     Ok(Configuration {
         switch_key,
         is_manual_switch_sound,

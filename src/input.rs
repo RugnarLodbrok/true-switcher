@@ -1039,7 +1039,7 @@ mod tests {
         let mut input = simulated_input(&[source]);
         input.pending = None;
         input.is_original_switch_key_held = false;
-        let settings = crate::auto_switch::Settings::parse(
+        let settings = crate::switch_rules::Settings::parse(
             r#"
 auto_switch = true
 [[switch_rules]]
@@ -1051,7 +1051,7 @@ patterns = ['^\.тф']
 "#,
         )
         .unwrap();
-        let switch = crate::auto_switch::AutoSwitch::compile(&settings, |name| {
+        let switch = crate::switch_rules::AutoSwitchRules::compile(&settings, |name| {
             Ok(Arc::new(crate::layout::Layout {
                 name: name.into(),
                 ..Default::default()
