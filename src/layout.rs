@@ -33,7 +33,10 @@ pub struct Layout {
 }
 
 impl Layout {
-    pub fn text(&self, strokes: &[crate::history::Stroke]) -> Option<String> {
+    pub fn text<'a>(
+        &self,
+        strokes: impl IntoIterator<Item = &'a crate::history::Stroke>,
+    ) -> Option<String> {
         if [&self.name, &self.variant, &self.model, &self.options]
             .iter()
             .any(|value| value.contains('\0'))

@@ -135,13 +135,13 @@ fn emit_batch(
 fn replay_strokes(word: &Word) -> io::Result<impl Iterator<Item = Stroke> + '_> {
     // Validate before typing anything, so unsupported keys cannot leave a
     // partially replayed word or trigger navigation/shortcuts.
-    if word.strokes.iter().any(|stroke| !is_text_key(stroke.key)) {
+    if word.strokes().any(|stroke| !is_text_key(stroke.key)) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "word contains a non-text key",
         ));
     }
-    Ok(word.strokes.iter().copied().chain(std::iter::repeat_n(
+    Ok(word.strokes().copied().chain(std::iter::repeat_n(
         Stroke {
             key: KeyCode::KEY_SPACE,
             shift: false,
@@ -218,7 +218,7 @@ mod tests {
     #[test]
     fn batch_replay_preserves_every_legacy_frame_with_shift_repeats_and_spaces() {
         let word = Word {
-            strokes: vec![
+            entries: vec![
                 Stroke {
                     key: KeyCode::KEY_A,
                     shift: true,
@@ -231,9 +231,14 @@ mod tests {
                     key: KeyCode::KEY_COMMA,
                     shift: false,
                 },
-            ],
+            ]
+            .into_iter()
+            .map(|stroke| crate::history::WordStroke {
+                stroke,
+                layout: None,
+            })
+            .collect(),
             trailing_spaces: 3,
-            ..Word::default()
         };
         assert_batch_matches_legacy(replay_strokes(&word).unwrap().collect());
     }
@@ -310,15 +315,20 @@ mod tests {
     #[test]
     fn replay_preserves_word_and_spaces_and_deletion_matches_their_length() {
         let word = Word {
-            strokes: vec![
+            entries: vec![
                 Stroke {
                     key: KeyCode::KEY_COMMA,
                     shift: true,
                 };
                 2
-            ],
+            ]
+            .into_iter()
+            .map(|stroke| crate::history::WordStroke {
+                stroke,
+                layout: None,
+            })
+            .collect(),
             trailing_spaces: 3,
-            ..Word::default()
         };
         let mut events = Vec::new();
         emit_strokes(replay_strokes(&word).unwrap(), |key, value| {
@@ -349,7 +359,7 @@ mod tests {
                     key: KeyCode::KEY_BACKSPACE,
                     shift: false,
                 },
-                word.strokes.len() + word.trailing_spaces,
+                word.entries.len() + word.trailing_spaces,
             ),
             |key, value| {
                 events.push((key, value));
@@ -361,7 +371,7 @@ mod tests {
             events,
             [(KeyCode::KEY_BACKSPACE, 1), (KeyCode::KEY_BACKSPACE, 0)].repeat(5)
         );
-        assert_eq!(word.strokes.len(), 2);
+        assert_eq!(word.entries.len(), 2);
         assert_eq!(word.trailing_spaces, 3);
         assert_eq!(replay_strokes(&Word::default()).unwrap().count(), 0);
     }
@@ -369,7 +379,7 @@ mod tests {
     #[test]
     fn invalid_word_is_rejected_before_any_stroke_can_be_emitted() {
         let word = Word {
-            strokes: vec![
+            entries: vec![
                 Stroke {
                     key: KeyCode::KEY_A,
                     shift: false,
@@ -378,9 +388,14 @@ mod tests {
                     key: KeyCode::KEY_ENTER,
                     shift: false,
                 },
-            ],
+            ]
+            .into_iter()
+            .map(|stroke| crate::history::WordStroke {
+                stroke,
+                layout: None,
+            })
+            .collect(),
             trailing_spaces: 0,
-            ..Word::default()
         };
         assert!(
             matches!(replay_strokes(&word), Err(error) if error.kind() == io::ErrorKind::InvalidInput)

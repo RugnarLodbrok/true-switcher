@@ -100,7 +100,7 @@ impl Statistics {
     pub fn record_word(&self, word: &Word) {
         let Some(text) = word.text() else {
             log::warn!(
-                "true-switcher: skipping typing statistics: cannot convert word to text (missing layout, mismatched strokes or unsupported character)"
+                "true-switcher: skipping typing statistics: cannot convert word to text (missing layout or unsupported character)"
             );
             return;
         };
@@ -146,7 +146,7 @@ fn make_record(
             .map(Word::text)
             .unwrap_or_else(|| Some(String::new()))?,
         b: word
-            .map(|word| target.text(&word.strokes))
+            .map(|word| target.text(word.strokes()))
             .unwrap_or_else(|| Some(String::new()))?,
     })
 }
@@ -296,13 +296,15 @@ mod tests {
     }
 
     fn word(name: &str) -> Word {
-        let strokes: Vec<_> = [KeyCode::KEY_G, KeyCode::KEY_H, KeyCode::KEY_B]
+        let entries = [KeyCode::KEY_G, KeyCode::KEY_H, KeyCode::KEY_B]
             .into_iter()
-            .map(|key| Stroke { key, shift: false })
+            .map(|key| crate::history::WordStroke {
+                stroke: Stroke { key, shift: false },
+                layout: Some(layout(name)),
+            })
             .collect();
         Word {
-            layouts: vec![Some(layout(name)); strokes.len()],
-            strokes,
+            entries,
             trailing_spaces: 2,
         }
     }
@@ -499,7 +501,7 @@ mod tests {
             (&String::new(), &String::new(), &String::new())
         );
         let mut unknown = word("us");
-        unknown.layouts[0] = None;
+        unknown.entries[0].layout = None;
         assert!(make_record(None, Some(&unknown), &layout("ru"), UNIX_EPOCH).is_none());
         assert!(make_record(Some(&unknown), None, &layout("ru"), UNIX_EPOCH).is_none());
         let invalid = layout("\0");

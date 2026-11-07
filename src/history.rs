@@ -13,24 +13,32 @@ pub struct Stroke {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Word {
-    pub strokes: Vec<Stroke>,
+    pub entries: Vec<WordStroke>,
     pub trailing_spaces: usize,
-    pub layouts: Vec<Option<Arc<crate::layout::Layout>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WordStroke {
+    pub stroke: Stroke,
+    pub layout: Option<Arc<crate::layout::Layout>>,
 }
 
 impl Word {
+    pub fn strokes(&self) -> impl Iterator<Item = &Stroke> {
+        self.entries.iter().map(|entry| &entry.stroke)
+    }
+
     pub fn text(&self) -> Option<String> {
-        if self.layouts.len() != self.strokes.len() {
-            return None;
-        }
         let mut text = String::new();
         let mut start = 0;
-        while start < self.strokes.len() {
-            let layout = self.layouts[start].as_ref()?;
-            let end = (start + 1..self.strokes.len())
-                .find(|&index| self.layouts[index].as_ref() != Some(layout))
-                .unwrap_or(self.strokes.len());
-            text.push_str(&layout.text(&self.strokes[start..end])?);
+        while start < self.entries.len() {
+            let layout = self.entries[start].layout.as_ref()?;
+            let end = (start + 1..self.entries.len())
+                .find(|&index| self.entries[index].layout.as_ref() != Some(layout))
+                .unwrap_or(self.entries.len());
+            text.push_str(
+                &layout.text(self.entries[start..end].iter().map(|entry| &entry.stroke))?,
+            );
             start = end;
         }
         Some(text)
@@ -39,7 +47,7 @@ impl Word {
 
 impl fmt::Display for Word {
     fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (index, stroke) in self.strokes.iter().enumerate() {
+        for (index, stroke) in self.strokes().enumerate() {
             if index > 0 {
                 write!(output, " ")?;
             }
@@ -117,7 +125,9 @@ impl History {
             self.observed_layout = layout.clone();
         }
         if let Some(word) = self.words.last_mut() {
-            word.layouts = vec![layout; word.strokes.len()];
+            for entry in &mut word.entries {
+                entry.layout = layout.clone();
+            }
         }
     }
 
@@ -175,8 +185,10 @@ impl History {
                 }
                 let shift = self.modifiers.iter().any(|(_, key)| is_shift(*key));
                 let word = self.words.last_mut().unwrap();
-                word.strokes.push(Stroke { key, shift });
-                word.layouts.push(self.layout.clone());
+                word.entries.push(WordStroke {
+                    stroke: Stroke { key, shift },
+                    layout: self.layout.clone(),
+                });
                 Vec::new()
             }
             _ => Vec::new(),
@@ -199,9 +211,8 @@ impl History {
             word.trailing_spaces -= 1;
             return None;
         }
-        word.strokes.pop();
-        word.layouts.pop();
-        if word.strokes.is_empty() {
+        word.entries.pop();
+        if word.entries.is_empty() {
             self.words.pop();
             return Some(
                 self.words
@@ -253,7 +264,7 @@ mod tests {
     }
 
     #[test]
-    fn previous_word_keeps_its_layout_and_backspace_keeps_layouts_aligned() {
+    fn previous_word_keeps_its_layout_and_backspace_removes_the_latest_stroke() {
         let mut history = History::default();
         history.accept_layout(Some(layout("us")), false);
         press(&mut history, KeyCode::KEY_A);
@@ -286,6 +297,36 @@ mod tests {
         assert!(history.latest_word().unwrap().text().is_none());
     }
 
+    #[test]
+    fn word_preserves_mixed_and_unknown_layouts_per_stroke() {
+        let mut word = Word {
+            entries: vec![
+                WordStroke {
+                    stroke: Stroke {
+                        key: KeyCode::KEY_A,
+                        shift: true,
+                    },
+                    layout: Some(layout("us")),
+                },
+                WordStroke {
+                    stroke: Stroke {
+                        key: KeyCode::KEY_B,
+                        shift: false,
+                    },
+                    layout: Some(layout("ru")),
+                },
+            ],
+            trailing_spaces: 2,
+        };
+        assert_eq!(word.text().as_deref(), Some("Aи"));
+        word.entries[1].layout = None;
+        assert_eq!(word.text(), None);
+        word.entries.pop();
+        assert_eq!(word.text().as_deref(), Some("A"));
+        word.entries.clear();
+        assert_eq!(word.text().as_deref(), Some(""));
+    }
+
     fn event(history: &mut History, key: KeyCode, value: i32) -> Vec<String> {
         history.process(Path::new("keyboard"), key, value)
     }
@@ -302,7 +343,7 @@ mod tests {
         assert_eq!(press(&mut history, KeyCode::KEY_SPACE), ["KEY_G KEY_COMMA"]);
         assert!(event(&mut history, KeyCode::KEY_SPACE, 2).is_empty());
         assert_eq!(history.words[0].trailing_spaces, 2);
-        assert_eq!(history.words[0].strokes.len(), 2);
+        assert_eq!(history.words[0].entries.len(), 2);
     }
 
     #[test]
@@ -314,7 +355,7 @@ mod tests {
         assert_eq!(press(&mut history, KeyCode::KEY_SPACE), ["KEY_A KEY_A"]);
         press(&mut history, KeyCode::KEY_BACKSPACE);
         event(&mut history, KeyCode::KEY_BACKSPACE, 2);
-        assert_eq!(history.words[0].strokes.len(), 1);
+        assert_eq!(history.words[0].entries.len(), 1);
         assert_eq!(event(&mut history, KeyCode::KEY_BACKSPACE, 2), [""]);
     }
 
@@ -363,8 +404,7 @@ mod tests {
         );
         assert_eq!(
             history.words[0]
-                .strokes
-                .iter()
+                .strokes()
                 .map(|stroke| stroke.shift)
                 .collect::<Vec<_>>(),
             [true, true, false]

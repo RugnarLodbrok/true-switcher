@@ -1362,7 +1362,7 @@ patterns = ['^\.тф']
             event_at(&mut input, 0, key, 0, now);
             assert!(!input.is_backing_off);
             event_at(&mut input, 0, KeyCode::KEY_C, 1, now);
-            assert_eq!(input.latest_word().unwrap().strokes.len(), 1);
+            assert_eq!(input.latest_word().unwrap().entries.len(), 1);
         }
     }
 
@@ -1431,7 +1431,7 @@ patterns = ['^\.тф']
         event_at(&mut input, 1, KeyCode::KEY_RIGHTSHIFT, 0, later);
         assert!(!input.is_backing_off);
         event_at(&mut input, 0, KeyCode::KEY_C, 1, later);
-        assert!(!input.latest_word().unwrap().strokes[0].shift);
+        assert!(!input.latest_word().unwrap().entries[0].stroke.shift);
     }
 
     #[test]

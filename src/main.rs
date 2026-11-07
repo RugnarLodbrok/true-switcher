@@ -201,7 +201,7 @@ fn correct_word(
     }
     log::debug!("SYNTHETIC erase");
     if let Some(word) = &correction.word {
-        keyboard.erase(word.strokes.len() + word.trailing_spaces)?;
+        keyboard.erase(word.entries.len() + word.trailing_spaces)?;
     }
     if is_cancelled.load(Ordering::Relaxed) {
         return Ok(());

@@ -45,7 +45,7 @@ impl AutoSwitchRules {
             if rule.target.name == current.name {
                 return None;
             }
-            let text = rule.target.text(&word.strokes)?;
+            let text = rule.target.text(word.strokes())?;
             rule.patterns.is_match(&text).then(|| rule.target.clone())
         })
     }
@@ -54,7 +54,7 @@ impl AutoSwitchRules {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::Stroke;
+    use crate::history::{Stroke, WordStroke};
     use evdev::KeyCode;
 
     fn parse_config(text: &str) -> Result<Configuration, String> {
@@ -70,9 +70,12 @@ mod tests {
 
     fn word(keys: &[KeyCode]) -> Word {
         Word {
-            strokes: keys
+            entries: keys
                 .iter()
-                .map(|&key| Stroke { key, shift: false })
+                .map(|&key| WordStroke {
+                    stroke: Stroke { key, shift: false },
+                    layout: None,
+                })
                 .collect(),
             ..Default::default()
         }
