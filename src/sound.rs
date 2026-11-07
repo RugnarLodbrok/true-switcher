@@ -27,12 +27,12 @@ impl Sound {
             let samples = synthesize();
             while receiver.recv().is_ok() {
                 if let Err(error) = play(&samples) {
-                    eprintln!("true-switcher: sound: {error}");
+                    log::warn!("true-switcher: sound: {error}");
                 }
             }
         });
         if let Err(error) = result {
-            eprintln!("true-switcher: cannot start sound worker: {error}");
+            log::warn!("true-switcher: cannot start sound worker: {error}");
             return Self { sender: None };
         }
         Self {
@@ -44,7 +44,7 @@ impl Sound {
         if let Some(sender) = &self.sender
             && let Err(error) = sender.send(())
         {
-            eprintln!("true-switcher: sound worker unavailable: {error}");
+            log::warn!("true-switcher: sound worker unavailable: {error}");
         }
     }
 }

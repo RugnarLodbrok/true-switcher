@@ -4,7 +4,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::input_events::{InputEventMessage, InputEventSender};
 use xkbcommon::xkb;
@@ -15,6 +15,7 @@ const SERVICE: &str = "org.kde.keyboard";
 const PATH: &str = "/Layouts";
 const INTERFACE: &str = "org.kde.KeyboardLayouts";
 const RETRY_DELAY: Duration = Duration::from_secs(1);
+const WARNING_INTERVAL: Duration = Duration::from_secs(60);
 const EVDEV_KEYCODE_OFFSET: u32 = 8;
 const CONFIG_FILE: &str = "kxkbrc";
 const XKB_DIRECTORY: &str = "/usr/share/X11/xkb";
@@ -84,15 +85,27 @@ impl LayoutTracker {
         if let Err(error) = thread::Builder::new()
             .name("layout-tracker".into())
             .spawn(move || {
+                let mut last_warning: Option<Instant> = None;
                 loop {
-                    if let Err(error) = track(&worker) {
-                        eprintln!("true-switcher: layout tracking: {error}");
+                    let result = track(&worker, &mut || {
+                        if last_warning.take().is_some() {
+                            log::info!("true-switcher: layout tracking restored");
+                        }
+                    });
+                    if let Err(error) = result {
+                        let now = Instant::now();
+                        if last_warning
+                            .is_none_or(|last| now.duration_since(last) >= WARNING_INTERVAL)
+                        {
+                            log::warn!("true-switcher: layout tracking: {error}");
+                            last_warning = Some(now);
+                        }
                     }
                     thread::sleep(RETRY_DELAY);
                 }
             })
         {
-            eprintln!("true-switcher: cannot start layout tracking: {error}");
+            log::error!("true-switcher: cannot start layout tracking: {error}");
         }
         tracker
     }
@@ -141,7 +154,7 @@ impl LayoutTracker {
     }
 }
 
-fn track(tracker: &LayoutTracker) -> zbus::Result<()> {
+fn track(tracker: &LayoutTracker, on_connected: &mut impl FnMut()) -> zbus::Result<()> {
     let connection = match Connection::session() {
         Ok(connection) => connection,
         Err(error) => {
@@ -149,7 +162,7 @@ fn track(tracker: &LayoutTracker) -> zbus::Result<()> {
             return Err(error);
         }
     };
-    track_connection(&connection, tracker, &read_configuration)
+    track_connection(&connection, tracker, &read_configuration, on_connected)
 }
 
 fn subscribe(connection: &Connection) -> zbus::Result<MessageIterator> {
@@ -179,8 +192,9 @@ fn track_connection(
     connection: &Connection,
     tracker: &LayoutTracker,
     read_config: &impl Fn() -> io::Result<String>,
+    on_connected: &mut impl FnMut(),
 ) -> zbus::Result<()> {
-    let result = receive_changes(connection, tracker, read_config);
+    let result = receive_changes(connection, tracker, read_config, on_connected);
     tracker.invalidate();
     result
 }
@@ -189,6 +203,7 @@ fn receive_changes(
     connection: &Connection,
     tracker: &LayoutTracker,
     read_config: &impl Fn() -> io::Result<String>,
+    on_connected: &mut impl FnMut(),
 ) -> zbus::Result<()> {
     let mut messages = subscribe(connection)?;
     let owner = DBusProxy::new(connection)?.get_name_owner(SERVICE.try_into()?)?;
@@ -196,6 +211,7 @@ fn receive_changes(
     tracker
         .observe(|| query(&proxy, read_config))
         .map_err(zbus::Error::from)?;
+    on_connected();
     for message in &mut messages {
         let message = message?;
         let header = message.header();

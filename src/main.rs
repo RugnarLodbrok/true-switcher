@@ -71,11 +71,12 @@ fn run() -> io::Result<()> {
     let (config, auto_switch) = match prepare_configuration() {
         Ok(prepared) => prepared,
         Err(error) => {
-            eprintln!("true-switcher: {error}");
+            log::error!("true-switcher: {error}");
             return tray::Tray::run_error(error);
         }
     };
 
+    log::set_max_level(config.log_level);
     let _tray = tray::Tray::start()?;
 
     let desktop = environment::KdePlasma::new()?;
@@ -101,7 +102,7 @@ fn run() -> io::Result<()> {
     };
 
     input.wait_for_keyboard_discovery(KEYBOARD_DISCOVERY_DELAY)?;
-    eprintln!("Ready");
+    log::info!("Ready");
 
     switcher.process_requests(&mut input, &config)
 }
@@ -198,7 +199,7 @@ fn correct_word(
     if is_cancelled.load(Ordering::Relaxed) {
         return Ok(());
     }
-    eprintln!("SYNTHETIC erase");
+    log::debug!("SYNTHETIC erase");
     if let Some(word) = &correction.word {
         keyboard.erase(word.strokes.len() + word.trailing_spaces)?;
     }
@@ -224,7 +225,7 @@ fn correct_word(
             )
         },
         || {
-            eprintln!("SYNTHETIC replay");
+            log::debug!("SYNTHETIC replay");
             if let Some(word) = &correction.word {
                 keyboard.replay(word)?;
             }
@@ -248,7 +249,7 @@ fn record_switch(
             Some(target)
         }
         Err(error) => {
-            eprintln!("true-switcher: skipping statistics: {error}");
+            log::warn!("true-switcher: skipping statistics: {error}");
             None
         }
     }
@@ -271,11 +272,15 @@ fn switch_and_replay<T>(
 }
 
 fn main() -> ExitCode {
+    env_logger::Builder::new()
+        .filter_level(log::LevelFilter::Trace)
+        .init();
+    log::set_max_level(log::LevelFilter::Info);
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) if error.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("true-switcher: {error}");
+            log::error!("true-switcher: {error}");
             ExitCode::FAILURE
         }
     }

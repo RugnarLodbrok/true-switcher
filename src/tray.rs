@@ -73,7 +73,7 @@ fn maintain() {
         match maintain_connection(&mut delay) {
             Ok(()) => delay = RETRY_DELAY,
             Err(error) => {
-                eprintln!("true-switcher: tray registration: {error}");
+                log::warn!("true-switcher: tray registration: {error}");
                 thread::sleep(delay);
                 delay = (delay * 2).min(MAX_RETRY_DELAY);
             }

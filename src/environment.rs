@@ -17,7 +17,7 @@ impl KdePlasma {
     pub fn new() -> io::Result<Self> {
         let path = env::var_os("PATH").unwrap_or_default();
         let qdbus = find_qdbus(&path)?;
-        eprintln!("qdbus executable: {}", qdbus.display());
+        log::debug!("qdbus executable: {}", qdbus.display());
         Ok(Self { qdbus })
     }
 

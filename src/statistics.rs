@@ -65,7 +65,7 @@ impl Statistics {
             .name("statistics".into())
             .spawn(move || write_records(receiver, writer))
         {
-            eprintln!("true-switcher: cannot start statistics thread: {error}");
+            log::error!("true-switcher: cannot start statistics thread: {error}");
         }
         Self { sender }
     }
@@ -90,7 +90,7 @@ impl Statistics {
         mode: SwitchMode,
     ) {
         let Some(mut record) = make_record(previous, word, target, time) else {
-            eprintln!("true-switcher: skipping statistics: cannot convert word to text");
+            log::warn!("true-switcher: skipping statistics: cannot convert word to text");
             return;
         };
         record.mode = mode;
@@ -99,7 +99,7 @@ impl Statistics {
 
     pub fn record_word(&self, word: &Word) {
         let Some(text) = word.text() else {
-            eprintln!(
+            log::warn!(
                 "true-switcher: skipping typing statistics: cannot convert word to text (missing layout, mismatched strokes or unsupported character)"
             );
             return;
@@ -109,7 +109,7 @@ impl Statistics {
 
     fn send(&self, record: Record) {
         if let Err(error) = self.sender.send(record) {
-            eprintln!("true-switcher: statistics queue: {error}");
+            log::error!("true-switcher: statistics queue: {error}");
         }
     }
 }
@@ -120,7 +120,7 @@ fn write_records(
 ) {
     for record in receiver {
         if let Err(error) = writer(&record) {
-            eprintln!("true-switcher: statistics database: {error}");
+            log::error!("true-switcher: statistics database: {error}");
         }
     }
 }

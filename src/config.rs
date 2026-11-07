@@ -10,6 +10,11 @@ const CONFIG_DIRECTORY: &str = ".config/true-switcher";
 const CONFIG_FILE: &str = "config.toml";
 #[derive(Deserialize)]
 pub struct Configuration {
+    #[serde(
+        default = "default_log_level",
+        deserialize_with = "deserialize_log_level"
+    )]
+    pub log_level: log::LevelFilter,
     #[serde(deserialize_with = "deserialize_switch_key")]
     pub switch_key: KeyCode,
     #[serde(default)]
@@ -31,6 +36,25 @@ pub struct SwitchRule {
 
 fn enabled() -> bool {
     true
+}
+
+fn default_log_level() -> log::LevelFilter {
+    log::LevelFilter::Info
+}
+
+fn deserialize_log_level<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<log::LevelFilter, D::Error> {
+    let value = String::deserialize(deserializer)?;
+    match value.as_str() {
+        "off" => Ok(log::LevelFilter::Off),
+        "error" => Ok(log::LevelFilter::Error),
+        "warn" => Ok(log::LevelFilter::Warn),
+        "info" => Ok(log::LevelFilter::Info),
+        "debug" => Ok(log::LevelFilter::Debug),
+        "trace" => Ok(log::LevelFilter::Trace),
+        _ => Err(de::Error::custom(format!("Invalid log_level: {value:?}"))),
+    }
 }
 
 fn deserialize_switch_key<'de, D: Deserializer<'de>>(deserializer: D) -> Result<KeyCode, D::Error> {
@@ -87,6 +111,29 @@ mod tests {
             "switch_key = 'KEY_F12'\n[[switch_rules]]\ntarget = 'ru'\npatterns = []\nvariant = 'phonetic'",
         ] {
             assert!(from_contents(text).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn validates_log_level() {
+        assert_eq!(
+            from_contents("switch_key = 'KEY_F12'").unwrap().log_level,
+            log::LevelFilter::Info
+        );
+        for (name, expected) in [
+            ("off", log::LevelFilter::Off),
+            ("error", log::LevelFilter::Error),
+            ("warn", log::LevelFilter::Warn),
+            ("info", log::LevelFilter::Info),
+            ("debug", log::LevelFilter::Debug),
+            ("trace", log::LevelFilter::Trace),
+        ] {
+            let contents = format!("switch_key = 'KEY_F12'\nlog_level = '{name}'");
+            assert_eq!(from_contents(&contents).unwrap().log_level, expected);
+        }
+        for value in ["'invalid'", "'INFO'", "true", "1"] {
+            let contents = format!("switch_key = 'KEY_F12'\nlog_level = {value}");
+            assert!(from_contents(&contents).is_err(), "{contents}");
         }
     }
 }

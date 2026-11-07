@@ -53,7 +53,7 @@ impl Menu {
                 .spawn(move || {
                     if let Err(error) = action() {
                         let body = format!("Cannot {verb} {SERVICE}: {error}");
-                        eprintln!("true-switcher: {body}");
+                        log::warn!("true-switcher: {body}");
                         let _ = super::notify(&connection.into(), title, &body);
                     }
                 })

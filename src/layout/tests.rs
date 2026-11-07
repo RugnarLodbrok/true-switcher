@@ -227,7 +227,9 @@ fn wait_for(events: &crate::input_events::InputEvents, name: Option<&str>) {
 fn watch(bus: &TestBus, tracker: &LayoutTracker) -> thread::JoinHandle<zbus::Result<()>> {
     let connection = bus.connect();
     let tracker = tracker.clone();
-    thread::spawn(move || track_connection(&connection, &tracker, &|| Ok(CONFIG.into())))
+    thread::spawn(move || {
+        track_connection(&connection, &tracker, &|| Ok(CONFIG.into()), &mut || {})
+    })
 }
 
 #[test]

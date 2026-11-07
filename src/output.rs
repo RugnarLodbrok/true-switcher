@@ -24,7 +24,7 @@ fn keyboard_builder() -> io::Result<VirtualDeviceBuilder<'static>> {
     {
         Ok(builder) => Ok(builder),
         Err(error) => {
-            eprintln!(
+            log::warn!(
                 "true-switcher: cannot set uinput physical_path: {error}; \
                  falling back to name {DEVICE_NAME}"
             );

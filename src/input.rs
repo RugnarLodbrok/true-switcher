@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io;
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -163,7 +163,7 @@ impl Input {
             let probe = match RawDevice::open(&path) {
                 Ok(device) => device,
                 Err(error) => {
-                    eprintln!("Cannot open {}: {error}", path.display());
+                    log::debug!("Cannot open {}: {error}", path.display());
                     continue;
                 }
             };
@@ -184,7 +184,7 @@ impl Input {
             ));
         }
         if self.pointers.is_empty() {
-            eprintln!(
+            log::warn!(
                 "No accessible pointer devices; mouse clicks and touchpad taps cannot reset history"
             );
         }
@@ -194,7 +194,7 @@ impl Input {
     fn open_pointer(&mut self, path: &Path, sender: &InputEventSender) -> io::Result<()> {
         match open_read_device(path) {
             Ok(device) => {
-                eprintln!("OPEN POINTER {} {:?}", path.display(), device.name());
+                log::debug!("OPEN POINTER {} {:?}", path.display(), device.name());
                 start_reader(
                     device,
                     path.to_owned(),
@@ -206,7 +206,7 @@ impl Input {
                     path: path.to_owned(),
                 });
             }
-            Err(error) => eprintln!("Cannot monitor pointer {}: {error}", path.display()),
+            Err(error) => log::warn!("Cannot monitor pointer {}: {error}", path.display()),
         }
         Ok(())
     }
@@ -216,7 +216,8 @@ impl Input {
         let held: BTreeSet<_> = device.get_key_state()?.iter().map(|key| key.0).collect();
         self.holds
             .snapshot(self.keyboards.len(), &held, Instant::now());
-        eprintln!("OPEN {} {:?} held={held:?}", path.display(), device.name());
+        log::debug!("OPEN {} {:?}", path.display(), device.name());
+        log::trace!("OPEN {} held={held:?}", path.display());
         let reader = RawDevice::from_fd(device.as_fd().try_clone_to_owned()?)?;
         start_reader(
             reader,
@@ -264,7 +265,7 @@ impl Input {
                 return Ok(false);
             }
             attempt += 1;
-            eprintln!("ENTRY attempt={attempt} begin");
+            log::debug!("ENTRY attempt={attempt} begin");
             self.recording = Some(EntryRecording::default());
             self.release_locks()?;
             self.release_modifiers()?;
@@ -282,7 +283,7 @@ impl Input {
             self.snapshot()?;
             self.process_available_events()?;
             let presses = self.recording.take().unwrap().presses;
-            eprintln!("ENTRY attempt={attempt} recorded {presses:?}");
+            log::trace!("ENTRY attempt={attempt} recorded {presses:?}");
             if self.pending.is_none() {
                 self.repair = presses;
                 self.rollback()?;
@@ -292,7 +293,7 @@ impl Input {
                 self.is_captured = true;
                 self.is_correction_cancelled = false;
                 self.pending = None;
-                eprintln!("ENTRY accepted");
+                log::debug!("ENTRY accepted");
                 return Ok(true);
             }
             self.repair = presses;
@@ -327,7 +328,7 @@ impl Input {
     }
 
     pub fn leave(&mut self) -> io::Result<()> {
-        eprintln!("WAIT_RELEASES begin");
+        log::trace!("WAIT_RELEASES begin");
         loop {
             self.process_available_events()?;
             self.release_modifiers()?;
@@ -345,12 +346,12 @@ impl Input {
         self.is_captured = false;
         self.release_locks()?;
         self.process_available_events()?;
-        eprintln!("WAIT_RELEASES complete");
+        log::trace!("WAIT_RELEASES complete");
         Ok(())
     }
 
     fn wait_ordinary(&mut self) -> io::Result<bool> {
-        eprintln!("WAIT_ORDINARY begin");
+        log::trace!("WAIT_ORDINARY begin");
         self.process_events_until(|input| !input.is_ordinary_key_held())?;
         Ok(self.pending.is_some())
     }
@@ -500,7 +501,7 @@ impl Input {
         let keyboard = &mut self.keyboards[index];
         let key = KeyCode::new(event.code());
         let value = event.value();
-        eprintln!(
+        log::trace!(
             "EVDEV {} {key:?} value={value} kernel_time={:?} grabbed={}",
             keyboard.path.display(),
             event.timestamp(),
@@ -562,13 +563,8 @@ impl Input {
                 self.is_original_switch_key_held = false;
             }
         }
-        if !lines.is_empty() {
-            let stdout = io::stdout();
-            let mut output = stdout.lock();
-            for line in lines {
-                writeln!(output, "{line}")?;
-            }
-            output.flush()?;
+        for line in lines {
+            log::trace!("{line}");
         }
         Ok(())
     }
@@ -671,7 +667,7 @@ impl Input {
 
     fn write_source(&mut self, index: usize, key: KeyCode, value: i32) -> io::Result<()> {
         let keyboard = &mut self.keyboards[index];
-        eprintln!(
+        log::trace!(
             "SOURCE_WRITE attempt {} {key:?} value={value} grabbed={}",
             keyboard.path.display(),
             keyboard.device.is_grabbed()
@@ -684,7 +680,7 @@ impl Input {
                 0,
             ),
         ]);
-        eprintln!(
+        log::trace!(
             "SOURCE_WRITE result {} {key:?} value={value}: {result:?}",
             keyboard.path.display()
         );
@@ -724,7 +720,9 @@ impl Input {
     fn grab(&mut self) -> io::Result<()> {
         for keyboard in &mut self.keyboards {
             let result = keyboard.device.grab();
-            eprintln!("GRAB {} {result:?}", keyboard.path.display());
+            if result.is_ok() {
+                log::debug!("GRAB {}", keyboard.path.display());
+            }
             result?;
         }
         Ok(())
@@ -735,7 +733,9 @@ impl Input {
         for keyboard in &mut self.keyboards {
             if keyboard.device.is_grabbed() {
                 let result = keyboard.device.ungrab();
-                eprintln!("UNGRAB {} {result:?}", keyboard.path.display());
+                if result.is_ok() {
+                    log::debug!("UNGRAB {}", keyboard.path.display());
+                }
                 if let Err(err) = result {
                     error.get_or_insert(err);
                 }
@@ -758,7 +758,8 @@ impl Input {
     }
 
     fn rollback(&mut self) -> io::Result<()> {
-        eprintln!("ROLLBACK begin {:?}", self.repair);
+        log::debug!("ROLLBACK begin");
+        log::trace!("ROLLBACK keys {:?}", self.repair);
         let mut error = None;
         for (index, code) in self.repair.clone() {
             if !is_repair_key(KeyCode::new(code)) {
@@ -808,7 +809,7 @@ fn is_shift(key: KeyCode) -> bool {
 
 impl Drop for Input {
     fn drop(&mut self) {
-        eprintln!("CLEANUP begin");
+        log::debug!("CLEANUP begin");
         if self.recording.is_some() {
             let _ = self.process_available_events();
             let _ = self.snapshot();
@@ -818,20 +819,20 @@ impl Drop for Input {
         if !self.repair.is_empty()
             && let Err(error) = self.rollback()
         {
-            eprintln!("CLEANUP rollback: {error}");
+            log::error!("CLEANUP rollback: {error}");
         }
         if self.is_captured
             && let Err(error) = self.release_modifiers()
         {
-            eprintln!("CLEANUP modifiers: {error}");
+            log::error!("CLEANUP modifiers: {error}");
         }
         if let Err(error) = self.ungrab() {
-            eprintln!("CLEANUP ungrab: {error}");
+            log::error!("CLEANUP ungrab: {error}");
         }
         if let Err(error) = self.release_locks() {
-            eprintln!("CLEANUP locks: {error}");
+            log::error!("CLEANUP locks: {error}");
         }
-        eprintln!("CLEANUP end");
+        log::debug!("CLEANUP end");
     }
 }
 
