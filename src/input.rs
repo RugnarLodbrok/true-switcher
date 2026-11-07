@@ -547,7 +547,7 @@ impl Input {
             }
             return Ok(());
         }
-        let lines = self.history.process(path, key, value);
+        let events = self.history.process(path, key, value);
         if matches!(value, 1 | 2) && (key == KeyCode::KEY_BACKSPACE || key == KeyCode::KEY_SPACE) {
             self.automatic_target = None;
         }
@@ -563,8 +563,13 @@ impl Input {
                 self.is_original_switch_key_held = false;
             }
         }
-        for line in lines {
-            log::trace!("{line}");
+        for event in events {
+            match event {
+                crate::history::HistoryEvent::WordCompleted(word)
+                | crate::history::HistoryEvent::WordRestored(word) => log::trace!("{word}"),
+                crate::history::HistoryEvent::LastWordRemoved
+                | crate::history::HistoryEvent::Reset => log::trace!(""),
+            }
         }
         Ok(())
     }

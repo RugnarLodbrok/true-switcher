@@ -60,6 +60,14 @@ impl fmt::Display for Word {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum HistoryEvent {
+    WordCompleted(Word),
+    WordRestored(Word),
+    LastWordRemoved,
+    Reset,
+}
+
 #[derive(Default)]
 pub struct History {
     words: Vec<Word>,
@@ -135,9 +143,8 @@ impl History {
         self.words.last()
     }
 
-    /// Returns lines for stdout on completion, restoration or reset.
     /// A repeat is another stroke, not a held key in the stored word.
-    pub fn process(&mut self, device: &Path, key: KeyCode, value: i32) -> Vec<String> {
+    pub fn process(&mut self, device: &Path, key: KeyCode, value: i32) -> Vec<HistoryEvent> {
         if !matches!(value, 0..=2) {
             return Vec::new();
         }
@@ -157,10 +164,11 @@ impl History {
             KeyCode::KEY_TAB | KeyCode::KEY_ENTER | KeyCode::KEY_KPENTER => {
                 let mut lines = Vec::new();
                 if let Some(word) = self.words.last().filter(|word| word.trailing_spaces == 0) {
-                    lines.push(word.to_string());
+                    lines.push(HistoryEvent::WordCompleted(word.clone()));
                 }
                 // These separators cannot be crossed by a correction.
-                lines.push(self.reset());
+                self.reset();
+                lines.push(HistoryEvent::Reset);
                 lines
             }
             KeyCode::KEY_SPACE => {
@@ -169,7 +177,7 @@ impl History {
                 };
                 word.trailing_spaces += 1;
                 if word.trailing_spaces == 1 {
-                    vec![word.to_string()]
+                    vec![HistoryEvent::WordCompleted(word.clone())]
                 } else {
                     Vec::new()
                 }
@@ -196,16 +204,15 @@ impl History {
     }
 
     /// Preserve held modifiers: resetting text history does not release keys.
-    pub fn reset(&mut self) -> String {
+    pub fn reset(&mut self) {
         for word in self.words.drain(..) {
             if let Some(statistics) = &self.statistics {
                 statistics.record_word(&word);
             }
         }
-        String::new()
     }
 
-    fn backspace(&mut self) -> Option<String> {
+    fn backspace(&mut self) -> Option<HistoryEvent> {
         let word = self.words.last_mut()?;
         if word.trailing_spaces > 0 {
             word.trailing_spaces -= 1;
@@ -217,8 +224,9 @@ impl History {
             return Some(
                 self.words
                     .last()
-                    .map(ToString::to_string)
-                    .unwrap_or_default(),
+                    .cloned()
+                    .map(HistoryEvent::WordRestored)
+                    .unwrap_or(HistoryEvent::LastWordRemoved),
             );
         }
         None
@@ -328,11 +336,52 @@ mod tests {
     }
 
     fn event(history: &mut History, key: KeyCode, value: i32) -> Vec<String> {
-        history.process(Path::new("keyboard"), key, value)
+        history
+            .process(Path::new("keyboard"), key, value)
+            .into_iter()
+            .map(|event| match event {
+                HistoryEvent::WordCompleted(word) | HistoryEvent::WordRestored(word) => {
+                    word.to_string()
+                }
+                HistoryEvent::LastWordRemoved | HistoryEvent::Reset => String::new(),
+            })
+            .collect()
     }
 
     fn press(history: &mut History, key: KeyCode) -> Vec<String> {
         event(history, key, 1)
+    }
+
+    #[test]
+    fn reports_completion_restoration_removal_and_reset_as_distinct_events() {
+        let mut history = History::default();
+        let device = Path::new("keyboard");
+        history.process(device, KeyCode::KEY_A, 1);
+        let first = history.latest_word().unwrap().clone();
+        assert_eq!(
+            history.process(device, KeyCode::KEY_SPACE, 1),
+            [HistoryEvent::WordCompleted(Word {
+                trailing_spaces: 1,
+                ..first.clone()
+            })]
+        );
+        history.process(device, KeyCode::KEY_B, 1);
+        assert_eq!(
+            history.process(device, KeyCode::KEY_BACKSPACE, 1),
+            [HistoryEvent::WordRestored(Word {
+                trailing_spaces: 1,
+                ..first
+            })]
+        );
+        history.process(device, KeyCode::KEY_BACKSPACE, 1);
+        assert_eq!(
+            history.process(device, KeyCode::KEY_BACKSPACE, 1),
+            [HistoryEvent::LastWordRemoved]
+        );
+        assert_eq!(
+            history.process(device, KeyCode::KEY_ENTER, 1),
+            [HistoryEvent::Reset]
+        );
     }
 
     #[test]
@@ -431,7 +480,7 @@ mod tests {
         let mut history = History::default();
         press(&mut history, KeyCode::KEY_LEFTSHIFT);
         press(&mut history, KeyCode::KEY_A);
-        assert_eq!(history.reset(), "");
+        history.reset();
         press(&mut history, KeyCode::KEY_B);
         assert_eq!(press(&mut history, KeyCode::KEY_SPACE), ["Shift+KEY_B"]);
     }
