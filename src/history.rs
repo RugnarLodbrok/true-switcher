@@ -55,7 +55,7 @@ impl fmt::Display for Word {
 #[derive(Default)]
 pub struct History {
     words: Vec<Word>,
-    layouts: crate::layout::LayoutTracker,
+    layout: Option<Arc<crate::layout::Layout>>,
     statistics: Option<crate::statistics::Statistics>,
     observed_layout: Option<Arc<crate::layout::Layout>>,
     auto_switch: crate::switch_rules::AutoSwitchRules,
@@ -65,13 +65,6 @@ pub struct History {
 }
 
 impl History {
-    pub fn with_layouts(layouts: crate::layout::LayoutTracker) -> Self {
-        Self {
-            layouts,
-            ..Self::default()
-        }
-    }
-
     pub fn with_statistics(mut self, statistics: crate::statistics::Statistics) -> Self {
         self.statistics = Some(statistics);
         self
@@ -87,11 +80,18 @@ impl History {
             .latest_word()
             .filter(|word| word.trailing_spaces == 0)?;
         self.auto_switch
-            .target(word, self.layouts.current()?.as_ref())
+            .target(word, self.layout.as_ref()?.as_ref())
+    }
+
+    pub fn accept_layout(&mut self, layout: Option<Arc<crate::layout::Layout>>, is_deferred: bool) {
+        self.layout = layout;
+        if !is_deferred {
+            self.synchronize_layout();
+        }
     }
 
     pub fn synchronize_layout(&mut self) {
-        let Some(current) = self.layouts.current() else {
+        let Some(current) = self.layout.clone() else {
             return;
         };
         if self
@@ -113,7 +113,7 @@ impl History {
 
     pub fn set_latest_layout(&mut self, layout: Option<Arc<crate::layout::Layout>>) {
         if layout.is_some() {
-            self.layouts.set(layout.clone());
+            self.layout = layout.clone();
             self.observed_layout = layout.clone();
         }
         if let Some(word) = self.words.last_mut() {
@@ -128,7 +128,6 @@ impl History {
     /// Returns lines for stdout on completion, restoration or reset.
     /// A repeat is another stroke, not a held key in the stored word.
     pub fn process(&mut self, device: &Path, key: KeyCode, value: i32) -> Vec<String> {
-        self.synchronize_layout();
         if !matches!(value, 0..=2) {
             return Vec::new();
         }
@@ -177,7 +176,7 @@ impl History {
                 let shift = self.modifiers.iter().any(|(_, key)| is_shift(*key));
                 let word = self.words.last_mut().unwrap();
                 word.strokes.push(Stroke { key, shift });
-                word.layouts.push(self.layouts.current());
+                word.layouts.push(self.layout.clone());
                 Vec::new()
             }
             _ => Vec::new(),
@@ -255,9 +254,8 @@ mod tests {
 
     #[test]
     fn previous_word_keeps_its_layout_and_backspace_keeps_layouts_aligned() {
-        let layouts = crate::layout::LayoutTracker::default();
-        layouts.set(Some(layout("us")));
-        let mut history = History::with_layouts(layouts.clone());
+        let mut history = History::default();
+        history.accept_layout(Some(layout("us")), false);
         press(&mut history, KeyCode::KEY_A);
         press(&mut history, KeyCode::KEY_SPACE);
         history.set_latest_layout(Some(layout("ru")));
@@ -276,15 +274,14 @@ mod tests {
 
     #[test]
     fn manual_layout_changes_reset_history() {
-        let layouts = crate::layout::LayoutTracker::default();
-        layouts.set(Some(layout("us")));
-        let mut history = History::with_layouts(layouts.clone());
+        let mut history = History::default();
+        history.accept_layout(Some(layout("us")), false);
         press(&mut history, KeyCode::KEY_A);
-        layouts.set(Some(layout("ru")));
+        history.accept_layout(Some(layout("ru")), false);
         press(&mut history, KeyCode::KEY_A);
         assert_eq!(history.latest_word().unwrap().text().as_deref(), Some("ф"));
         assert!(history.previous_word().is_none());
-        layouts.set(None);
+        history.accept_layout(None, false);
         press(&mut history, KeyCode::KEY_B);
         assert!(history.latest_word().unwrap().text().is_none());
     }

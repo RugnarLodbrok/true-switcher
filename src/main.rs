@@ -2,7 +2,9 @@ mod config;
 mod environment;
 mod focus;
 mod history;
+mod hold;
 mod input;
+mod input_events;
 mod layout;
 pub mod output;
 mod sound;
@@ -62,6 +64,7 @@ struct Switcher {
     keyboard: output::KeyboardOutput,
     statistics: statistics::Statistics,
     sound: sound::Sound,
+    layouts: layout::LayoutTracker,
 }
 
 fn run() -> io::Result<()> {
@@ -80,19 +83,21 @@ fn run() -> io::Result<()> {
     let statistics = statistics::Statistics::start();
     let sound = sound::Sound::start(config.manual_switch_sound || config.auto_switch_sound);
 
-    let focus_service = focus::FocusService::start()?;
-    let layouts = layout::LayoutTracker::start();
+    let (sender, events) = input_events::InputEvents::new();
+    let _focus_service = focus::FocusService::start(sender.clone())?;
+    let layouts = layout::LayoutTracker::start(sender.clone());
 
-    let history = history::History::with_layouts(layouts)
+    let history = history::History::default()
         .with_statistics(statistics.clone())
         .with_auto_switch(auto_switch);
-    let mut input = input::Input::open(focus_service.changes(), config.switch_key, history)?;
+    let mut input = input::Input::open(events, sender, config.switch_key, history)?;
 
     let mut switcher = Switcher {
         desktop,
         keyboard,
         statistics,
         sound,
+        layouts,
     };
 
     input.wait_for_keyboard_discovery(KEYBOARD_DISCOVERY_DELAY)?;
@@ -137,32 +142,38 @@ impl Switcher {
         let is_cancelled = AtomicBool::new(input.read_captured()?);
         thread::scope(|scope| -> io::Result<()> {
             let worker = scope.spawn(|| {
-                correct_word(
-                    correction,
-                    &mut self.keyboard,
-                    &self.desktop,
-                    &self.statistics,
-                    &self.sound,
-                    &is_cancelled,
-                )
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    correct_word(
+                        correction,
+                        &mut self.keyboard,
+                        &self.desktop,
+                        &self.statistics,
+                        &self.sound,
+                        &is_cancelled,
+                    )
+                }))
+                .unwrap_or_else(|_| Err(io::Error::other("correction thread panicked")));
+                self.layouts.finish_correction(result);
             });
             let mut read_error = None;
-            while !worker.is_finished() {
-                match input.read_captured() {
-                    Ok(true) => is_cancelled.store(true, Ordering::Relaxed),
-                    Ok(false) => {}
+            let result = loop {
+                match input.wait_for_correction() {
+                    Ok(result) => {
+                        if input.take_cancel_request() {
+                            is_cancelled.store(true, Ordering::Relaxed);
+                        }
+                        if let Some(result) = result {
+                            break result;
+                        }
+                    }
                     Err(error) => {
                         is_cancelled.store(true, Ordering::Relaxed);
                         read_error = Some(error);
-                        break;
+                        break Ok(());
                     }
                 }
-                thread::sleep(Duration::from_millis(5));
-            }
-            if input.read_captured()? {
-                is_cancelled.store(true, Ordering::Relaxed);
-            }
-            let result = worker
+            };
+            worker
                 .join()
                 .map_err(|_| io::Error::other("correction thread panicked"))?;
             if let Some(error) = read_error {
@@ -170,10 +181,8 @@ impl Switcher {
             }
             if is_cancelled.load(Ordering::Relaxed) {
                 input.reset_history();
-            } else if let Ok(layout) = &result {
-                input.set_latest_layout(layout.clone());
             }
-            result.map(|_| ())
+            result
         })
     }
 }
@@ -185,16 +194,16 @@ fn correct_word(
     statistics: &statistics::Statistics,
     sound: &sound::Sound,
     is_cancelled: &AtomicBool,
-) -> io::Result<Option<Arc<layout::Layout>>> {
+) -> io::Result<()> {
     if is_cancelled.load(Ordering::Relaxed) {
-        return Ok(None);
+        return Ok(());
     }
     eprintln!("SYNTHETIC erase");
     if let Some(word) = &correction.word {
         keyboard.erase(word.strokes.len() + word.trailing_spaces)?;
     }
     if is_cancelled.load(Ordering::Relaxed) {
-        return Ok(None);
+        return Ok(());
     }
     switch_and_replay(
         || match &correction.target {
@@ -223,6 +232,7 @@ fn correct_word(
         },
         is_cancelled,
     )
+    .map(|_| ())
 }
 
 fn record_switch(

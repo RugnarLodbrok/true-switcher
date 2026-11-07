@@ -8,7 +8,6 @@ use std::time::Instant;
 
 const CONFIG: &str = "[Layout]\nLayoutList=us,ru\nVariantList=,phonetic\nModel=pc105\nOptions=\n";
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
-const TEST_POLL: Duration = Duration::from_millis(5);
 
 #[test]
 fn accepts_only_identifiers_in_xkb_layout_section() {
@@ -207,11 +206,21 @@ impl KeyboardLayouts {
     }
 }
 
-fn wait_for(tracker: &LayoutTracker, name: &str) {
+fn wait_for(events: &crate::input_events::InputEvents, name: Option<&str>) {
     let deadline = Instant::now() + TEST_TIMEOUT;
-    while tracker.current().is_none_or(|layout| layout.name != name) {
-        assert!(Instant::now() < deadline, "tracker did not reach {name}");
-        thread::sleep(TEST_POLL);
+    loop {
+        match events
+            .wait(Some(deadline))
+            .unwrap()
+            .expect("layout event before deadline")
+        {
+            InputEventMessage::LayoutChanged(layout)
+                if layout.as_ref().map(|value| value.name.as_str()) == name =>
+            {
+                return;
+            }
+            _ => {}
+        }
     }
 }
 
@@ -222,35 +231,91 @@ fn watch(bus: &TestBus, tracker: &LayoutTracker) -> thread::JoinHandle<zbus::Res
 }
 
 #[test]
+fn serializes_layout_queries_and_completion_publication() {
+    use std::sync::mpsc;
+    let (sender, events) = crate::input_events::InputEvents::new();
+    let tracker = LayoutTracker::new(sender);
+    let (started, started_query) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    let observer = tracker.clone();
+    let worker = thread::spawn(move || {
+        observer.observe(|| {
+            started.send(()).unwrap();
+            released.recv_timeout(TEST_TIMEOUT).unwrap();
+            Ok(Arc::new(Layout {
+                name: "us".into(),
+                ..Default::default()
+            }))
+        })
+    });
+    started_query.recv_timeout(TEST_TIMEOUT).unwrap();
+    let completion = tracker.clone();
+    let (queried, completion_query) = mpsc::channel();
+    let finished = thread::spawn(move || {
+        completion.finish_with(Ok(()), || {
+            queried.send(()).unwrap();
+            Ok(Arc::new(Layout {
+                name: "ru".into(),
+                ..Default::default()
+            }))
+        })
+    });
+    assert!(completion_query.try_recv().is_err());
+    assert!(events.available().unwrap().is_none());
+    release.send(()).unwrap();
+    worker.join().unwrap().unwrap();
+    finished.join().unwrap();
+    wait_for(&events, Some("us"));
+    match events.available().unwrap().unwrap() {
+        InputEventMessage::CorrectionFinished { result, layout } => {
+            assert!(result.is_ok());
+            assert_eq!(layout.unwrap().name, "ru");
+        }
+        _ => panic!("expected correction completion after older observation"),
+    }
+    tracker
+        .observe(|| {
+            Ok(Arc::new(Layout {
+                name: "us".into(),
+                ..Default::default()
+            }))
+        })
+        .unwrap();
+    wait_for(&events, Some("us"));
+}
+
+#[test]
 fn subscribes_before_initial_query_and_handles_changes_during_query() {
     let bus = TestBus::start();
     let (service, _) = bus.service(true);
-    let tracker = LayoutTracker::default();
+    let (sender, events) = crate::input_events::InputEvents::new();
+    let tracker = LayoutTracker::new(sender);
     let worker = watch(&bus, &tracker);
-    wait_for(&tracker, "ru");
+    wait_for(&events, Some("ru"));
     service.release_name(SERVICE).unwrap();
     assert!(worker.join().unwrap().is_err());
-    assert!(tracker.current().is_none());
+    wait_for(&events, None);
 }
 
 #[test]
 fn gets_initial_layout_receives_changes_and_resubscribes_after_owner_loss() {
     let bus = TestBus::start();
     let (service, index) = bus.service(false);
-    let tracker = LayoutTracker::default();
+    let (sender, events) = crate::input_events::InputEvents::new();
+    let tracker = LayoutTracker::new(sender);
     let worker = watch(&bus, &tracker);
-    wait_for(&tracker, "us");
+    wait_for(&events, Some("us"));
     index.store(1, Ordering::SeqCst);
     service
         .emit_signal(None::<&str>, PATH, INTERFACE, "layoutChanged", &(1_u32,))
         .unwrap();
-    wait_for(&tracker, "ru");
+    wait_for(&events, Some("ru"));
     service.release_name(SERVICE).unwrap();
     assert!(worker.join().unwrap().is_err());
-    assert!(tracker.current().is_none());
+    wait_for(&events, None);
     let (replacement, _) = bus.service(false);
     let worker = watch(&bus, &tracker);
-    wait_for(&tracker, "us");
+    wait_for(&events, Some("us"));
     replacement.release_name(SERVICE).unwrap();
     assert!(worker.join().unwrap().is_err());
 }

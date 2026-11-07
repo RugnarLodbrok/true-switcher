@@ -269,12 +269,9 @@ mod tests {
             sent.send(record.clone())?;
             Ok(())
         });
-        let layouts = crate::layout::LayoutTracker::default();
-        layouts.set(Some(layout("us")));
-        (
-            crate::history::History::with_layouts(layouts).with_statistics(statistics),
-            received,
-        )
+        let mut history = crate::history::History::default().with_statistics(statistics);
+        history.accept_layout(Some(layout("us")), false);
+        (history, received)
     }
 
     fn press(history: &mut crate::history::History, key: KeyCode) {

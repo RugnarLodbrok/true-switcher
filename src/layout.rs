@@ -2,10 +2,11 @@ use std::env;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use crate::input_events::{InputEventMessage, InputEventSender};
 use xkbcommon::xkb;
 use zbus::blocking::{Connection, MessageIterator, Proxy, fdo::DBusProxy};
 use zbus::{MatchRule, message::Type};
@@ -70,12 +71,15 @@ impl Layout {
     }
 }
 
-#[derive(Clone, Default)]
-pub struct LayoutTracker(Arc<RwLock<Option<Arc<Layout>>>>);
+#[derive(Clone)]
+pub struct LayoutTracker {
+    observation: Arc<Mutex<()>>,
+    sender: InputEventSender,
+}
 
 impl LayoutTracker {
-    pub fn start() -> Self {
-        let tracker = Self::default();
+    pub fn start(sender: InputEventSender) -> Self {
+        let tracker = Self::new(sender);
         let worker = tracker.clone();
         if let Err(error) = thread::Builder::new()
             .name("layout-tracker".into())
@@ -84,7 +88,6 @@ impl LayoutTracker {
                     if let Err(error) = track(&worker) {
                         eprintln!("true-switcher: layout tracking: {error}");
                     }
-                    worker.set(None);
                     thread::sleep(RETRY_DELAY);
                 }
             })
@@ -94,19 +97,58 @@ impl LayoutTracker {
         tracker
     }
 
-    pub fn current(&self) -> Option<Arc<Layout>> {
-        self.0.read().ok()?.clone()
+    fn new(sender: InputEventSender) -> Self {
+        Self {
+            observation: Arc::new(Mutex::new(())),
+            sender,
+        }
     }
 
-    pub(crate) fn set(&self, layout: Option<Arc<Layout>>) {
-        if let Ok(mut current) = self.0.write() {
-            *current = layout;
-        }
+    fn set(&self, layout: Option<Arc<Layout>>) {
+        self.sender.send(InputEventMessage::LayoutChanged(layout));
+    }
+
+    fn observe(&self, read: impl FnOnce() -> io::Result<Arc<Layout>>) -> io::Result<()> {
+        let _guard = self
+            .observation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let result = read();
+        self.set(result.as_ref().ok().cloned());
+        result.map(|_| ())
+    }
+
+    fn invalidate(&self) {
+        let _guard = self
+            .observation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.set(None);
+    }
+
+    pub fn finish_correction(&self, result: io::Result<()>) {
+        self.finish_with(result, current_layout);
+    }
+
+    fn finish_with(&self, result: io::Result<()>, read: impl FnOnce() -> io::Result<Arc<Layout>>) {
+        let _guard = self
+            .observation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let layout = read().ok();
+        self.sender
+            .send(InputEventMessage::CorrectionFinished { result, layout });
     }
 }
 
 fn track(tracker: &LayoutTracker) -> zbus::Result<()> {
-    let connection = Connection::session()?;
+    let connection = match Connection::session() {
+        Ok(connection) => connection,
+        Err(error) => {
+            tracker.invalidate();
+            return Err(error);
+        }
+    };
     track_connection(&connection, tracker, &read_configuration)
 }
 
@@ -139,7 +181,7 @@ fn track_connection(
     read_config: &impl Fn() -> io::Result<String>,
 ) -> zbus::Result<()> {
     let result = receive_changes(connection, tracker, read_config);
-    tracker.set(None);
+    tracker.invalidate();
     result
 }
 
@@ -151,7 +193,9 @@ fn receive_changes(
     let mut messages = subscribe(connection)?;
     let owner = DBusProxy::new(connection)?.get_name_owner(SERVICE.try_into()?)?;
     let proxy = Proxy::new(connection, owner.as_str(), PATH, INTERFACE)?;
-    tracker.set(Some(query(&proxy, read_config).map_err(zbus::Error::from)?));
+    tracker
+        .observe(|| query(&proxy, read_config))
+        .map_err(zbus::Error::from)?;
     for message in &mut messages {
         let message = message?;
         let header = message.header();
@@ -177,10 +221,11 @@ fn receive_changes(
                 .interface()
                 .is_some_and(|value| value.as_str() == INTERFACE)
         {
-            tracker.set(None);
             // Requery instead of replaying queued indices: signals received during
             // `query` must never overwrite the snapshot with an older layout.
-            tracker.set(Some(query(&proxy, read_config).map_err(zbus::Error::from)?));
+            tracker
+                .observe(|| query(&proxy, read_config))
+                .map_err(zbus::Error::from)?;
         }
     }
     Err(io::Error::other("layout signal stream closed").into())

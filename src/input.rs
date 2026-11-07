@@ -1,19 +1,19 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
+use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use evdev::{Device, EventType, InputEvent, KeyCode, SynchronizationCode, raw_stream::RawDevice};
+use evdev::{EventType, InputEvent, KeyCode, SynchronizationCode, raw_stream::RawDevice};
 
 use crate::history::History;
+use crate::hold::HoldDetector;
+use crate::input_events::{InputEventMessage, InputEventSender, InputEvents};
 use crate::output::is_own_keyboard;
 
-const POLL_INTERVAL: Duration = Duration::from_millis(5);
-const HOLD_TIMEOUT: Duration = Duration::from_millis(300);
 const MODIFIERS: [KeyCode; 8] = [
     KeyCode::KEY_LEFTSHIFT,
     KeyCode::KEY_RIGHTSHIFT,
@@ -58,26 +58,13 @@ struct Keyboard {
     path: PathBuf,
     device: Box<dyn Source>,
     held: BTreeSet<u16>,
-    held_since: BTreeMap<u16, Instant>,
 }
 
 struct Pointer {
     path: PathBuf,
-    device: Box<dyn PointerSource>,
-}
-
-trait PointerSource {
-    fn events(&mut self) -> io::Result<Vec<InputEvent>>;
-}
-
-impl PointerSource for RawDevice {
-    fn events(&mut self) -> io::Result<Vec<InputEvent>> {
-        Ok(self.fetch_events()?.collect())
-    }
 }
 
 trait Source {
-    fn events(&mut self) -> io::Result<Vec<InputEvent>>;
     fn keys(&self) -> io::Result<BTreeSet<u16>>;
     fn send(&mut self, events: &[InputEvent]) -> io::Result<()>;
     fn grab(&mut self) -> io::Result<()>;
@@ -86,10 +73,6 @@ trait Source {
 }
 
 impl Source for RawDevice {
-    fn events(&mut self) -> io::Result<Vec<InputEvent>> {
-        Ok(self.fetch_events()?.collect())
-    }
-
     fn keys(&self) -> io::Result<BTreeSet<u16>> {
         Ok(self.get_key_state()?.iter().map(|key| key.0).collect())
     }
@@ -115,7 +98,10 @@ pub struct Input {
     keyboards: Vec<Keyboard>,
     pointers: Vec<Pointer>,
     history: History,
-    focus_changes: Arc<AtomicBool>,
+    events: InputEvents,
+    holds: HoldDetector,
+    correction_result: Option<io::Result<()>>,
+    is_correction_cancelled: bool,
     switch_key: KeyCode,
     is_cancel_requested: bool,
     pending: Option<usize>,
@@ -131,12 +117,43 @@ pub struct Input {
 
 impl Input {
     pub fn open(
-        focus_changes: Arc<AtomicBool>,
+        events: InputEvents,
+        sender: InputEventSender,
         switch_key: KeyCode,
         history: History,
     ) -> io::Result<Self> {
-        let mut keyboards = Vec::new();
-        let mut pointers = Vec::new();
+        let mut input = Self {
+            keyboards: Vec::new(),
+            pointers: Vec::new(),
+            history,
+            events,
+            holds: HoldDetector::default(),
+            correction_result: None,
+            is_correction_cancelled: false,
+            switch_key,
+            is_cancel_requested: false,
+            pending: None,
+            is_original_switch_key_held: false,
+            recording: None,
+            repair: BTreeSet::new(),
+            repair_prepared: BTreeSet::new(),
+            is_captured: false,
+            is_backing_off: false,
+            is_auto_request: false,
+            automatic_target: None,
+        };
+        input.discover_devices(&sender)?;
+        for keyboard in &input.keyboards {
+            for &code in &keyboard.held {
+                if MODIFIERS.contains(&KeyCode::new(code)) {
+                    input.history.process(&keyboard.path, KeyCode::new(code), 1);
+                }
+            }
+        }
+        Ok(input)
+    }
+
+    fn discover_devices(&mut self, sender: &InputEventSender) -> io::Result<()> {
         for entry in fs::read_dir("/dev/input")? {
             let entry = entry?;
             if !entry.file_name().as_encoded_bytes().starts_with(b"event") {
@@ -154,67 +171,66 @@ impl Input {
                 continue;
             }
             if is_pointer(&probe) {
-                match open_read_device(&path) {
-                    Ok(device) => {
-                        eprintln!("OPEN POINTER {} {:?}", path.display(), device.name());
-                        pointers.push(Pointer {
-                            path: path.clone(),
-                            device: Box::new(device),
-                        });
-                    }
-                    Err(error) => eprintln!("Cannot monitor pointer {}: {error}", path.display()),
-                }
+                self.open_pointer(&path, sender)?;
             }
             if is_keyboard(&probe) {
-                let device = open_device(&path)?;
-                let held: BTreeSet<_> = device.get_key_state()?.iter().map(|key| key.0).collect();
-                let now = Instant::now();
-                let held_since = held.iter().map(|&code| (code, now)).collect();
-                eprintln!("OPEN {} {:?} held={held:?}", path.display(), device.name());
-                keyboards.push(Keyboard {
-                    path,
-                    device: Box::new(device),
-                    held,
-                    held_since,
-                });
+                self.open_keyboard(path, sender)?;
             }
         }
-        if keyboards.is_empty() {
+        if self.keyboards.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "no accessible keyboards",
             ));
         }
-        if pointers.is_empty() {
+        if self.pointers.is_empty() {
             eprintln!(
                 "No accessible pointer devices; mouse clicks and touchpad taps cannot reset history"
             );
         }
-        let mut input = Self {
-            keyboards,
-            pointers,
-            history,
-            focus_changes,
-            switch_key,
-            is_cancel_requested: false,
-            pending: None,
-            is_original_switch_key_held: false,
-            recording: None,
-            repair: BTreeSet::new(),
-            repair_prepared: BTreeSet::new(),
-            is_captured: false,
-            is_backing_off: false,
-            is_auto_request: false,
-            automatic_target: None,
-        };
-        for keyboard in &input.keyboards {
-            for &code in &keyboard.held {
-                if MODIFIERS.contains(&KeyCode::new(code)) {
-                    input.history.process(&keyboard.path, KeyCode::new(code), 1);
-                }
+        Ok(())
+    }
+
+    fn open_pointer(&mut self, path: &Path, sender: &InputEventSender) -> io::Result<()> {
+        match open_read_device(path) {
+            Ok(device) => {
+                eprintln!("OPEN POINTER {} {:?}", path.display(), device.name());
+                start_reader(
+                    device,
+                    path.to_owned(),
+                    self.pointers.len(),
+                    false,
+                    sender.clone(),
+                )?;
+                self.pointers.push(Pointer {
+                    path: path.to_owned(),
+                });
             }
+            Err(error) => eprintln!("Cannot monitor pointer {}: {error}", path.display()),
         }
-        Ok(input)
+        Ok(())
+    }
+
+    fn open_keyboard(&mut self, path: PathBuf, sender: &InputEventSender) -> io::Result<()> {
+        let device = open_device(&path)?;
+        let held: BTreeSet<_> = device.get_key_state()?.iter().map(|key| key.0).collect();
+        self.holds
+            .snapshot(self.keyboards.len(), &held, Instant::now());
+        eprintln!("OPEN {} {:?} held={held:?}", path.display(), device.name());
+        let reader = RawDevice::from_fd(device.as_fd().try_clone_to_owned()?)?;
+        start_reader(
+            reader,
+            path.clone(),
+            self.keyboards.len(),
+            true,
+            sender.clone(),
+        )?;
+        self.keyboards.push(Keyboard {
+            path,
+            device: Box::new(device),
+            held,
+        });
+        Ok(())
     }
 
     pub fn wait_for_keyboard_discovery(&mut self, duration: Duration) -> io::Result<()> {
@@ -229,14 +245,16 @@ impl Input {
             if remaining.is_zero() {
                 return Ok(());
             }
-            thread::sleep(POLL_INTERVAL.min(remaining));
+            self.wait(Some(deadline))?;
         }
     }
 
     pub fn wait_for_switch_request(&mut self) -> io::Result<()> {
         while self.pending.is_none() {
             self.drain()?;
-            thread::sleep(POLL_INTERVAL);
+            if self.pending.is_none() {
+                self.wait(None)?;
+            }
         }
         Ok(())
     }
@@ -275,6 +293,7 @@ impl Input {
             }
             if presses.is_empty() {
                 self.is_captured = true;
+                self.is_correction_cancelled = false;
                 self.pending = None;
                 eprintln!("ENTRY accepted");
                 return Ok(true);
@@ -323,7 +342,7 @@ impl Input {
             {
                 break;
             }
-            thread::sleep(POLL_INTERVAL);
+            self.wait(None)?;
         }
         self.ungrab()?;
         self.is_captured = false;
@@ -351,44 +370,69 @@ impl Input {
             if !is_held {
                 return Ok(true);
             }
-            thread::sleep(POLL_INTERVAL);
+            self.wait(None)?;
         }
     }
 
     fn drain(&mut self) -> io::Result<()> {
+        while let Some(event) = self.events.available()? {
+            self.process_message(event)?;
+        }
         if !self.is_captured && self.recording.is_none() {
             self.history.synchronize_layout();
             if self.history.latest_word().is_none() {
                 self.automatic_target = None;
             }
         }
-        loop {
-            let mut count = 0;
-            for index in 0..self.keyboards.len() {
-                let events = match self.keyboards[index].device.events() {
-                    Ok(events) => events,
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                        ) =>
-                    {
-                        continue;
-                    }
-                    Err(error) => return Err(error),
-                };
-                count += events.len();
-                for event in events {
-                    self.process(index, event)?;
+        self.update_back_off(Instant::now());
+        Ok(())
+    }
+
+    fn wait(&mut self, deadline: Option<Instant>) -> io::Result<()> {
+        let hold_deadline = if self.is_backing_off {
+            None
+        } else {
+            self.holds.deadline()
+        };
+        let deadline = deadline.into_iter().chain(hold_deadline).min();
+        if let Some(event) = self.events.wait(deadline)? {
+            self.process_message(event)?;
+        }
+        self.drain()
+    }
+
+    fn process_message(&mut self, event: InputEventMessage) -> io::Result<()> {
+        match event {
+            InputEventMessage::Keyboard(index, event) => self.process(index, event)?,
+            InputEventMessage::Pointer(index, event) => self.process_pointer(index, event)?,
+            InputEventMessage::DeviceError(error) => return Err(error),
+            InputEventMessage::FocusChanged => self.request_history_reset(),
+            InputEventMessage::LayoutChanged(layout) => {
+                self.history
+                    .accept_layout(layout, self.is_captured || self.recording.is_some());
+                if self.history.latest_word().is_none() {
+                    self.automatic_target = None;
                 }
             }
-            count += self.drain_pointers()?;
-            self.process_focus_change();
-            self.update_back_off(Instant::now());
-            if count == 0 {
-                return Ok(());
+            InputEventMessage::CorrectionFinished { result, layout } => {
+                self.history.accept_layout(layout.clone(), true);
+                if result.is_ok() && !self.is_correction_cancelled {
+                    self.set_latest_layout(layout);
+                } else {
+                    self.history.accept_layout(layout, false);
+                    self.history.reset();
+                }
+                self.correction_result = Some(result);
             }
         }
+        Ok(())
+    }
+
+    pub fn wait_for_correction(&mut self) -> io::Result<Option<io::Result<()>>> {
+        if self.correction_result.is_none() {
+            self.wait(None)?;
+        }
+        Ok(self.correction_result.take())
     }
 
     fn process(&mut self, index: usize, event: InputEvent) -> io::Result<()> {
@@ -418,7 +462,8 @@ impl Input {
         let key = KeyCode::new(event.code());
         let value = event.value();
         self.update_back_off(now);
-        self.track_key(index, event, now);
+        self.holds.update(index, key.0, value, now);
+        self.track_key(index, event);
         if let Some(recording) = &mut self.recording {
             recording.record(index, key.0, value);
         }
@@ -439,7 +484,7 @@ impl Input {
         self.process_history_event(index, &path, key, value)
     }
 
-    fn track_key(&mut self, index: usize, event: InputEvent, now: Instant) {
+    fn track_key(&mut self, index: usize, event: InputEvent) {
         let keyboard = &mut self.keyboards[index];
         let key = KeyCode::new(event.code());
         let value = event.value();
@@ -452,11 +497,9 @@ impl Input {
         match value {
             0 => {
                 keyboard.held.remove(&key.0);
-                keyboard.held_since.remove(&key.0);
             }
             1 | 2 => {
                 keyboard.held.insert(key.0);
-                keyboard.held_since.entry(key.0).or_insert(now);
             }
             _ => {}
         }
@@ -518,47 +561,23 @@ impl Input {
         Ok(())
     }
 
-    fn drain_pointers(&mut self) -> io::Result<usize> {
-        let mut count = 0;
-        for index in 0..self.pointers.len() {
-            let events = match self.pointers[index].device.events() {
-                Ok(events) => events,
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                    ) =>
-                {
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-            for event in events {
-                if event.event_type() == EventType::SYNCHRONIZATION
-                    && event.code() == SynchronizationCode::SYN_DROPPED.0
-                {
-                    self.request_history_reset();
-                    return Err(io::Error::other(format!(
-                        "{}: SYN_DROPPED",
-                        self.pointers[index].path.display()
-                    )));
-                }
-                if event.event_type() == EventType::KEY
-                    && event.value() == 1
-                    && is_pointer_press(event.code())
-                {
-                    count += 1;
-                    self.request_history_reset();
-                }
-            }
+    fn process_pointer(&mut self, index: usize, event: InputEvent) -> io::Result<()> {
+        if event.event_type() == EventType::SYNCHRONIZATION
+            && event.code() == SynchronizationCode::SYN_DROPPED.0
+        {
+            self.request_history_reset();
+            return Err(io::Error::other(format!(
+                "{}: SYN_DROPPED",
+                self.pointers[index].path.display()
+            )));
         }
-        Ok(count)
-    }
-
-    fn process_focus_change(&mut self) {
-        if self.focus_changes.swap(false, Ordering::AcqRel) {
+        if event.event_type() == EventType::KEY
+            && event.value() == 1
+            && is_pointer_press(event.code())
+        {
             self.request_history_reset();
         }
+        Ok(())
     }
 
     fn should_reset_for_key(&self, key: KeyCode, value: i32) -> bool {
@@ -601,6 +620,7 @@ impl Input {
         self.history.reset();
         if self.is_captured {
             self.is_cancel_requested = true;
+            self.is_correction_cancelled = true;
         }
     }
 
@@ -616,11 +636,7 @@ impl Input {
     }
 
     fn update_back_off(&mut self, now: Instant) {
-        if self.keyboards.iter().any(|keyboard| {
-            keyboard.held_since.iter().any(|(&code, &since)| {
-                !is_shift(KeyCode::new(code)) && now.saturating_duration_since(since) > HOLD_TIMEOUT
-            })
-        }) {
+        if self.holds.expire(now) {
             self.start_back_off();
         }
         if self.is_backing_off
@@ -661,18 +677,14 @@ impl Input {
             keyboard.path.display()
         );
         result?;
+        self.holds.update(index, key.0, value, Instant::now());
         if value == 0 {
             keyboard.held.remove(&key.0);
-            keyboard.held_since.remove(&key.0);
             if MODIFIERS.contains(&key) {
                 self.history.process(&keyboard.path, key, 0);
             }
         } else {
             keyboard.held.insert(key.0);
-            keyboard
-                .held_since
-                .entry(key.0)
-                .or_insert_with(Instant::now);
         }
         Ok(())
     }
@@ -723,12 +735,7 @@ impl Input {
     fn snapshot(&mut self) -> io::Result<()> {
         for (index, keyboard) in self.keyboards.iter_mut().enumerate() {
             keyboard.held = keyboard.device.keys()?;
-            keyboard
-                .held_since
-                .retain(|code, _| keyboard.held.contains(code));
-            for &code in &keyboard.held {
-                keyboard.held_since.entry(code).or_insert_with(Instant::now);
-            }
+            self.holds.snapshot(index, &keyboard.held, Instant::now());
             if let Some(recording) = &mut self.recording {
                 recording
                     .presses
@@ -846,8 +853,6 @@ fn open_device(path: &Path) -> io::Result<RawDevice> {
                 format!("{} requires read/write access: {error}", path.display()),
             )
         })?;
-    let configuration = Device::from_fd(file.try_clone()?.into())?;
-    configuration.set_nonblocking(true)?;
     RawDevice::try_from(file)
 }
 
@@ -858,9 +863,45 @@ fn open_read_device(path: &Path) -> io::Result<RawDevice> {
             format!("{} requires read access: {error}", path.display()),
         )
     })?;
-    let configuration = Device::from_fd(file.try_clone()?.into())?;
-    configuration.set_nonblocking(true)?;
     RawDevice::try_from(file)
+}
+
+fn start_reader(
+    mut device: RawDevice,
+    path: PathBuf,
+    index: usize,
+    is_keyboard: bool,
+    sender: InputEventSender,
+) -> io::Result<()> {
+    thread::Builder::new()
+        .name(format!("input-{}", path.display()))
+        .spawn(move || {
+            loop {
+                match device.fetch_events() {
+                    Ok(events) => {
+                        for event in events {
+                            let message = if is_keyboard {
+                                InputEventMessage::Keyboard(index, event)
+                            } else {
+                                InputEventMessage::Pointer(index, event)
+                            };
+                            if !sender.send(message) {
+                                return;
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => {
+                        sender.send(InputEventMessage::DeviceError(io::Error::new(
+                            error.kind(),
+                            format!("{}: {error}", path.display()),
+                        )));
+                        return;
+                    }
+                }
+            }
+        })?;
+    Ok(())
 }
 
 fn is_repair_key(key: KeyCode) -> bool {
@@ -890,12 +931,38 @@ fn is_repair_key(key: KeyCode) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hold::HOLD_TIMEOUT;
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    const TEST_STEP: Duration = Duration::from_millis(5);
+
+    #[derive(Default)]
+    struct SimulatedEvents {
+        sender: Option<InputEventSender>,
+        index: usize,
+    }
+
+    impl SimulatedEvents {
+        fn push(&mut self, event: InputEvent) {
+            assert!(
+                self.sender
+                    .as_ref()
+                    .unwrap()
+                    .send(InputEventMessage::Keyboard(self.index, event))
+            );
+        }
+
+        fn extend(&mut self, events: impl IntoIterator<Item = InputEvent>) {
+            for event in events {
+                self.push(event);
+            }
+        }
+    }
+
     #[derive(Default)]
     struct SimulatedKeyboard {
-        events: Vec<InputEvent>,
+        events: SimulatedEvents,
         held: BTreeSet<u16>,
         writes: Vec<(KeyCode, i32, bool)>,
         is_grabbed: bool,
@@ -908,25 +975,7 @@ mod tests {
 
     struct SimulatedSource(Rc<RefCell<SimulatedKeyboard>>);
 
-    #[derive(Default)]
-    struct SimulatedPointer {
-        events: Vec<InputEvent>,
-        reads: usize,
-    }
-
-    impl PointerSource for Rc<RefCell<SimulatedPointer>> {
-        fn events(&mut self) -> io::Result<Vec<InputEvent>> {
-            let mut pointer = self.borrow_mut();
-            pointer.reads += 1;
-            Ok(std::mem::take(&mut pointer.events))
-        }
-    }
-
     impl Source for SimulatedSource {
-        fn events(&mut self) -> io::Result<Vec<InputEvent>> {
-            Ok(std::mem::take(&mut self.0.borrow_mut().events))
-        }
-
         fn keys(&self) -> io::Result<BTreeSet<u16>> {
             Ok(self.0.borrow().held.clone())
         }
@@ -1000,26 +1049,32 @@ mod tests {
     }
 
     fn simulated_input(sources: &[Rc<RefCell<SimulatedKeyboard>>]) -> Input {
+        let (sender, events) = InputEvents::new();
+        let mut holds = HoldDetector::default();
         let keyboards = sources
             .iter()
             .enumerate()
-            .map(|(index, source)| Keyboard {
-                path: PathBuf::from(format!("keyboard-{index}")),
-                device: Box::new(SimulatedSource(source.clone())),
-                held: source.borrow().held.clone(),
-                held_since: source
-                    .borrow()
-                    .held
-                    .iter()
-                    .map(|&code| (code, Instant::now()))
-                    .collect(),
+            .map(|(index, source)| {
+                source.borrow_mut().events = SimulatedEvents {
+                    sender: Some(sender.clone()),
+                    index,
+                };
+                holds.snapshot(index, &source.borrow().held, Instant::now());
+                Keyboard {
+                    path: PathBuf::from(format!("keyboard-{index}")),
+                    device: Box::new(SimulatedSource(source.clone())),
+                    held: source.borrow().held.clone(),
+                }
             })
             .collect();
         Input {
             keyboards,
             pointers: Vec::new(),
             history: History::default(),
-            focus_changes: Arc::new(AtomicBool::new(false)),
+            events,
+            holds,
+            correction_result: None,
+            is_correction_cancelled: false,
             switch_key: KeyCode::KEY_PAUSE,
             is_cancel_requested: false,
             pending: Some(0),
@@ -1059,12 +1114,14 @@ patterns = ['^\.тф']
             }))
         })
         .unwrap();
-        let layouts = crate::layout::LayoutTracker::default();
-        layouts.set(Some(Arc::new(crate::layout::Layout {
-            name: "ru".into(),
-            ..Default::default()
-        })));
-        input.history = History::with_layouts(layouts).with_auto_switch(switch);
+        input.history = History::default().with_auto_switch(switch);
+        input.history.accept_layout(
+            Some(Arc::new(crate::layout::Layout {
+                name: "ru".into(),
+                ..Default::default()
+            })),
+            false,
+        );
         input
     }
 
@@ -1078,6 +1135,138 @@ patterns = ['^\.тф']
         input
             .process_at(source, InputEvent::new(EventType::KEY.0, key.0, value), now)
             .unwrap();
+    }
+
+    fn layout(name: &str) -> Arc<crate::layout::Layout> {
+        Arc::new(crate::layout::Layout {
+            name: name.into(),
+            ..Default::default()
+        })
+    }
+
+    fn channel_input() -> (Input, InputEventSender) {
+        let source = Rc::new(RefCell::new(SimulatedKeyboard::default()));
+        let input = simulated_input(std::slice::from_ref(&source));
+        let sender = source.borrow().events.sender.as_ref().unwrap().clone();
+        (input, sender)
+    }
+
+    #[test]
+    fn queued_layouts_are_applied_in_order_and_duplicate_layouts_keep_history() {
+        let (mut input, sender) = channel_input();
+        sender.send(InputEventMessage::LayoutChanged(Some(layout("us"))));
+        sender.send(InputEventMessage::Keyboard(
+            0,
+            InputEvent::new(EventType::KEY.0, KeyCode::KEY_A.0, 1),
+        ));
+        sender.send(InputEventMessage::LayoutChanged(Some(layout("us"))));
+        input.drain().unwrap();
+        assert_eq!(input.latest_word().unwrap().text().as_deref(), Some("a"));
+        sender.send(InputEventMessage::LayoutChanged(Some(layout("ru"))));
+        input.drain().unwrap();
+        assert!(input.latest_word().is_none());
+    }
+
+    #[test]
+    fn completion_replaces_deferred_layout_and_late_duplicate_preserves_corrected_word() {
+        let (mut input, sender) = channel_input();
+        input.history.accept_layout(Some(layout("us")), false);
+        press(&mut input, KeyCode::KEY_A);
+        input.is_captured = true;
+        sender.send(InputEventMessage::LayoutChanged(Some(layout("ru"))));
+        input.drain().unwrap();
+        assert_eq!(input.latest_word().unwrap().text().as_deref(), Some("a"));
+        sender.send(InputEventMessage::CorrectionFinished {
+            result: Ok(()),
+            layout: Some(layout("ru")),
+        });
+        sender.send(InputEventMessage::LayoutChanged(Some(layout("ru"))));
+        assert!(input.wait_for_correction().unwrap().unwrap().is_ok());
+        assert_eq!(input.latest_word().unwrap().text().as_deref(), Some("ф"));
+        event_at(&mut input, 0, KeyCode::KEY_A, 0, Instant::now());
+        input.leave().unwrap();
+        assert_eq!(input.latest_word().unwrap().text().as_deref(), Some("ф"));
+    }
+
+    #[test]
+    fn layout_change_after_completion_is_reconciled_when_capture_ends() {
+        let (mut input, sender) = channel_input();
+        input.history.accept_layout(Some(layout("us")), false);
+        press(&mut input, KeyCode::KEY_A);
+        input.is_captured = true;
+        sender.send(InputEventMessage::CorrectionFinished {
+            result: Ok(()),
+            layout: Some(layout("ru")),
+        });
+        sender.send(InputEventMessage::LayoutChanged(Some(layout("us"))));
+        assert!(input.wait_for_correction().unwrap().unwrap().is_ok());
+        event_at(&mut input, 0, KeyCode::KEY_A, 0, Instant::now());
+        input.leave().unwrap();
+        assert!(input.latest_word().is_none());
+    }
+
+    #[test]
+    fn consumed_cancellation_still_prevents_applying_successful_correction() {
+        let (mut input, sender) = channel_input();
+        press(&mut input, KeyCode::KEY_A);
+        input.is_captured = true;
+        sender.send(InputEventMessage::FocusChanged);
+        assert!(input.read_captured().unwrap());
+        assert!(!input.take_cancel_request());
+        sender.send(InputEventMessage::CorrectionFinished {
+            result: Ok(()),
+            layout: Some(layout("ru")),
+        });
+        assert!(input.wait_for_correction().unwrap().unwrap().is_ok());
+        assert!(input.latest_word().is_none());
+        input.is_captured = false;
+        press(&mut input, KeyCode::KEY_B);
+        assert_eq!(input.latest_word().unwrap().text().as_deref(), Some("и"));
+    }
+
+    #[test]
+    fn completion_and_device_errors_wake_input_without_keyboard_events() {
+        let (mut input, sender) = channel_input();
+        let worker = thread::spawn(move || {
+            sender.send(InputEventMessage::CorrectionFinished {
+                result: Err(io::Error::other("correction failed")),
+                layout: None,
+            });
+        });
+        assert_eq!(
+            input
+                .wait_for_correction()
+                .unwrap()
+                .unwrap()
+                .unwrap_err()
+                .to_string(),
+            "correction failed"
+        );
+        worker.join().unwrap();
+        let (mut input, sender) = channel_input();
+        sender.send(InputEventMessage::DeviceError(io::Error::other(
+            "device disconnected",
+        )));
+        assert_eq!(
+            input.wait(None).unwrap_err().to_string(),
+            "device disconnected"
+        );
+    }
+
+    #[test]
+    fn waiting_expires_hold_timer_without_new_messages() {
+        let (mut input, _sender) = channel_input();
+        event_at(
+            &mut input,
+            0,
+            KeyCode::KEY_A,
+            1,
+            Instant::now() - HOLD_TIMEOUT - TEST_STEP,
+        );
+        assert!(!input.is_backing_off);
+        input.wait(None).unwrap();
+        assert!(input.is_backing_off);
+        assert!(input.latest_word().is_none());
     }
 
     #[test]
@@ -1122,9 +1311,12 @@ patterns = ['^\.тф']
         event_at(&mut input, 0, KeyCode::KEY_A, 0, now + HOLD_TIMEOUT / 2);
         input.update_back_off(now + HOLD_TIMEOUT);
         assert!(!input.is_backing_off);
-        input.keyboards[0].held_since.insert(
+        input.holds.update(0, KeyCode::KEY_B.0, 0, now);
+        input.holds.update(
+            0,
             KeyCode::KEY_B.0,
-            Instant::now() - HOLD_TIMEOUT - POLL_INTERVAL,
+            1,
+            Instant::now() - HOLD_TIMEOUT - TEST_STEP,
         );
         input.drain().unwrap();
         assert!(input.is_backing_off);
@@ -1141,7 +1333,7 @@ patterns = ['^\.тф']
             0,
             KeyCode::KEY_A,
             0,
-            now + HOLD_TIMEOUT + POLL_INTERVAL,
+            now + HOLD_TIMEOUT + TEST_STEP,
         );
         assert!(input.latest_word().is_none());
         assert!(!input.is_backing_off);
@@ -1157,7 +1349,7 @@ patterns = ['^\.тф']
             event_at(&mut input, 1, key, 1, now);
             event_at(&mut input, 1, key, 2, now);
         }
-        let later = now + HOLD_TIMEOUT + POLL_INTERVAL;
+        let later = now + HOLD_TIMEOUT + TEST_STEP;
         input.update_back_off(later);
         assert!(!input.is_backing_off);
         event_at(&mut input, 0, KeyCode::KEY_A, 1, later);
@@ -1237,7 +1429,7 @@ patterns = ['^\.тф']
             event_at(&mut input, 0, key, 1, now);
             input.update_back_off(now + HOLD_TIMEOUT);
             assert!(!input.is_backing_off);
-            input.update_back_off(now + HOLD_TIMEOUT + POLL_INTERVAL);
+            input.update_back_off(now + HOLD_TIMEOUT + TEST_STEP);
             assert!(input.is_backing_off, "{key:?}");
             assert!(input.pending.is_none());
         }
@@ -1287,29 +1479,30 @@ patterns = ['^\.тф']
     }
 
     #[test]
-    fn discovery_drains_devices_and_ignores_switch_requests() {
+    fn discovery_drains_channel_and_ignores_switch_requests() {
         let source = Rc::new(RefCell::new(SimulatedKeyboard::default()));
-        let pointer = Rc::new(RefCell::new(SimulatedPointer::default()));
         let mut input = simulated_input(std::slice::from_ref(&source));
         input.pending = None;
         input.pointers.push(Pointer {
             path: PathBuf::from("pointer"),
-            device: Box::new(pointer.clone()),
         });
         source.borrow_mut().events.extend([
             InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTSHIFT.0, 1),
             InputEvent::new(EventType::KEY.0, KeyCode::KEY_PAUSE.0, 1),
             InputEvent::new(EventType::KEY.0, KeyCode::KEY_PAUSE.0, 0),
         ]);
-        pointer
-            .borrow_mut()
+        source
+            .borrow()
             .events
-            .push(InputEvent::new(EventType::RELATIVE.0, 0, 1));
-        input
-            .wait_for_keyboard_discovery(POLL_INTERVAL * 3)
-            .unwrap();
-        assert!(pointer.borrow().reads >= 2);
-        assert!(pointer.borrow().events.is_empty());
+            .sender
+            .as_ref()
+            .unwrap()
+            .send(InputEventMessage::Pointer(
+                0,
+                InputEvent::new(EventType::RELATIVE.0, 0, 1),
+            ));
+        input.wait_for_keyboard_discovery(TEST_STEP * 3).unwrap();
+        assert!(input.events.available().unwrap().is_none());
         assert_eq!(input.pending, None);
         assert!(!input.is_original_switch_key_held);
         assert!(input.keyboards[0].held.contains(&KeyCode::KEY_LEFTSHIFT.0));
@@ -1330,22 +1523,27 @@ patterns = ['^\.тф']
     #[test]
     fn discovery_propagates_pointer_event_loss() {
         let source = Rc::new(RefCell::new(SimulatedKeyboard::default()));
-        let pointer = Rc::new(RefCell::new(SimulatedPointer {
-            events: vec![InputEvent::new(
-                EventType::SYNCHRONIZATION.0,
-                SynchronizationCode::SYN_DROPPED.0,
-                0,
-            )],
-            ..Default::default()
-        }));
         let mut input = simulated_input(std::slice::from_ref(&source));
         input.pointers.push(Pointer {
             path: PathBuf::from("pointer"),
-            device: Box::new(pointer),
         });
+        source
+            .borrow()
+            .events
+            .sender
+            .as_ref()
+            .unwrap()
+            .send(InputEventMessage::Pointer(
+                0,
+                InputEvent::new(
+                    EventType::SYNCHRONIZATION.0,
+                    SynchronizationCode::SYN_DROPPED.0,
+                    0,
+                ),
+            ));
         assert!(
             input
-                .wait_for_keyboard_discovery(POLL_INTERVAL)
+                .wait_for_keyboard_discovery(TEST_STEP)
                 .unwrap_err()
                 .to_string()
                 .contains("SYN_DROPPED")
