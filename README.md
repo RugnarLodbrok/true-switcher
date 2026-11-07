@@ -66,6 +66,7 @@ After installation, the installer starts True Switcher and enables it to start a
 
 True Switcher shows an icon in the KDE Plasma system tray while the process is running.
 Its menu contains `Reload`, which restarts the system service `true-switcher.service` without waiting for the restart to finish. The icon briefly disappears and the new process reads `~/.config/true-switcher/config.toml` again.
+`Quit` stops the system service.
 
 If the configuration cannot be read, or `switch_key` is missing or invalid, the program uses `KEY_PAUSE` and sends a desktop notification. A failed restart request is also logged and reported in a notification.
 

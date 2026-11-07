@@ -8,6 +8,7 @@ use zbus::zvariant::{OwnedValue, Str, Value};
 
 const ROOT_ID: i32 = 0;
 const RELOAD_ID: i32 = 1;
+const QUIT_ID: i32 = 2;
 const REVISION: u32 = 1;
 const PROTOCOL_VERSION: u32 = 3;
 const SERVICE: &str = "true-switcher.service";
@@ -20,12 +21,14 @@ type Restart = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
 
 pub(super) struct Menu {
     pub(super) restart: Restart,
+    pub(super) stop: Restart,
 }
 
 impl Menu {
     pub(super) fn new() -> Self {
         Self {
             restart: Arc::new(restart_service),
+            stop: Arc::new(stop_service),
         }
     }
 
@@ -35,19 +38,23 @@ impl Menu {
         id: i32,
         event: &str,
     ) -> zbus::fdo::Result<()> {
-        if ![ROOT_ID, RELOAD_ID].contains(&id) {
+        if ![ROOT_ID, RELOAD_ID, QUIT_ID].contains(&id) {
             return Err(zbus::fdo::Error::InvalidArgs("Unknown menu item".into()));
         }
-        if id == RELOAD_ID && event == CLICKED {
-            let restart = self.restart.clone();
+        if [RELOAD_ID, QUIT_ID].contains(&id) && event == CLICKED {
+            let (action, verb, title) = if id == RELOAD_ID {
+                (self.restart.clone(), "restart", "Reload failed")
+            } else {
+                (self.stop.clone(), "stop", "Quit failed")
+            };
             let connection = connection.clone();
             thread::Builder::new()
-                .name("tray-reload".into())
+                .name(format!("tray-{verb}"))
                 .spawn(move || {
-                    if let Err(error) = restart() {
-                        let body = format!("Cannot restart {SERVICE}: {error}");
+                    if let Err(error) = action() {
+                        let body = format!("Cannot {verb} {SERVICE}: {error}");
                         eprintln!("true-switcher: {body}");
-                        let _ = super::notify(&connection.into(), "Reload failed", &body);
+                        let _ = super::notify(&connection.into(), title, &body);
                     }
                 })
                 .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
@@ -57,8 +64,16 @@ impl Menu {
 }
 
 fn restart_service() -> io::Result<()> {
+    control_service("restart")
+}
+
+fn stop_service() -> io::Result<()> {
+    control_service("stop")
+}
+
+fn control_service(verb: &str) -> io::Result<()> {
     let output = Command::new("systemctl")
-        .args(["--system", "--no-block", "restart", SERVICE])
+        .args(["--system", "--no-block", verb, SERVICE])
         .output()?;
     if output.status.success() {
         Ok(())
@@ -76,6 +91,11 @@ fn properties(id: i32, names: &[String]) -> zbus::fdo::Result<Properties> {
         ROOT_ID => HashMap::from([("children-display".into(), Str::from("submenu").into())]),
         RELOAD_ID => HashMap::from([
             ("label".into(), Str::from("Reload").into()),
+            ("enabled".into(), true.into()),
+            ("visible".into(), true.into()),
+        ]),
+        QUIT_ID => HashMap::from([
+            ("label".into(), Str::from("Quit").into()),
             ("enabled".into(), true.into()),
             ("visible".into(), true.into()),
         ]),
@@ -118,14 +138,12 @@ impl Menu {
     ) -> zbus::fdo::Result<(u32, Layout)> {
         let mut children = Vec::new();
         if parent_id == ROOT_ID && recursion_depth != 0 {
-            let child: Layout = (
-                RELOAD_ID,
-                properties(RELOAD_ID, &property_names)?,
-                Vec::new(),
-            );
-            children.push(Value::from(child).try_into().map_err(
-                |error: zbus::zvariant::Error| zbus::fdo::Error::Failed(error.to_string()),
-            )?);
+            for id in [RELOAD_ID, QUIT_ID] {
+                let child: Layout = (id, properties(id, &property_names)?, Vec::new());
+                children.push(Value::from(child).try_into().map_err(
+                    |error: zbus::zvariant::Error| zbus::fdo::Error::Failed(error.to_string()),
+                )?);
+            }
         }
         Ok((
             REVISION,
@@ -139,7 +157,7 @@ impl Menu {
         property_names: Vec<String>,
     ) -> Vec<(i32, Properties)> {
         let ids = if ids.is_empty() {
-            vec![ROOT_ID, RELOAD_ID]
+            vec![ROOT_ID, RELOAD_ID, QUIT_ID]
         } else {
             ids
         };
@@ -191,7 +209,7 @@ impl Menu {
         (
             Vec::new(),
             ids.into_iter()
-                .filter(|id| ![ROOT_ID, RELOAD_ID].contains(id))
+                .filter(|id| ![ROOT_ID, RELOAD_ID, QUIT_ID].contains(id))
                 .collect(),
         )
     }

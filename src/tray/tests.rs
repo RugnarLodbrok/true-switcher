@@ -88,11 +88,16 @@ fn exports_icon_and_reload_menu_and_dispatches_only_clicks() {
     let bus = TestBus::start();
     let tray = bus.connect();
     let (sent, received) = mpsc::channel();
+    let (quit_sent, quit_received) = mpsc::channel();
     export(
         &tray,
         menu::Menu {
             restart: Arc::new(move || {
                 sent.send(()).unwrap();
+                Ok(())
+            }),
+            stop: Arc::new(move || {
+                quit_sent.send(()).unwrap();
                 Ok(())
             }),
         },
@@ -116,12 +121,19 @@ fn exports_icon_and_reload_menu_and_dispatches_only_clicks() {
     let (_, layout): (u32, menu::Layout) = menu
         .call("GetLayout", &(0_i32, -1_i32, Vec::<String>::new()))
         .unwrap();
-    assert_eq!(layout.2.len(), 1);
-    let child = menu::Layout::try_from(layout.2.into_iter().next().unwrap()).unwrap();
+    assert_eq!(layout.2.len(), 2);
+    let mut children = layout.2.into_iter();
+    let child = menu::Layout::try_from(children.next().unwrap()).unwrap();
     assert_eq!(child.0, 1);
     assert_eq!(
         <&str>::try_from(child.1.get("label").unwrap()).unwrap(),
         "Reload"
+    );
+    let child = menu::Layout::try_from(children.next().unwrap()).unwrap();
+    assert_eq!(child.0, 2);
+    assert_eq!(
+        <&str>::try_from(child.1.get("label").unwrap()).unwrap(),
+        "Quit"
     );
     let (_, shallow): (u32, menu::Layout) = menu
         .call("GetLayout", &(0_i32, 0_i32, Vec::<String>::new()))
@@ -133,6 +145,12 @@ fn exports_icon_and_reload_menu_and_dispatches_only_clicks() {
     menu.call::<_, _, ()>("Event", &(1_i32, "clicked", Value::from(0_i32), 0_u32))
         .unwrap();
     received.recv_timeout(TEST_TIMEOUT).unwrap();
+    menu.call::<_, _, ()>("Event", &(2_i32, "hovered", Value::from(0_i32), 0_u32))
+        .unwrap();
+    assert!(quit_received.try_recv().is_err());
+    menu.call::<_, _, ()>("Event", &(2_i32, "clicked", Value::from(0_i32), 0_u32))
+        .unwrap();
+    quit_received.recv_timeout(TEST_TIMEOUT).unwrap();
     assert!(
         menu.call::<_, _, ()>("Event", &(99_i32, "clicked", Value::from(0_i32), 0_u32))
             .is_err()
@@ -216,6 +234,7 @@ fn sends_warning_and_reports_failed_reload_as_notification() {
         &tray,
         menu::Menu {
             restart: Arc::new(|| Err(io::Error::other("Permission denied"))),
+            stop: Arc::new(|| Ok(())),
         },
         None,
     )
