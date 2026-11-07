@@ -1,4 +1,4 @@
-.PHONY: run run-learn run-input-debug run-modifier-experiment-100 run-modifier-experiment-101 run-capture-experiment-102 fmt-check test
+.PHONY: run run-learn run-input-debug run-modifier-experiment-100 run-modifier-experiment-101 run-capture-experiment-102 fmt-check test logs
 
 run:
 	cargo build --bin true-switcher
@@ -53,6 +53,9 @@ fmt-check:
 
 test:
 	cargo test --bin true-switcher
+
+logs:
+	sudo journalctl -u true-switcher.service -n 1000 -f
 
 .PHONY: install uninstall
 install uninstall:
