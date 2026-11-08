@@ -5,11 +5,14 @@ use std::time::Instant;
 use evdev::InputEvent;
 
 use crate::layout::Layout;
+use crate::lifecycle::ShutdownReason;
 
 pub enum InputEventMessage {
     Keyboard(usize, InputEvent),
-    Pointer(usize, InputEvent),
     DeviceError(io::Error),
+    DeviceDisconnected(usize, Instant),
+    DevicesChanged(Instant),
+    Shutdown(ShutdownReason),
     FocusChanged,
     LayoutChanged(Option<Arc<Layout>>),
     CorrectionFinished {
@@ -24,6 +27,12 @@ pub struct InputEventSender(mpsc::Sender<InputEventMessage>);
 impl InputEventSender {
     pub fn send(&self, event: InputEventMessage) -> bool {
         self.0.send(event).is_ok()
+    }
+
+    pub fn shutdown(&self, reason: ShutdownReason) -> io::Result<()> {
+        self.0
+            .send(InputEventMessage::Shutdown(reason))
+            .map_err(|_| closed())
     }
 }
 

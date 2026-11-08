@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::fs::{self, OpenOptions};
+use std::fs::OpenOptions;
 use std::io;
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use evdev::{EventType, InputEvent, KeyCode, SynchronizationCode, raw_stream::RawDevice};
 
+mod devices;
 mod interception;
 
 use interception::InterceptionState;
@@ -17,7 +18,7 @@ pub use interception::Interceptor;
 use crate::history::History;
 use crate::hold::HoldDetector;
 use crate::input_events::{InputEventMessage, InputEventSender, InputEvents};
-use crate::output::is_own_keyboard;
+use crate::lifecycle::{Lifecycle, ShutdownReason};
 
 const MODIFIERS: [KeyCode; 8] = [
     KeyCode::KEY_LEFTSHIFT,
@@ -65,10 +66,6 @@ struct Keyboard {
     held: BTreeSet<u16>,
 }
 
-struct Pointer {
-    path: PathBuf,
-}
-
 trait Source {
     fn keys(&self) -> io::Result<BTreeSet<u16>>;
     fn send(&mut self, events: &[InputEvent]) -> io::Result<()>;
@@ -101,7 +98,7 @@ impl Source for RawDevice {
 
 pub struct Input {
     keyboards: Vec<Keyboard>,
-    pointers: Vec<Pointer>,
+    lifecycle: Lifecycle,
     history: History,
     statistics: Option<crate::statistics::Statistics>,
     auto_switch: crate::switch_rules::AutoSwitchRules,
@@ -130,7 +127,7 @@ impl Input {
     ) -> io::Result<Self> {
         let mut input = Self {
             keyboards: Vec::new(),
-            pointers: Vec::new(),
+            lifecycle: Lifecycle::Running,
             history: History::default(),
             statistics: Some(statistics),
             auto_switch,
@@ -148,64 +145,30 @@ impl Input {
             is_auto_request: false,
             automatic_target: None,
         };
-        input.discover_devices(&sender)?;
+        let monitor = devices::Monitor::new()?;
+        input.discover_devices(&sender, &monitor)?;
+        monitor.start(sender)?;
         Ok(input)
     }
 
-    fn discover_devices(&mut self, sender: &InputEventSender) -> io::Result<()> {
-        for entry in fs::read_dir("/dev/input")? {
-            let entry = entry?;
-            if !entry.file_name().as_encoded_bytes().starts_with(b"event") {
-                continue;
-            }
-            let path = entry.path();
-            let probe = match RawDevice::open(&path) {
-                Ok(device) => device,
-                Err(error) => {
-                    log::debug!("Cannot open {}: {error}", path.display());
-                    continue;
+    fn discover_devices(
+        &mut self,
+        sender: &InputEventSender,
+        monitor: &devices::Monitor,
+    ) -> io::Result<()> {
+        for path in monitor.keyboards.keys() {
+            if let Err(error) = self.open_keyboard(path.clone(), sender) {
+                if is_disconnection(&error) {
+                    self.devices_changed(Instant::now());
+                } else if error.kind() == io::ErrorKind::PermissionDenied {
+                    log::warn!("Cannot open keyboard {}: {error}", path.display());
+                } else {
+                    return Err(error);
                 }
-            };
-            if is_own_keyboard(probe.physical_path(), probe.name()) {
-                continue;
-            }
-            if is_pointer(&probe) {
-                self.open_pointer(&path, sender)?;
-            }
-            if is_keyboard(&probe) {
-                self.open_keyboard(path, sender)?;
             }
         }
         if self.keyboards.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "no accessible keyboards",
-            ));
-        }
-        if self.pointers.is_empty() {
-            log::warn!(
-                "No accessible pointer devices; mouse clicks and touchpad taps cannot reset history"
-            );
-        }
-        Ok(())
-    }
-
-    fn open_pointer(&mut self, path: &Path, sender: &InputEventSender) -> io::Result<()> {
-        match open_read_device(path) {
-            Ok(device) => {
-                log::debug!("OPEN POINTER {} {:?}", path.display(), device.name());
-                start_reader(
-                    device,
-                    path.to_owned(),
-                    self.pointers.len(),
-                    false,
-                    sender.clone(),
-                )?;
-                self.pointers.push(Pointer {
-                    path: path.to_owned(),
-                });
-            }
-            Err(error) => log::warn!("Cannot monitor pointer {}: {error}", path.display()),
+            log::info!("No accessible keyboards; waiting for a keyboard to appear");
         }
         Ok(())
     }
@@ -218,13 +181,7 @@ impl Input {
         log::debug!("OPEN {} {:?}", path.display(), device.name());
         log::trace!("OPEN {} held={held:?}", path.display());
         let reader = RawDevice::from_fd(device.as_fd().try_clone_to_owned()?)?;
-        start_reader(
-            reader,
-            path.clone(),
-            self.keyboards.len(),
-            true,
-            sender.clone(),
-        )?;
+        start_reader(reader, path.clone(), self.keyboards.len(), sender.clone())?;
         self.keyboards.push(Keyboard {
             path,
             device: Box::new(device),
@@ -250,6 +207,7 @@ impl Input {
     }
 
     pub fn wait_for_switch_request(&mut self) -> io::Result<()> {
+        self.lifecycle.check()?;
         if self.pending.is_some() {
             return Ok(());
         }
@@ -314,14 +272,29 @@ impl Input {
         self.drain_events(state.as_deref_mut())?;
         self.synchronize_history(state.as_deref());
         self.update_back_off(Instant::now(), state.is_some_and(|state| state.is_captured));
-        Ok(())
+        self.lifecycle.check()
     }
 
     fn drain_events(&mut self, mut state: Option<&mut InterceptionState>) -> io::Result<()> {
         while let Some(event) = self.events.available()? {
             self.process_message(event, state.as_deref_mut())?;
+            self.lifecycle.check()?;
         }
         Ok(())
+    }
+
+    fn process_cleanup_events(
+        &mut self,
+        mut state: Option<&mut InterceptionState>,
+    ) -> io::Result<()> {
+        let mut error = None;
+        while let Some(event) = self.events.available()? {
+            if let Err(err) = self.process_message(event, state.as_deref_mut()) {
+                log::error!("CLEANUP input event: {err}");
+                error.get_or_insert(err);
+            }
+        }
+        error.map_or(Ok(()), Err)
     }
 
     fn synchronize_history(&mut self, state: Option<&InterceptionState>) {
@@ -358,10 +331,21 @@ impl Input {
         let is_captured = state.as_ref().is_some_and(|state| state.is_captured);
         match event {
             InputEventMessage::Keyboard(index, event) => self.process(index, event, state)?,
-            InputEventMessage::Pointer(index, event) => {
-                self.process_pointer(index, event, is_captured)?
-            }
             InputEventMessage::DeviceError(error) => return Err(error),
+            InputEventMessage::DevicesChanged(at) => self.devices_changed(at),
+            InputEventMessage::DeviceDisconnected(index, at) => {
+                log::info!(
+                    "Keyboard disconnected: {}",
+                    self.keyboards[index].path.display()
+                );
+                if self.lifecycle == Lifecycle::Running {
+                    self.devices_changed(at);
+                }
+            }
+            InputEventMessage::Shutdown(reason) => {
+                self.lifecycle.shutdown(reason);
+                self.cancel_processing();
+            }
             InputEventMessage::FocusChanged => self.request_history_reset(is_captured),
             InputEventMessage::LayoutChanged(layout) => {
                 self.accept_layout(
@@ -388,6 +372,60 @@ impl Input {
             }
         }
         Ok(())
+    }
+
+    pub fn devices_changed(&mut self, at: Instant) {
+        if self.lifecycle == Lifecycle::Running {
+            log::info!("Keyboard devices changed; cancelling input processing before restart");
+        }
+        self.lifecycle.devices_changed(at);
+        self.cancel_processing();
+    }
+
+    fn cancel_processing(&mut self) {
+        self.reset_history();
+        self.pending = None;
+        self.automatic_target = None;
+        self.is_auto_request = false;
+        self.is_original_switch_key_held = false;
+        self.is_cancel_requested = true;
+        self.is_correction_cancelled = true;
+    }
+
+    pub fn wait_for_resume(&mut self) -> io::Result<Option<ShutdownReason>> {
+        if self.lifecycle != Lifecycle::Running
+            && let Err(error) = self.process_cleanup_events(None)
+        {
+            log::error!("Lifecycle event cleanup: {error}");
+        }
+        if let Lifecycle::PreparingForRestart(deadline) = self.lifecycle {
+            log::info!("Waiting for keyboard devices to settle before restart");
+            self.lifecycle = Lifecycle::WaitingForRestart(deadline);
+        }
+        loop {
+            let deadline = match self.lifecycle {
+                Lifecycle::Running => return Ok(None),
+                Lifecycle::Shutdown(_) => {
+                    if let Err(error) = self.process_cleanup_events(None) {
+                        log::error!("Shutdown event cleanup: {error}");
+                    }
+                    let Lifecycle::Shutdown(reason) = self.lifecycle else {
+                        unreachable!()
+                    };
+                    return Ok(Some(reason));
+                }
+                Lifecycle::WaitingForRestart(deadline) => deadline,
+                Lifecycle::PreparingForRestart(_) => unreachable!(),
+            };
+            if Instant::now() >= deadline {
+                self.lifecycle.shutdown(ShutdownReason::Restart);
+                continue;
+            }
+            match self.events.wait(Some(deadline))? {
+                Some(event) => self.process_message(event, None)?,
+                None => self.lifecycle.shutdown(ShutdownReason::Restart),
+            }
+        }
     }
 
     fn wait_for_correction(
@@ -424,6 +462,9 @@ impl Input {
         now: Instant,
         state: Option<&mut InterceptionState>,
     ) -> io::Result<()> {
+        if self.lifecycle != Lifecycle::Running && state.is_none() {
+            return Ok(());
+        }
         if event.event_type() == EventType::SYNCHRONIZATION
             && event.code() == SynchronizationCode::SYN_DROPPED.0
         {
@@ -443,6 +484,9 @@ impl Input {
         self.track_key(index, event);
         if let Some(recording) = state.and_then(|state| state.recording.as_mut()) {
             recording.record(index, key.0, value);
+        }
+        if self.lifecycle != Lifecycle::Running {
+            return Ok(());
         }
         if value == 2 && !is_shift(key) {
             self.start_back_off(is_captured);
@@ -489,10 +533,7 @@ impl Input {
             key,
             KeyCode::KEY_TAB | KeyCode::KEY_ENTER | KeyCode::KEY_KPENTER
         ) && !self.has_shortcut_modifier();
-        let is_pointer_click = value == 1 && is_pointer_press(key.0);
-        if (self.should_reset_for_key(key, value) || is_pointer_click)
-            && (!is_hard_separator || is_captured)
-        {
+        if self.should_reset_for_key(key, value) && (!is_hard_separator || is_captured) {
             self.request_history_reset(is_captured);
         }
         if is_captured || self.keyboards[index].device.is_grabbed() {
@@ -554,30 +595,6 @@ impl Input {
                 self.is_original_switch_key_held = false;
             }
         }
-    }
-
-    fn process_pointer(
-        &mut self,
-        index: usize,
-        event: InputEvent,
-        is_captured: bool,
-    ) -> io::Result<()> {
-        if event.event_type() == EventType::SYNCHRONIZATION
-            && event.code() == SynchronizationCode::SYN_DROPPED.0
-        {
-            self.request_history_reset(is_captured);
-            return Err(io::Error::other(format!(
-                "{}: SYN_DROPPED",
-                self.pointers[index].path.display()
-            )));
-        }
-        if event.event_type() == EventType::KEY
-            && event.value() == 1
-            && is_pointer_press(event.code())
-        {
-            self.request_history_reset(is_captured);
-        }
-        Ok(())
     }
 
     fn should_reset_for_key(&self, key: KeyCode, value: i32) -> bool {
@@ -701,8 +718,9 @@ impl Input {
             "SOURCE_WRITE result {} {key:?} value={value}: {result:?}",
             keyboard.path.display()
         );
-        result?;
+        self.device_result(result)?;
         self.holds.update(index, key.0, value, Instant::now());
+        let keyboard = &mut self.keyboards[index];
         if value == 0 {
             keyboard.held.remove(&key.0);
         } else {
@@ -740,12 +758,12 @@ impl Input {
     }
 
     fn grab(&mut self) -> io::Result<()> {
-        for keyboard in &mut self.keyboards {
-            let result = keyboard.device.grab();
+        for index in 0..self.keyboards.len() {
+            let result = self.keyboards[index].device.grab();
             if result.is_ok() {
-                log::debug!("GRAB {}", keyboard.path.display());
+                log::debug!("GRAB {}", self.keyboards[index].path.display());
             }
-            result?;
+            self.device_result(result)?;
         }
         Ok(())
     }
@@ -764,12 +782,23 @@ impl Input {
                 }
             }
         }
-        error.map_or(Ok(()), Err)
+        self.device_result(error.map_or(Ok(()), Err))
     }
 
     fn snapshot(&mut self, mut state: Option<&mut InterceptionState>) -> io::Result<()> {
-        for (index, keyboard) in self.keyboards.iter_mut().enumerate() {
-            keyboard.held = keyboard.device.keys()?;
+        let mut error = None;
+        for index in 0..self.keyboards.len() {
+            let keys = self.keyboards[index].device.keys();
+            let keys = match self.device_result(keys) {
+                Ok(keys) => keys,
+                Err(err) => {
+                    log::error!("SNAPSHOT keyboard={index}: {err}");
+                    error.get_or_insert(err);
+                    continue;
+                }
+            };
+            let keyboard = &mut self.keyboards[index];
+            keyboard.held = keys;
             self.holds.snapshot(index, &keyboard.held, Instant::now());
             if let Some(recording) = state
                 .as_deref_mut()
@@ -780,7 +809,18 @@ impl Input {
                     .extend(keyboard.held.iter().map(|&code| (index, code)));
             }
         }
-        Ok(())
+        error.map_or(Ok(()), Err)
+    }
+
+    fn device_result<T>(&mut self, result: io::Result<T>) -> io::Result<T> {
+        match result {
+            Err(error) if is_disconnection(&error) && self.lifecycle == Lifecycle::Running => {
+                log::info!("Keyboard disconnected during device operation: {error}");
+                self.devices_changed(Instant::now());
+                self.lifecycle.check().map(|()| unreachable!())
+            }
+            result => result,
+        }
     }
 }
 
@@ -788,54 +828,28 @@ fn is_shift(key: KeyCode) -> bool {
     matches!(key, KeyCode::KEY_LEFTSHIFT | KeyCode::KEY_RIGHTSHIFT)
 }
 
-fn is_keyboard(device: &RawDevice) -> bool {
-    device.supported_keys().is_some_and(|keys| {
-        [KeyCode::KEY_A, KeyCode::KEY_SPACE, KeyCode::KEY_ENTER]
-            .iter()
-            .all(|key| keys.contains(*key))
-    })
-}
-
-fn is_pointer(device: &RawDevice) -> bool {
-    device.supported_keys().is_some_and(|keys| {
-        (KeyCode::BTN_LEFT.0..=KeyCode::BTN_TASK.0).any(|code| keys.contains(KeyCode::new(code)))
-            || keys.contains(KeyCode::BTN_TOUCH)
-    })
-}
-
-fn is_pointer_press(code: u16) -> bool {
-    (KeyCode::BTN_LEFT.0..=KeyCode::BTN_TASK.0).contains(&code) || code == KeyCode::BTN_TOUCH.0
-}
-
 fn open_device(path: &Path) -> io::Result<RawDevice> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .open(path)
-        .map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("{} requires read/write access: {error}", path.display()),
-            )
+        .inspect_err(|error| {
+            log::warn!("{} requires read/write access: {error}", path.display());
         })?;
     RawDevice::try_from(file)
 }
 
-fn open_read_device(path: &Path) -> io::Result<RawDevice> {
-    let file = OpenOptions::new().read(true).open(path).map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!("{} requires read access: {error}", path.display()),
-        )
-    })?;
-    RawDevice::try_from(file)
+fn is_disconnection(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(nix::libc::ENODEV | nix::libc::ENOENT)
+    )
 }
 
 fn start_reader(
     mut device: RawDevice,
     path: PathBuf,
     index: usize,
-    is_keyboard: bool,
     sender: InputEventSender,
 ) -> io::Result<()> {
     thread::Builder::new()
@@ -845,17 +859,17 @@ fn start_reader(
                 match device.fetch_events() {
                     Ok(events) => {
                         for event in events {
-                            let message = if is_keyboard {
-                                InputEventMessage::Keyboard(index, event)
-                            } else {
-                                InputEventMessage::Pointer(index, event)
-                            };
+                            let message = InputEventMessage::Keyboard(index, event);
                             if !sender.send(message) {
                                 return;
                             }
                         }
                     }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) if is_disconnection(&error) => {
+                        sender.send(InputEventMessage::DeviceDisconnected(index, Instant::now()));
+                        return;
+                    }
                     Err(error) => {
                         sender.send(InputEventMessage::DeviceError(io::Error::new(
                             error.kind(),
@@ -941,6 +955,7 @@ pub(crate) mod tests {
         is_entry_repeated: bool,
         is_grab_failed: bool,
         is_repair_release_failed: bool,
+        on_grab: Option<InputEventMessage>,
     }
 
     struct SimulatedSource(Rc<RefCell<SimulatedKeyboard>>);
@@ -1011,6 +1026,9 @@ pub(crate) mod tests {
                     ));
                 }
             }
+            if let Some(event) = keyboard.on_grab.take() {
+                keyboard.events.sender.as_ref().unwrap().send(event);
+            }
             Ok(())
         }
 
@@ -1062,7 +1080,7 @@ pub(crate) mod tests {
             .collect();
         Input {
             keyboards,
-            pointers: Vec::new(),
+            lifecycle: Lifecycle::Running,
             history: History::default(),
             statistics: None,
             auto_switch: Default::default(),
@@ -1259,6 +1277,152 @@ patterns = ['^\.тф']
             input.wait_for_switch_request().unwrap_err().to_string(),
             "device disconnected"
         );
+    }
+
+    #[test]
+    fn shutdown_wakes_input_and_discovery_without_any_keyboards() {
+        for is_discovering in [false, true] {
+            let mut input = simulated_input(&[]);
+            input.pending = None;
+            let (sender, events) = InputEvents::new();
+            input.events = events;
+            sender.shutdown(ShutdownReason::Stop).unwrap();
+            let result = if is_discovering {
+                input.wait_for_keyboard_discovery(TEST_STEP)
+            } else {
+                input.wait_for_switch_request()
+            };
+            assert!(crate::lifecycle::is_control_interrupt(&result.unwrap_err()));
+            assert_eq!(input.wait_for_resume().unwrap(), Some(ShutdownReason::Stop));
+        }
+    }
+
+    #[test]
+    fn shutdown_during_entry_repairs_hidden_input_before_releasing_capture() {
+        let source = Rc::new(RefCell::new(SimulatedKeyboard {
+            is_entry_interrupted: true,
+            on_grab: Some(InputEventMessage::Shutdown(ShutdownReason::Stop)),
+            ..Default::default()
+        }));
+        let mut input = simulated_input(std::slice::from_ref(&source));
+        let Err(error) = Interceptor::enter(&mut input) else {
+            panic!("entry must be interrupted");
+        };
+        assert!(crate::lifecycle::is_control_interrupt(&error));
+        let keyboard = source.borrow();
+        assert!(!keyboard.is_grabbed);
+        assert!(keyboard.writes.contains(&(KeyCode::KEY_A, 1, true)));
+        assert!(keyboard.writes.contains(&(KeyCode::KEY_A, 0, false)));
+        drop(keyboard);
+        assert_eq!(input.wait_for_resume().unwrap(), Some(ShutdownReason::Stop));
+    }
+
+    #[test]
+    fn disconnection_cancels_correction_wait_and_cleans_up_with_keys_held() {
+        let source = Rc::new(RefCell::new(SimulatedKeyboard::default()));
+        let mut input = simulated_input(std::slice::from_ref(&source));
+        let mut interception = Interceptor::enter(&mut input).unwrap().unwrap();
+        let sender = source.borrow().events.sender.as_ref().unwrap().clone();
+        source
+            .borrow_mut()
+            .held
+            .extend([KeyCode::KEY_A.0, KeyCode::KEY_LEFTSHIFT.0]);
+        source.borrow_mut().events.extend([
+            InputEvent::new(EventType::KEY.0, KeyCode::KEY_A.0, 1),
+            InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTSHIFT.0, 1),
+        ]);
+        sender.send(InputEventMessage::DeviceDisconnected(0, Instant::now()));
+        assert!(crate::lifecycle::is_control_interrupt(
+            &interception.wait_for_correction().unwrap_err()
+        ));
+        assert!(interception.take_cancel_request());
+        sender.shutdown(ShutdownReason::Stop).unwrap();
+        sender.shutdown(ShutdownReason::Restart).unwrap();
+        drop(interception);
+        assert!(!source.borrow().is_grabbed);
+        assert!(!source.borrow().held.contains(&KeyCode::KEY_LEFTSHIFT.0));
+        assert!(source.borrow().held.contains(&KeyCode::KEY_A.0));
+        assert_eq!(input.wait_for_resume().unwrap(), Some(ShutdownReason::Stop));
+    }
+
+    #[test]
+    fn shutdown_interrupts_release_wait_without_waiting_for_user() {
+        let source = Rc::new(RefCell::new(SimulatedKeyboard::default()));
+        let mut input = simulated_input(std::slice::from_ref(&source));
+        let interception = Interceptor::enter(&mut input).unwrap().unwrap();
+        source.borrow_mut().held.insert(KeyCode::KEY_A.0);
+        source
+            .borrow_mut()
+            .events
+            .push(InputEvent::new(EventType::KEY.0, KeyCode::KEY_A.0, 1));
+        source
+            .borrow()
+            .events
+            .sender
+            .as_ref()
+            .unwrap()
+            .shutdown(ShutdownReason::Restart)
+            .unwrap();
+        assert!(crate::lifecycle::is_control_interrupt(
+            &interception.finish().unwrap_err()
+        ));
+        assert!(!source.borrow().is_grabbed);
+        assert!(source.borrow().held.contains(&KeyCode::KEY_A.0));
+        assert_eq!(
+            input.wait_for_resume().unwrap(),
+            Some(ShutdownReason::Restart)
+        );
+    }
+
+    #[test]
+    fn restart_wait_ignores_keys_and_release_does_not_resume_processing() {
+        let (mut input, sender) = channel_input();
+        press(&mut input, KeyCode::KEY_A);
+        let now = Instant::now();
+        input.devices_changed(now);
+        let Lifecycle::PreparingForRestart(deadline) = input.lifecycle else {
+            unreachable!()
+        };
+        input.lifecycle = Lifecycle::WaitingForRestart(deadline);
+        let lifecycle = input.lifecycle;
+        for key in [KeyCode::KEY_A, KeyCode::KEY_PAUSE] {
+            for value in [0, 1, 2, 0] {
+                input
+                    .process_message(
+                        InputEventMessage::Keyboard(
+                            0,
+                            InputEvent::new(EventType::KEY.0, key.0, value),
+                        ),
+                        None,
+                    )
+                    .unwrap();
+            }
+        }
+        assert!(input.latest_word().is_none());
+        assert!(input.pending.is_none());
+        assert_eq!(input.lifecycle, lifecycle);
+        sender.shutdown(ShutdownReason::Restart).unwrap();
+        assert_eq!(
+            input.wait_for_resume().unwrap(),
+            Some(ShutdownReason::Restart)
+        );
+    }
+
+    #[test]
+    fn expired_restart_wait_restarts_once_and_queued_quit_takes_priority() {
+        for is_stopping in [false, true] {
+            let (mut input, sender) = channel_input();
+            input.lifecycle = Lifecycle::PreparingForRestart(Instant::now());
+            if is_stopping {
+                sender.shutdown(ShutdownReason::Stop).unwrap();
+            }
+            let reason = if is_stopping {
+                ShutdownReason::Stop
+            } else {
+                ShutdownReason::Restart
+            };
+            assert_eq!(input.wait_for_resume().unwrap(), Some(reason));
+        }
     }
 
     #[test]
@@ -1804,9 +1968,6 @@ patterns = ['^\.тф']
         let source = Rc::new(RefCell::new(SimulatedKeyboard::default()));
         let mut input = simulated_input(std::slice::from_ref(&source));
         input.pending = None;
-        input.pointers.push(Pointer {
-            path: PathBuf::from("pointer"),
-        });
         source.borrow_mut().events.extend([
             InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTSHIFT.0, 1),
             InputEvent::new(EventType::KEY.0, KeyCode::KEY_PAUSE.0, 1),
@@ -1818,7 +1979,7 @@ patterns = ['^\.тф']
             .sender
             .as_ref()
             .unwrap()
-            .send(InputEventMessage::Pointer(
+            .send(InputEventMessage::Keyboard(
                 0,
                 InputEvent::new(EventType::RELATIVE.0, 0, 1),
             ));
@@ -1842,19 +2003,16 @@ patterns = ['^\.тф']
     }
 
     #[test]
-    fn discovery_propagates_pointer_event_loss() {
+    fn discovery_propagates_keyboard_event_loss() {
         let source = Rc::new(RefCell::new(SimulatedKeyboard::default()));
         let mut input = simulated_input(std::slice::from_ref(&source));
-        input.pointers.push(Pointer {
-            path: PathBuf::from("pointer"),
-        });
         source
             .borrow()
             .events
             .sender
             .as_ref()
             .unwrap()
-            .send(InputEventMessage::Pointer(
+            .send(InputEventMessage::Keyboard(
                 0,
                 InputEvent::new(
                     EventType::SYNCHRONIZATION.0,

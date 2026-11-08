@@ -6,6 +6,7 @@ mod input;
 mod input_events;
 mod kde;
 mod layout;
+mod lifecycle;
 pub mod output;
 mod sound;
 mod statistics;
@@ -15,6 +16,7 @@ mod tray;
 mod word;
 mod xkb;
 
+use lifecycle::{RESTART_EXIT_CODE, ShutdownReason};
 use std::io;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -22,24 +24,25 @@ use switcher::Switcher;
 
 const KEYBOARD_DISCOVERY_DELAY: Duration = Duration::from_millis(500);
 
-fn run() -> io::Result<()> {
+fn run() -> io::Result<ShutdownReason> {
+    let (sender, events) = input_events::InputEvents::new();
+    lifecycle::start_signals(sender.clone())?;
     let (config, auto_switch) = match prepare_configuration() {
         Ok(prepared) => prepared,
         Err(error) => {
             log::error!("true-switcher: {error}");
-            return tray::Tray::run_error(error);
+            return tray::Tray::run_error(error, sender, events);
         }
     };
 
     log::set_max_level(config.log_level);
-    let _tray = tray::Tray::start()?;
+    let _tray = tray::Tray::start(sender.clone())?;
 
     let desktop = kde::KdePlasma::new()?;
     let keyboard = output::KeyboardOutput::new()?;
     let statistics = statistics::Statistics::start();
     let sound = sound::Sound::start(config.manual_switch_sound || config.auto_switch_sound);
 
-    let (sender, events) = input_events::InputEvents::new();
     let _focus_service = focus::FocusService::start(sender.clone())?;
     let layouts = kde::LayoutTracker::start(sender.clone());
 
@@ -59,8 +62,11 @@ fn run() -> io::Result<()> {
         layouts,
     };
 
-    input.wait_for_keyboard_discovery(KEYBOARD_DISCOVERY_DELAY)?;
-    log::info!("Ready");
+    match input.wait_for_keyboard_discovery(KEYBOARD_DISCOVERY_DELAY) {
+        Ok(()) => log::info!("Ready"),
+        Err(error) if lifecycle::is_control_interrupt(&error) => {}
+        Err(error) => return Err(error),
+    }
 
     switcher.process_requests(&mut input, &config)
 }
@@ -80,7 +86,13 @@ fn main() -> ExitCode {
         .init();
     log::set_max_level(log::LevelFilter::Info);
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(ShutdownReason::Stop) => ExitCode::SUCCESS,
+        Ok(ShutdownReason::Restart) => {
+            log::info!(
+                "Restart requested; exiting with status {RESTART_EXIT_CODE}. Automatic restart requires systemd"
+            );
+            ExitCode::from(RESTART_EXIT_CODE)
+        }
         Err(error) if error.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
         Err(error) => {
             log::error!("true-switcher: {error}");

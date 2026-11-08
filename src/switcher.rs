@@ -1,3 +1,4 @@
+use crate::lifecycle::{ShutdownReason, is_control_interrupt};
 use crate::{config, input, kde, layout, output, sound, statistics, word};
 use std::io;
 use std::sync::Arc;
@@ -63,24 +64,39 @@ impl Switcher {
         &mut self,
         input: &mut input::Input,
         config: &config::Configuration,
-    ) -> io::Result<()> {
+    ) -> io::Result<ShutdownReason> {
         loop {
-            input.wait_for_switch_request()?;
-
-            let Some(mut interception) = input::Interceptor::enter(input)? else {
-                continue;
-            };
-
-            if let Some(correction) = Correction::from_input(
-                interception.input(),
-                config.auto_switch_sound,
-                config.manual_switch_sound,
-            ) {
-                self.correct(&mut interception, &correction)?;
+            if let Some(reason) = input.wait_for_resume()? {
+                return Ok(reason);
             }
-
-            interception.finish()?;
+            match self.process_request(input, config) {
+                Err(error) if is_control_interrupt(&error) => continue,
+                Err(error) => return Err(error),
+                Ok(()) => {}
+            }
         }
+    }
+
+    fn process_request(
+        &mut self,
+        input: &mut input::Input,
+        config: &config::Configuration,
+    ) -> io::Result<()> {
+        input.wait_for_switch_request()?;
+
+        let Some(mut interception) = input::Interceptor::enter(input)? else {
+            return Ok(());
+        };
+
+        if let Some(correction) = Correction::from_input(
+            interception.input(),
+            config.auto_switch_sound,
+            config.manual_switch_sound,
+        ) {
+            self.correct(&mut interception, &correction)?;
+        }
+
+        interception.finish()
     }
 
     fn correct(

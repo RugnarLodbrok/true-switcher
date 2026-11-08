@@ -4,8 +4,10 @@ use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use crate::input_events::{InputEventMessage, InputEventSender, InputEvents};
+use crate::lifecycle::ShutdownReason;
 use zbus::blocking::{Connection, Proxy, fdo::DBusProxy};
 use zbus::zvariant::{ObjectPath, OwnedValue};
 
@@ -30,23 +32,30 @@ type Pixmaps = Vec<(i32, i32, Vec<u8>)>;
 pub struct Tray;
 
 impl Tray {
-    pub fn start() -> io::Result<Self> {
+    pub fn start(sender: InputEventSender) -> io::Result<Self> {
         thread::Builder::new()
             .name("system-tray".into())
-            .spawn(maintain)?;
+            .spawn(move || maintain(sender))?;
         Ok(Self)
     }
 
-    pub fn run_error(error: String) -> io::Result<()> {
+    pub fn run_error(
+        error: String,
+        sender: InputEventSender,
+        events: InputEvents,
+    ) -> io::Result<ShutdownReason> {
         let connection = Connection::session().map_err(io::Error::other)?;
-        export(&connection, menu::Menu::new(), Some(error.clone())).map_err(io::Error::other)?;
+        export(&connection, menu::Menu::new(sender), Some(error.clone()))
+            .map_err(io::Error::other)?;
         let mut owner = None;
         register(&connection, &mut owner)
             .map_err(|error| io::Error::other(format!("tray registration: {error}")))?;
         notify(&connection, "Configuration error", &error)
             .map_err(|error| io::Error::other(format!("notification: {error}")))?;
         loop {
-            thread::sleep(RETRY_DELAY);
+            if let Some(reason) = wait_for_shutdown(&events, Instant::now() + RETRY_DELAY)? {
+                return Ok(reason);
+            }
             register(&connection, &mut owner)
                 .map_err(|error| io::Error::other(format!("tray registration: {error}")))?;
             DBusProxy::new(&connection)
@@ -67,10 +76,24 @@ fn export(connection: &Connection, menu: menu::Menu, error: Option<String>) -> z
     Ok(())
 }
 
-fn maintain() {
+fn wait_for_shutdown(
+    events: &InputEvents,
+    deadline: Instant,
+) -> io::Result<Option<ShutdownReason>> {
+    while let Some(event) = events.wait(Some(deadline))? {
+        match event {
+            InputEventMessage::Shutdown(reason) => return Ok(Some(reason)),
+            InputEventMessage::DeviceError(error) => return Err(error),
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
+fn maintain(sender: InputEventSender) {
     let mut delay = RETRY_DELAY;
     loop {
-        match maintain_connection(&mut delay) {
+        match maintain_connection(&mut delay, &sender) {
             Ok(()) => delay = RETRY_DELAY,
             Err(error) => {
                 log::warn!("true-switcher: tray registration: {error}");
@@ -81,9 +104,9 @@ fn maintain() {
     }
 }
 
-fn maintain_connection(delay: &mut Duration) -> zbus::Result<()> {
+fn maintain_connection(delay: &mut Duration, sender: &InputEventSender) -> zbus::Result<()> {
     let connection = Connection::session()?;
-    export(&connection, menu::Menu::new(), None)?;
+    export(&connection, menu::Menu::new(sender.clone()), None)?;
     let mut owner = None;
     loop {
         register(&connection, &mut owner)?;

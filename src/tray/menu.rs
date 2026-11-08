@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 use std::io;
-use std::process::Command;
 use std::sync::Arc;
 use std::thread;
 
+use crate::input_events::InputEventSender;
+use crate::lifecycle::ShutdownReason;
 use zbus::zvariant::{OwnedValue, Str, Value};
 
 const ROOT_ID: i32 = 0;
@@ -11,7 +12,6 @@ const RELOAD_ID: i32 = 1;
 const QUIT_ID: i32 = 2;
 const REVISION: u32 = 1;
 const PROTOCOL_VERSION: u32 = 3;
-const SERVICE: &str = "true-switcher.service";
 const CLICKED: &str = "clicked";
 
 type Properties = HashMap<String, OwnedValue>;
@@ -25,10 +25,11 @@ pub(super) struct Menu {
 }
 
 impl Menu {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(sender: InputEventSender) -> Self {
+        let restart = sender.clone();
         Self {
-            restart: Arc::new(restart_service),
-            stop: Arc::new(stop_service),
+            restart: Arc::new(move || restart.shutdown(ShutdownReason::Restart)),
+            stop: Arc::new(move || sender.shutdown(ShutdownReason::Stop)),
         }
     }
 
@@ -52,7 +53,7 @@ impl Menu {
                 .name(format!("tray-{verb}"))
                 .spawn(move || {
                     if let Err(error) = action() {
-                        let body = format!("Cannot {verb} {SERVICE}: {error}");
+                        let body = format!("Cannot {verb} True Switcher: {error}");
                         log::warn!("true-switcher: {body}");
                         let _ = super::notify(&connection.into(), title, &body);
                     }
@@ -60,29 +61,6 @@ impl Menu {
                 .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
         }
         Ok(())
-    }
-}
-
-fn restart_service() -> io::Result<()> {
-    control_service("restart")
-}
-
-fn stop_service() -> io::Result<()> {
-    control_service("stop")
-}
-
-fn control_service(verb: &str) -> io::Result<()> {
-    let output = Command::new("systemctl")
-        .args(["--system", "--no-block", verb, SERVICE])
-        .output()?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
-            "{}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )))
     }
 }
 

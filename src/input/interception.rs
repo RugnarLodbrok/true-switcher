@@ -127,6 +127,10 @@ impl<'a> Interceptor<'a> {
         self.input.process_available_events(Some(&mut self.state))
     }
 
+    fn process_cleanup_events(&mut self) -> io::Result<()> {
+        self.input.process_cleanup_events(Some(&mut self.state))
+    }
+
     pub fn finish(mut self) -> io::Result<()> {
         self.phase = Phase::Finishing;
         self.wait_releases()?;
@@ -218,7 +222,7 @@ impl<'a> Interceptor<'a> {
         let mut error = None;
         for (stage, result) in [
             ("prepare", self.prepare_repair()),
-            ("events", self.process_available_events()),
+            ("events", self.process_cleanup_events()),
             ("ungrab", self.input.ungrab()),
             ("release", self.repair_releases()),
             ("locks", self.release_locks()),
@@ -235,7 +239,7 @@ impl<'a> Interceptor<'a> {
         if self.state.recording.is_none() {
             return;
         }
-        Self::log_cleanup("events", self.process_available_events());
+        Self::log_cleanup("events", self.process_cleanup_events());
         Self::log_cleanup("snapshot", self.input.snapshot(Some(&mut self.state)));
         self.state
             .repair

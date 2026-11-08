@@ -1167,6 +1167,7 @@ dependencies = [
  "libpulse-binding",
  "libpulse-simple-binding",
  "log",
+ "nix",
  "regex",
  "rusqlite",
  "serde",

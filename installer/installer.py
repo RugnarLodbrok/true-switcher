@@ -140,6 +140,7 @@ Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{os.getuid()}/bus
 Environment=XDG_RUNTIME_DIR=/run/user/{os.getuid()}
 Environment=PATH={SYSTEM_PATH}
 ExecStart={BINARY}
+RestartForceExitStatus=75
 '''
     session = f'''[Unit]
 Description=True Switcher graphical session

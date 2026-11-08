@@ -69,6 +69,12 @@ class QdbusTests(unittest.TestCase):
 
 
 class TrayInstallationTests(unittest.TestCase):
+    def test_only_explicit_restart_exit_status_forces_restart(self) -> None:
+        system, *_ = installer._contents()
+        self.assertIn('\nRestartForceExitStatus=75\n', system)
+        self.assertNotIn('\nRestart=always\n', system)
+        self.assertNotIn('\nRestart=on-success\n', system)
+
     def test_installs_icon_with_service_files(self) -> None:
         with patch.object(installer, '_preflight', return_value=False), \
                 patch.object(installer, '_ensure_user_config'), \

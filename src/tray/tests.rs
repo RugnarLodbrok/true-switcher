@@ -70,7 +70,8 @@ impl Watcher {
 fn registers_when_watcher_appears_and_after_it_is_replaced() {
     let bus = TestBus::start();
     let tray = bus.connect();
-    export(&tray, menu::Menu::new(), None).unwrap();
+    let (sender, _events) = InputEvents::new();
+    export(&tray, menu::Menu::new(sender), None).unwrap();
     let mut owner = None;
     assert!(register(&tray, &mut owner).is_err());
     let (watcher, registrations) = bus.watcher();
@@ -163,7 +164,8 @@ fn error_item_exposes_error_icon_and_details() {
     let bus = TestBus::start();
     let tray = bus.connect();
     let error = "Invalid switch_key";
-    export(&tray, menu::Menu::new(), Some(error.into())).unwrap();
+    let (sender, _events) = InputEvents::new();
+    export(&tray, menu::Menu::new(sender), Some(error.into())).unwrap();
     let client = bus.connect();
     let item = Proxy::new(
         &client,
@@ -188,6 +190,22 @@ fn error_item_exposes_error_icon_and_details() {
 }
 
 struct Notifications(mpsc::Sender<(String, String)>);
+
+#[test]
+fn menu_requests_shutdown_and_error_mode_receives_the_same_reasons() {
+    let (sender, events) = InputEvents::new();
+    let menu = menu::Menu::new(sender);
+    (menu.restart)().unwrap();
+    assert_eq!(
+        wait_for_shutdown(&events, Instant::now() + TEST_TIMEOUT).unwrap(),
+        Some(ShutdownReason::Restart)
+    );
+    (menu.stop)().unwrap();
+    assert_eq!(
+        wait_for_shutdown(&events, Instant::now() + TEST_TIMEOUT).unwrap(),
+        Some(ShutdownReason::Stop)
+    );
+}
 
 #[zbus::interface(name = "org.freedesktop.Notifications")]
 impl Notifications {
