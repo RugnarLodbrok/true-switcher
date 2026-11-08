@@ -71,6 +71,7 @@ class QdbusTests(unittest.TestCase):
 class TrayInstallationTests(unittest.TestCase):
     def test_only_explicit_restart_exit_status_forces_restart(self) -> None:
         system, *_ = installer._contents()
+        self.assertIn('\nSuccessExitStatus=75\n', system)
         self.assertIn('\nRestartForceExitStatus=75\n', system)
         self.assertNotIn('\nRestart=always\n', system)
         self.assertNotIn('\nRestart=on-success\n', system)
