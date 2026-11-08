@@ -376,6 +376,10 @@ impl Input {
                 self.accept_layout(layout.clone(), true);
                 if result.is_ok() && !self.is_correction_cancelled {
                     self.set_latest_layout(layout);
+                    if !self.is_auto_request {
+                        self.history.block_auto_switch();
+                        self.automatic_target = None;
+                    }
                 } else {
                     self.accept_layout(layout, false);
                     self.reset_history();
@@ -537,15 +541,13 @@ impl Input {
             && crate::history::is_text_key(key)
             && !self.has_shortcut_modifier()
             && (self.pending.is_none() || self.is_auto_request)
+            && !self.history.is_auto_switch_blocked()
         {
-            self.automatic_target = self
-                .history
-                .latest_word()
-                .and_then(|word| {
-                    self.layout
-                        .as_ref()
-                        .and_then(|layout| self.auto_switch.target(word, layout))
-                });
+            self.automatic_target = self.history.latest_word().and_then(|word| {
+                self.layout
+                    .as_ref()
+                    .and_then(|layout| self.auto_switch.target(word, layout))
+            });
             if self.automatic_target.is_some() {
                 self.pending = Some(index);
                 self.is_auto_request = true;
@@ -1310,6 +1312,7 @@ patterns = ['^\.тф']
         );
         interception.finish().unwrap();
         assert_eq!(input.latest_word().unwrap().text().as_deref(), Ok("ф"));
+        assert!(input.history.is_auto_switch_blocked());
     }
 
     #[test]
@@ -1345,6 +1348,7 @@ patterns = ['^\.тф']
         assert!(interception.wait_for_correction().unwrap().unwrap().is_ok());
         assert!(interception.input().latest_word().is_none());
         interception.finish().unwrap();
+        assert!(!input.history.is_auto_switch_blocked());
         press(&mut input, KeyCode::KEY_B);
         assert_eq!(input.latest_word().unwrap().text().as_deref(), Ok("и"));
     }
@@ -1600,6 +1604,129 @@ patterns = ['^\.тф']
     }
 
     #[test]
+    fn manual_correction_blocks_auto_switch_while_editing_the_word() {
+        let mut input = auto_input();
+        press(&mut input, KeyCode::KEY_SLASH);
+        complete_manual_correction(&mut input, "us");
+        press(&mut input, KeyCode::KEY_N);
+        press(&mut input, KeyCode::KEY_A);
+        assert!(input.pending.is_none());
+        assert!(input.automatic_target().is_none());
+        press(&mut input, KeyCode::KEY_BACKSPACE);
+        press(&mut input, KeyCode::KEY_A);
+        assert!(input.pending.is_none());
+        assert!(input.history.is_auto_switch_blocked());
+
+        complete_manual_correction(&mut input, "ru");
+        assert!(input.history.is_auto_switch_blocked());
+        assert_eq!(input.latest_word().unwrap().text().as_deref(), Ok(".тф"));
+    }
+
+    fn complete_manual_correction(input: &mut Input, target: &str) {
+        press(input, KeyCode::KEY_PAUSE);
+        assert!(input.pending.is_some());
+        assert!(!input.is_auto_request());
+        input.pending = None;
+        input
+            .process_message(
+                InputEventMessage::CorrectionFinished {
+                    result: Ok(()),
+                    layout: Some(layout(target)),
+                },
+                None,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn manual_correction_after_spaces_survives_erasing_spaces() {
+        let mut input = auto_input();
+        for key in [KeyCode::KEY_SLASH, KeyCode::KEY_SPACE, KeyCode::KEY_SPACE] {
+            press(&mut input, key);
+        }
+        complete_manual_correction(&mut input, "us");
+        for key in [
+            KeyCode::KEY_BACKSPACE,
+            KeyCode::KEY_BACKSPACE,
+            KeyCode::KEY_N,
+            KeyCode::KEY_A,
+        ] {
+            press(&mut input, key);
+        }
+        assert!(input.pending.is_none());
+        assert!(input.history.is_auto_switch_blocked());
+    }
+
+    #[test]
+    fn erasing_manual_word_allows_auto_switch_when_retyping_it() {
+        let mut input = auto_input();
+        press(&mut input, KeyCode::KEY_SLASH);
+        complete_manual_correction(&mut input, "us");
+        press(&mut input, KeyCode::KEY_BACKSPACE);
+        assert!(!input.history.is_auto_switch_blocked());
+        assert!(input.latest_word().is_none());
+        for key in [KeyCode::KEY_SLASH, KeyCode::KEY_N, KeyCode::KEY_A] {
+            press(&mut input, key);
+        }
+        assert_eq!(input.automatic_target().unwrap().name(), "ru");
+    }
+
+    #[test]
+    fn next_word_forgets_manual_override_even_after_returning_with_backspace() {
+        let mut input = auto_input();
+        press(&mut input, KeyCode::KEY_SLASH);
+        complete_manual_correction(&mut input, "us");
+        for key in [KeyCode::KEY_SPACE, KeyCode::KEY_B] {
+            press(&mut input, key);
+        }
+        assert!(!input.history.is_auto_switch_blocked());
+        for key in [
+            KeyCode::KEY_BACKSPACE,
+            KeyCode::KEY_BACKSPACE,
+            KeyCode::KEY_N,
+            KeyCode::KEY_A,
+        ] {
+            press(&mut input, key);
+        }
+        assert_eq!(input.automatic_target().unwrap().name(), "ru");
+    }
+
+    #[test]
+    fn context_reset_forgets_manual_override() {
+        for key in [KeyCode::KEY_ENTER, KeyCode::KEY_TAB, KeyCode::KEY_LEFT] {
+            let mut input = auto_input();
+            press(&mut input, KeyCode::KEY_SLASH);
+            complete_manual_correction(&mut input, "us");
+            press(&mut input, key);
+            assert!(!input.history.is_auto_switch_blocked());
+            for key in [KeyCode::KEY_SLASH, KeyCode::KEY_N, KeyCode::KEY_A] {
+                press(&mut input, key);
+            }
+            assert_eq!(input.automatic_target().unwrap().name(), "ru");
+        }
+    }
+
+    #[test]
+    fn failed_manual_correction_does_not_block_auto_switch() {
+        let mut input = auto_input();
+        press(&mut input, KeyCode::KEY_SLASH);
+        input
+            .process_message(
+                InputEventMessage::CorrectionFinished {
+                    result: Err(io::Error::other("switch failed")),
+                    layout: Some(layout("ru")),
+                },
+                None,
+            )
+            .unwrap();
+        assert!(!input.history.is_auto_switch_blocked());
+        for key in [KeyCode::KEY_SLASH, KeyCode::KEY_N] {
+            press(&mut input, key);
+        }
+        assert_eq!(input.automatic_target().unwrap().name(), "us");
+    }
+
+    #[test]
     fn auto_switches_before_separator_and_can_switch_same_word_again() {
         let mut input = auto_input();
         press(&mut input, KeyCode::KEY_SLASH);
@@ -1609,7 +1736,16 @@ patterns = ['^\.тф']
         let us = input.automatic_target().unwrap();
         assert_eq!(us.name(), "us");
         assert_eq!(input.latest_word().unwrap().text().as_deref(), Ok(".т"));
-        input.set_latest_layout(Some(us));
+        input
+            .process_message(
+                InputEventMessage::CorrectionFinished {
+                    result: Ok(()),
+                    layout: Some(us),
+                },
+                None,
+            )
+            .unwrap();
+        assert!(!input.history.is_auto_switch_blocked());
         input.pending = None;
         press(&mut input, KeyCode::KEY_A);
         assert_eq!(input.automatic_target().unwrap().name(), "ru");

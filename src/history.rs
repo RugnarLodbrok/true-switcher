@@ -6,6 +6,7 @@ use std::sync::Arc;
 #[derive(Default)]
 pub struct History {
     words: Vec<Word>,
+    is_auto_switch_blocked: bool,
 }
 
 impl History {
@@ -18,6 +19,14 @@ impl History {
 
     pub fn latest_word(&self) -> Option<&Word> {
         self.words.last()
+    }
+
+    pub fn block_auto_switch(&mut self) {
+        self.is_auto_switch_blocked = self.latest_word().is_some();
+    }
+
+    pub fn is_auto_switch_blocked(&self) -> bool {
+        self.is_auto_switch_blocked
     }
 
     pub fn set_latest_layout(&mut self, layout: Option<Arc<Layout>>) {
@@ -46,6 +55,7 @@ impl History {
                     .is_none_or(|word| word.trailing_spaces > 0)
                 {
                     self.words.push(Word::default());
+                    self.is_auto_switch_blocked = false;
                 }
                 self.words.last_mut().unwrap().entries.push(WordStroke {
                     stroke: Stroke {
@@ -60,6 +70,7 @@ impl History {
     }
 
     pub fn reset(&mut self) -> Vec<Word> {
+        self.is_auto_switch_blocked = false;
         if let Some(word) = self.words.last().filter(|word| word.trailing_spaces == 0) {
             log::trace!("{word}");
         }
@@ -78,6 +89,7 @@ impl History {
         word.entries.pop();
         if word.entries.is_empty() {
             self.words.pop();
+            self.is_auto_switch_blocked = false;
             if let Some(word) = self.words.last() {
                 log::trace!("{word}");
             } else {
