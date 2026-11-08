@@ -530,7 +530,7 @@ impl Input {
                 self.history.process(key, is_shift, self.layout.clone());
             }
         }
-        if matches!(value, 1 | 2) && (key == KeyCode::KEY_BACKSPACE || key == KeyCode::KEY_SPACE) {
+        if matches!(value, 1 | 2) && key == KeyCode::KEY_BACKSPACE {
             self.automatic_target = None;
         }
         if matches!(value, 1 | 2)
@@ -541,7 +541,6 @@ impl Input {
             self.automatic_target = self
                 .history
                 .latest_word()
-                .filter(|word| word.trailing_spaces == 0)
                 .and_then(|word| {
                     self.layout
                         .as_ref()
@@ -1618,10 +1617,31 @@ patterns = ['^\.тф']
     }
 
     #[test]
+    fn spaces_preserve_auto_switch_while_waiting_for_key_release() {
+        let mut input = auto_input();
+        press(&mut input, KeyCode::KEY_SLASH);
+        statistics_event(&mut input, KeyCode::KEY_SLASH, 0);
+        statistics_event(&mut input, KeyCode::KEY_N, 1);
+        for spaces in 1..=3 {
+            press(&mut input, KeyCode::KEY_SPACE);
+            statistics_event(&mut input, KeyCode::KEY_SPACE, 0);
+            assert!(input.is_ordinary_key_held());
+            assert_eq!(input.automatic_target().unwrap().name(), "us");
+            assert_eq!(input.latest_word().unwrap().trailing_spaces, spaces);
+        }
+        statistics_event(&mut input, KeyCode::KEY_N, 0);
+        assert!(!input.is_ordinary_key_held());
+        assert!(input.is_auto_request());
+        assert!(input.pending.is_some());
+        assert_eq!(input.automatic_target().unwrap().name(), "us");
+        press(&mut input, KeyCode::KEY_A);
+        assert!(input.automatic_target().is_none());
+    }
+
+    #[test]
     fn backspace_does_not_check_patterns_and_separators_cancel_pending_auto_switch() {
         for separator in [
             KeyCode::KEY_BACKSPACE,
-            KeyCode::KEY_SPACE,
             KeyCode::KEY_TAB,
             KeyCode::KEY_ENTER,
             KeyCode::KEY_LEFT,
