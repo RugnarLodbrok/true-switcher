@@ -102,14 +102,7 @@ mod tests {
     use super::*;
 
     fn press(history: &mut History, key: KeyCode) {
-        history.process(
-            key,
-            false,
-            Some(Arc::new(Layout {
-                name: "us".into(),
-                ..Default::default()
-            })),
-        );
+        history.process(key, false, Some(Arc::new(Layout::new("us", "", "", ""))));
     }
 
     #[test]
@@ -137,10 +130,7 @@ mod tests {
     fn backspace_restores_previous_word_with_its_layout_and_spaces() {
         let mut history = History::default();
         press(&mut history, KeyCode::KEY_A);
-        history.set_latest_layout(Some(Arc::new(Layout {
-            name: "ru".into(),
-            ..Default::default()
-        })));
+        history.set_latest_layout(Some(Arc::new(Layout::new("ru", "", "", ""))));
         press(&mut history, KeyCode::KEY_SPACE);
         press(&mut history, KeyCode::KEY_SPACE);
         press(&mut history, KeyCode::KEY_B);
@@ -177,18 +167,12 @@ mod tests {
         history.process(
             KeyCode::KEY_A,
             true,
-            Some(Arc::new(Layout {
-                name: "us".into(),
-                ..Default::default()
-            })),
+            Some(Arc::new(Layout::new("us", "", "", ""))),
         );
         history.process(
             KeyCode::KEY_B,
             false,
-            Some(Arc::new(Layout {
-                name: "ru".into(),
-                ..Default::default()
-            })),
+            Some(Arc::new(Layout::new("ru", "", "", ""))),
         );
         assert_eq!(history.latest_word().unwrap().text().as_deref(), Ok("Aи"));
         history.process(KeyCode::KEY_C, false, None);
@@ -198,10 +182,7 @@ mod tests {
         ));
         press(&mut history, KeyCode::KEY_BACKSPACE);
         assert_eq!(history.latest_word().unwrap().text().as_deref(), Ok("Aи"));
-        history.set_latest_layout(Some(Arc::new(Layout {
-            name: "us".into(),
-            ..Default::default()
-        })));
+        history.set_latest_layout(Some(Arc::new(Layout::new("us", "", "", ""))));
         assert_eq!(history.latest_word().unwrap().text().as_deref(), Ok("Ab"));
     }
 }

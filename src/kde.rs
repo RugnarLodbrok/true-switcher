@@ -296,16 +296,15 @@ fn configured_layout(contents: &str, index: usize, name: &str) -> Option<Layout>
     if layout != name || layout.is_empty() {
         return None;
     }
-    Some(Layout {
-        name: layout.into(),
-        variant: values
+    Some(Layout::new(
+        layout,
+        values
             .get("VariantList")
             .and_then(|value| value.split(',').nth(index))
-            .unwrap_or_default()
-            .into(),
-        model: values.get("Model").copied().unwrap_or("pc104").into(),
-        options: values.get("Options").copied().unwrap_or_default().into(),
-    })
+            .unwrap_or_default(),
+        values.get("Model").copied().unwrap_or("pc104"),
+        values.get("Options").copied().unwrap_or_default(),
+    ))
 }
 
 const QDBUS_NAMES: [&str; 3] = ["qdbus-qt6", "qdbus6", "qdbus"];

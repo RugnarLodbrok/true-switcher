@@ -1,4 +1,4 @@
-use std::{env, fmt, fs, io, path::PathBuf};
+use std::{cell::RefCell, collections::HashMap, env, fmt, fs, io, path::PathBuf};
 
 use evdev::KeyCode;
 use xkbcommon::xkb;
@@ -9,6 +9,16 @@ const EVDEV_KEYCODE_OFFSET: u32 = 8;
 const XKB_DIRECTORY: &str = "/usr/share/X11/xkb";
 const XKB_LAYOUT_REGISTRY: &str = "rules/evdev.lst";
 const XKB_RULES: &str = "evdev";
+
+thread_local! {
+    static KEYMAPS: RefCell<HashMap<Layout, xkb::Keymap>> = RefCell::new(HashMap::new());
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static CONVERSIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static COMPILATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 #[cfg(test)]
 mod tests;
@@ -44,17 +54,21 @@ pub fn to_text<'a>(
     layout: &Layout,
     strokes: impl IntoIterator<Item = &'a Stroke>,
 ) -> Result<String, ConversionError> {
+    #[cfg(test)]
+    CONVERSIONS.with(|count| count.set(count.get() + 1));
     convert(layout, strokes).inspect_err(|error| {
         log::error!("true-switcher: text conversion: {error}; layout={layout:?}");
     })
 }
 
 fn compile_keymap(layout: &Layout) -> Result<xkb::Keymap, ConversionError> {
+    #[cfg(test)]
+    COMPILATIONS.with(|count| count.set(count.get() + 1));
     for (field, value) in [
-        ("name", &layout.name),
-        ("variant", &layout.variant),
-        ("model", &layout.model),
-        ("options", &layout.options),
+        ("name", layout.name()),
+        ("variant", layout.variant()),
+        ("model", layout.model()),
+        ("options", layout.options()),
     ] {
         if value.contains('\0') {
             return Err(ConversionError::InvalidParameter { field });
@@ -64,10 +78,10 @@ fn compile_keymap(layout: &Layout) -> Result<xkb::Keymap, ConversionError> {
     xkb::Keymap::new_from_names(
         &context,
         XKB_RULES,
-        &layout.model,
-        &layout.name,
-        &layout.variant,
-        Some(layout.options.clone()),
+        layout.model(),
+        layout.name(),
+        layout.variant(),
+        Some(layout.options().to_owned()),
         xkb::KEYMAP_COMPILE_NO_FLAGS,
     )
     .ok_or(ConversionError::KeymapCompilationFailed)
@@ -87,9 +101,21 @@ fn convert<'a>(
     layout: &Layout,
     strokes: impl IntoIterator<Item = &'a Stroke>,
 ) -> Result<String, ConversionError> {
-    let keymap = compile_keymap(layout)?;
+    KEYMAPS.with(|maps| {
+        let mut maps = maps.borrow_mut();
+        if !maps.contains_key(layout) {
+            maps.insert(layout.clone(), compile_keymap(layout)?);
+        }
+        convert_with_keymap(&maps[layout], strokes)
+    })
+}
+
+fn convert_with_keymap<'a>(
+    keymap: &xkb::Keymap,
+    strokes: impl IntoIterator<Item = &'a Stroke>,
+) -> Result<String, ConversionError> {
     let shift_index = keymap.mod_get_index(xkb::MOD_NAME_SHIFT);
-    let mut state = xkb::State::new(&keymap);
+    let mut state = xkb::State::new(keymap);
     let mut text = String::new();
     for stroke in strokes {
         state.update_mask(shift_mask(stroke, shift_index)?, 0, 0, 0, 0, 0);

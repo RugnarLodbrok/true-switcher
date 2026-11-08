@@ -9,6 +9,10 @@ default-run = "true-switcher"
 name = "learn"
 path = "src-learn/main.rs"
 
+[[bin]]
+name = "learn-xkb-threads"
+path = "src-learn/xkb_threads.rs"
+
 [dependencies]
 env_logger = "0.11"
 evdev = "0.13.2"

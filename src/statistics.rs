@@ -383,10 +383,7 @@ mod tests {
     }
 
     fn layout(name: &str) -> Arc<Layout> {
-        Arc::new(Layout {
-            name: name.into(),
-            ..Layout::default()
-        })
+        Arc::new(Layout::new(name, "", "", ""))
     }
 
     fn word(name: &str) -> Word {
@@ -605,11 +602,7 @@ mod tests {
     fn conversion_error_discards_typing_and_switch_records_in_full() {
         let mut original = word("us");
         original.entries[1].stroke.key = KeyCode::KEY_APOSTROPHE;
-        let target = Arc::new(Layout {
-            name: "us".into(),
-            variant: "intl".into(),
-            ..Default::default()
-        });
+        let target = Arc::new(Layout::new("us", "intl", "", ""));
         assert!(make_record(None, Some(&original), &target, UNIX_EPOCH).is_none());
         original.entries[1].layout = Some(target);
         assert!(make_record(None, Some(&original), &layout("ru"), UNIX_EPOCH).is_none());

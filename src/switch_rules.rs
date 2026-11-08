@@ -1,5 +1,5 @@
-use std::io;
 use std::sync::Arc;
+use std::{collections::HashMap, io};
 
 use regex::RegexSet;
 
@@ -41,12 +41,17 @@ impl AutoSwitchRules {
     }
 
     pub fn target(&self, word: &Word, current: &Layout) -> Option<Arc<Layout>> {
+        let mut conversions = HashMap::new();
         self.rules.iter().find_map(|rule| {
-            if rule.target.name == current.name {
+            if rule.target.name() == current.name() {
                 return None;
             }
-            let text = rule.target.to_text(word.strokes()).ok()?;
-            rule.patterns.is_match(&text).then(|| rule.target.clone())
+            let text = conversions
+                .entry(rule.target.as_ref())
+                .or_insert_with(|| rule.target.to_text(word.strokes()));
+            rule.patterns
+                .is_match(text.as_ref().ok()?)
+                .then(|| rule.target.clone())
         })
     }
 }
@@ -62,10 +67,7 @@ mod tests {
     }
 
     fn resolve(name: &str) -> io::Result<Arc<Layout>> {
-        Ok(Arc::new(Layout {
-            name: name.into(),
-            ..Default::default()
-        }))
+        Ok(Arc::new(Layout::new(name, "", "", "")))
     }
 
     fn word(keys: &[KeyCode]) -> Word {
@@ -93,23 +95,52 @@ mod tests {
     }
 
     #[test]
+    fn reuses_successes_and_errors_only_within_one_target_call() {
+        let bad = Arc::new(Layout::new(
+            "us",
+            "invalid-variant-for-true-switcher",
+            "",
+            "",
+        ));
+        let good = resolve("gb").unwrap();
+        let rules = AutoSwitchRules {
+            rules: [
+                (bad.clone(), "a"),
+                (bad, "a"),
+                (good.clone(), "z"),
+                (good, "a"),
+            ]
+            .into_iter()
+            .map(|(target, pattern)| CompiledRule {
+                target,
+                patterns: RegexSet::new([pattern]).unwrap(),
+            })
+            .collect(),
+        };
+        let word = word(&[KeyCode::KEY_A]);
+        let current = resolve("ru").unwrap();
+        crate::xkb::CONVERSIONS.with(|count| count.set(0));
+        for expected in [2, 4] {
+            assert_eq!(rules.target(&word, &current).unwrap().name(), "gb");
+            assert_eq!(crate::xkb::CONVERSIONS.with(|count| count.get()), expected);
+        }
+    }
+
+    #[test]
     fn conversion_failure_continues_rules_without_using_partial_text() {
         let settings = parse_config("auto_switch = true\n[[switch_rules]]\ntarget = 'us'\npatterns = ['^a']\n[[switch_rules]]\ntarget = 'gb'\npatterns = ['^a']\n[[switch_rules]]\ntarget = 'ru'\npatterns = ['^ф']").unwrap();
         let switch = AutoSwitchRules::compile(&settings, |name| {
-            Ok(Arc::new(Layout {
-                name: name.into(),
-                variant: if name == "us" {
-                    "intl".into()
-                } else {
-                    String::new()
-                },
-                ..Default::default()
-            }))
+            Ok(Arc::new(Layout::new(
+                name,
+                if name == "us" { "intl" } else { "" },
+                "",
+                "",
+            )))
         })
         .unwrap();
         let word = word(&[KeyCode::KEY_A, KeyCode::KEY_APOSTROPHE]);
         let current = resolve("de").unwrap();
-        assert_eq!(switch.target(&word, &current).unwrap().name, "gb");
+        assert_eq!(switch.target(&word, &current).unwrap().name(), "gb");
     }
 
     #[test]
@@ -118,16 +149,16 @@ mod tests {
         let switch = AutoSwitchRules::compile(&settings, resolve).unwrap();
         let ru = resolve("ru").unwrap();
         let prefix = word(&[KeyCode::KEY_SLASH, KeyCode::KEY_N]);
-        assert_eq!(switch.target(&prefix, &ru).unwrap().name, "us");
+        assert_eq!(switch.target(&prefix, &ru).unwrap().name(), "us");
         assert_eq!(
             switch
                 .target(&prefix, &resolve("us").unwrap())
                 .unwrap()
-                .name,
+                .name(),
             "gb"
         );
         let embedded = word(&[KeyCode::KEY_A, KeyCode::KEY_SLASH, KeyCode::KEY_N]);
-        assert_eq!(switch.target(&embedded, &ru).unwrap().name, "gb");
+        assert_eq!(switch.target(&embedded, &ru).unwrap().name(), "gb");
         assert!(switch.target(&word(&[KeyCode::KEY_SLASH]), &ru).is_none());
     }
 }

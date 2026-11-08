@@ -150,7 +150,7 @@ fn correct_word(
     }
     switch_and_replay(
         || match &correction.target {
-            Some(target) => desktop.switch_to_layout(&target.name),
+            Some(target) => desktop.switch_to_layout(target.name()),
             None => desktop.switch_to_next_layout(),
         },
         || {

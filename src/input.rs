@@ -1188,18 +1188,12 @@ patterns = ['^\.тф']
         )
         .unwrap();
         let switch = crate::switch_rules::AutoSwitchRules::compile(&settings, |name| {
-            Ok(Arc::new(crate::layout::Layout {
-                name: name.into(),
-                ..Default::default()
-            }))
+            Ok(Arc::new(crate::layout::Layout::new(name, "", "", "")))
         })
         .unwrap();
         input.auto_switch = switch;
         input.accept_layout(
-            Some(Arc::new(crate::layout::Layout {
-                name: "ru".into(),
-                ..Default::default()
-            })),
+            Some(Arc::new(crate::layout::Layout::new("ru", "", "", ""))),
             false,
         );
         input
@@ -1218,10 +1212,7 @@ patterns = ['^\.тф']
     }
 
     fn layout(name: &str) -> Arc<crate::layout::Layout> {
-        Arc::new(crate::layout::Layout {
-            name: name.into(),
-            ..Default::default()
-        })
+        Arc::new(crate::layout::Layout::new(name, "", "", ""))
     }
 
     fn channel_input() -> (Input, InputEventSender) {
@@ -1622,12 +1613,12 @@ patterns = ['^\.тф']
         press(&mut input, KeyCode::KEY_N);
         assert!(input.is_auto_request());
         let us = input.automatic_target().unwrap();
-        assert_eq!(us.name, "us");
+        assert_eq!(us.name(), "us");
         assert_eq!(input.latest_word().unwrap().text().as_deref(), Ok(".т"));
         input.set_latest_layout(Some(us));
         input.pending = None;
         press(&mut input, KeyCode::KEY_A);
-        assert_eq!(input.automatic_target().unwrap().name, "ru");
+        assert_eq!(input.automatic_target().unwrap().name(), "ru");
         assert_eq!(input.latest_word().unwrap().text().as_deref(), Ok("/na"));
     }
 

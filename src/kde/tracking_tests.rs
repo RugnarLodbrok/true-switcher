@@ -17,7 +17,7 @@ fn uses_first_duplicate_layout_with_its_configured_variant() {
     ];
     let contents = "[Layout]\nLayoutList=ru,ru\nVariantList=phonetic,\n";
     assert_eq!(
-        configured_target(&names, contents, "ru").unwrap().variant,
+        configured_target(&names, contents, "ru").unwrap().variant(),
         "phonetic"
     );
     assert!(configured_target(&names, contents, "us").is_err());
@@ -27,7 +27,7 @@ fn uses_first_duplicate_layout_with_its_configured_variant() {
 #[ignore = "requires a running KDE session and its kxkbrc"]
 fn reads_running_kde_layout() {
     let layout = current_layout().expect("read layout from the running KDE session");
-    assert!(!layout.name.is_empty());
+    assert!(!layout.name().is_empty());
     assert!(layout.to_text(&strokes()).is_ok());
 }
 
@@ -45,15 +45,15 @@ fn strokes() -> Vec<Stroke> {
 #[test]
 fn configuration_preserves_variant_model_and_options_and_rejects_mismatch() {
     let layout = configured_layout(CONFIG, 1, "ru").unwrap();
-    assert_eq!(layout.name, "ru");
-    assert_eq!(layout.variant, "phonetic");
-    assert_eq!(layout.model, "pc105");
+    assert_eq!(layout.name(), "ru");
+    assert_eq!(layout.variant(), "phonetic");
+    assert_eq!(layout.model(), "pc105");
     assert_eq!(layout.to_text(&strokes()).as_deref(), Ok("Гхб"));
     assert!(configured_layout(CONFIG, 0, "ru").is_none());
     assert!(configured_layout(CONFIG, 2, "us").is_none());
     let contents = "[Other]\nLayoutList=ru\n[Layout]\nLayoutList=us\nOptions=shift:both_capslock\n";
     assert_eq!(
-        configured_layout(contents, 0, "us").unwrap().options,
+        configured_layout(contents, 0, "us").unwrap().options(),
         "shift:both_capslock"
     );
 }
@@ -154,7 +154,7 @@ fn wait_for(events: &crate::input_events::InputEvents, name: Option<&str>) {
             .expect("layout event before deadline")
         {
             InputEventMessage::LayoutChanged(layout)
-                if layout.as_ref().map(|value| value.name.as_str()) == name =>
+                if layout.as_ref().map(|value| value.name()) == name =>
             {
                 return;
             }
@@ -183,10 +183,7 @@ fn serializes_layout_queries_and_completion_publication() {
         observer.observe(|| {
             started.send(()).unwrap();
             released.recv_timeout(TEST_TIMEOUT).unwrap();
-            Ok(Arc::new(Layout {
-                name: "us".into(),
-                ..Default::default()
-            }))
+            Ok(Arc::new(Layout::new("us", "", "", "")))
         })
     });
     started_query.recv_timeout(TEST_TIMEOUT).unwrap();
@@ -195,10 +192,7 @@ fn serializes_layout_queries_and_completion_publication() {
     let finished = thread::spawn(move || {
         completion.finish_with(Ok(()), || {
             queried.send(()).unwrap();
-            Ok(Arc::new(Layout {
-                name: "ru".into(),
-                ..Default::default()
-            }))
+            Ok(Arc::new(Layout::new("ru", "", "", "")))
         })
     });
     assert!(completion_query.try_recv().is_err());
@@ -210,17 +204,12 @@ fn serializes_layout_queries_and_completion_publication() {
     match events.available().unwrap().unwrap() {
         InputEventMessage::CorrectionFinished { result, layout } => {
             assert!(result.is_ok());
-            assert_eq!(layout.unwrap().name, "ru");
+            assert_eq!(layout.unwrap().name(), "ru");
         }
         _ => panic!("expected correction completion after older observation"),
     }
     tracker
-        .observe(|| {
-            Ok(Arc::new(Layout {
-                name: "us".into(),
-                ..Default::default()
-            }))
-        })
+        .observe(|| Ok(Arc::new(Layout::new("us", "", "", ""))))
         .unwrap();
     wait_for(&events, Some("us"));
 }
