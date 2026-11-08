@@ -67,22 +67,28 @@ impl Switcher {
         loop {
             input.wait_for_switch_request()?;
 
-            if !input.enter()? {
+            let Some(mut interception) = input::Interceptor::enter(input)? else {
                 continue;
+            };
+
+            if let Some(correction) = Correction::from_input(
+                interception.input(),
+                config.auto_switch_sound,
+                config.manual_switch_sound,
+            ) {
+                self.correct(&mut interception, &correction)?;
             }
 
-            if let Some(correction) =
-                Correction::from_input(input, config.auto_switch_sound, config.manual_switch_sound)
-            {
-                self.correct(input, &correction)?;
-            }
-
-            input.leave()?;
+            interception.finish()?;
         }
     }
 
-    fn correct(&mut self, input: &mut input::Input, correction: &Correction) -> io::Result<()> {
-        let is_cancelled = AtomicBool::new(input.read_captured()?);
+    fn correct(
+        &mut self,
+        interception: &mut input::Interceptor<'_>,
+        correction: &Correction,
+    ) -> io::Result<()> {
+        let is_cancelled = AtomicBool::new(interception.read_captured()?);
         thread::scope(|scope| -> io::Result<()> {
             let worker = scope.spawn(|| {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -100,9 +106,9 @@ impl Switcher {
             });
             let mut read_error = None;
             let result = loop {
-                match input.wait_for_correction() {
+                match interception.wait_for_correction() {
                     Ok(result) => {
-                        if input.take_cancel_request() {
+                        if interception.take_cancel_request() {
                             is_cancelled.store(true, Ordering::Relaxed);
                         }
                         if let Some(result) = result {
@@ -123,7 +129,7 @@ impl Switcher {
                 return Err(error);
             }
             if is_cancelled.load(Ordering::Relaxed) {
-                input.reset_history();
+                interception.reset_history();
             }
             result
         })
