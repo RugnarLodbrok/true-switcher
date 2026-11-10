@@ -14,6 +14,8 @@ pub enum InputEventMessage {
     DevicesChanged(Instant),
     Shutdown(ShutdownReason),
     FocusChanged,
+    PointerPressed,
+    PointerEventsLost,
     LayoutChanged(Option<Arc<Layout>>),
     CorrectionFinished {
         result: io::Result<()>,

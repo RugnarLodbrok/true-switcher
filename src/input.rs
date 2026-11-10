@@ -11,6 +11,7 @@ use evdev::{EventType, InputEvent, KeyCode, SynchronizationCode, raw_stream::Raw
 
 mod devices;
 mod interception;
+mod pointer;
 
 use interception::InterceptionState;
 pub use interception::Interceptor;
@@ -147,6 +148,7 @@ impl Input {
         };
         let monitor = devices::Monitor::new()?;
         input.discover_devices(&sender, &monitor)?;
+        pointer::start(sender.clone());
         monitor.start(sender)?;
         Ok(input)
     }
@@ -346,7 +348,9 @@ impl Input {
                 self.lifecycle.shutdown(reason);
                 self.cancel_processing();
             }
-            InputEventMessage::FocusChanged => self.request_history_reset(is_captured),
+            InputEventMessage::FocusChanged
+            | InputEventMessage::PointerPressed
+            | InputEventMessage::PointerEventsLost => self.request_history_reset(is_captured),
             InputEventMessage::LayoutChanged(layout) => {
                 self.accept_layout(
                     layout,
@@ -634,6 +638,10 @@ impl Input {
 
     fn request_history_reset(&mut self, is_captured: bool) {
         self.automatic_target = None;
+        if self.is_auto_request {
+            self.pending = None;
+            self.is_auto_request = false;
+        }
         self.reset_history();
         if is_captured {
             self.is_cancel_requested = true;
@@ -1240,6 +1248,47 @@ patterns = ['^\.тф']
             input.events.available().unwrap(),
             Some(InputEventMessage::FocusChanged)
         ));
+    }
+
+    #[test]
+    fn pointer_press_and_event_loss_reset_history_without_restarting() {
+        let (mut input, sender) = channel_input();
+        input.pending = None;
+        press(&mut input, KeyCode::KEY_A);
+        input.pending = Some(0);
+        input.is_auto_request = true;
+        input.automatic_target = Some(layout("us"));
+        sender.send(InputEventMessage::PointerPressed);
+        input.process_available_events(None).unwrap();
+        assert!(input.latest_word().is_none());
+        assert!(input.pending.is_none());
+        assert!(input.automatic_target.is_none());
+        assert_eq!(input.lifecycle, Lifecycle::Running);
+
+        press(&mut input, KeyCode::KEY_B);
+        sender.send(InputEventMessage::PointerEventsLost);
+        input.process_available_events(None).unwrap();
+        assert!(input.latest_word().is_none());
+        assert_eq!(input.lifecycle, Lifecycle::Running);
+    }
+
+    #[test]
+    fn pointer_press_during_correction_requests_cancellation() {
+        let (mut input, sender) = channel_input();
+        press(&mut input, KeyCode::KEY_A);
+        event_at(&mut input, 0, KeyCode::KEY_A, 0, Instant::now());
+        let mut interception = Interceptor::enter(&mut input).unwrap().unwrap();
+        sender.send(InputEventMessage::PointerPressed);
+        assert!(interception.wait_for_correction().unwrap().is_none());
+        assert!(interception.take_cancel_request());
+        assert!(interception.input().latest_word().is_none());
+        sender.send(InputEventMessage::CorrectionFinished {
+            result: Ok(()),
+            layout: Some(layout("ru")),
+        });
+        assert!(interception.wait_for_correction().unwrap().unwrap().is_ok());
+        interception.finish().unwrap();
+        assert!(input.latest_word().is_none());
     }
 
     #[test]
