@@ -108,7 +108,7 @@ pub struct Input {
     events: InputEvents,
     correction: CorrectionState,
     switch_key: KeyCode,
-    pending: Option<usize>,
+    pending: Option<usize>, // index of keyboard with pending switch
     is_original_switch_key_held: bool,
     is_backing_off: bool,
     is_auto_request: bool,
@@ -542,7 +542,7 @@ impl Input {
 
     fn process_text_event(
         &mut self,
-        index: usize, // keyboard index
+        index: usize, // keyboard device index
         key: KeyCode,
         value: i32, // 0 = release, 1 = press, 2 = repeated press while holding
         is_hard_separator: bool,
@@ -559,7 +559,7 @@ impl Input {
                     .keyboard_input
                     .held_keys()
                     .any(|(_, code)| is_shift(KeyCode::new(code)));
-                self.history.process(key, is_shift, self.layout.clone());
+                self.history.process(key, is_shift, self.layout.clone());  // spaces go here too
             }
         }
         if key == KeyCode::KEY_BACKSPACE {
