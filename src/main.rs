@@ -64,8 +64,8 @@ fn run() -> io::Result<ShutdownReason> {
 
     match input.wait_for_keyboard_discovery(KEYBOARD_DISCOVERY_DELAY) {
         Ok(()) => log::info!("Ready"),
-        Err(error) if lifecycle::is_control_interrupt(&error) => {}
-        Err(error) => return Err(error),
+        Err(lifecycle::ProcessingError::Interrupted) => {}
+        Err(lifecycle::ProcessingError::Io(error)) => return Err(error),
     }
 
     switcher.process_requests(&mut input, &config)

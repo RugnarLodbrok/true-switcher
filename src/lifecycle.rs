@@ -44,30 +44,38 @@ impl Lifecycle {
         }
     }
 
-    pub fn check(&self) -> io::Result<()> {
+    pub fn check(&self) -> ProcessingResult<()> {
         if *self == Self::Running {
             Ok(())
         } else {
-            Err(io::Error::new(io::ErrorKind::Interrupted, ControlInterrupt))
+            Err(ProcessingError::Interrupted)
         }
     }
 }
 
 #[derive(Debug)]
-struct ControlInterrupt;
+pub enum ProcessingError {
+    Interrupted,
+    Io(io::Error),
+}
 
-impl fmt::Display for ControlInterrupt {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("input processing interrupted by lifecycle request")
+pub type ProcessingResult<T> = Result<T, ProcessingError>;
+
+impl From<io::Error> for ProcessingError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
     }
 }
 
-impl std::error::Error for ControlInterrupt {}
-
-pub fn is_control_interrupt(error: &io::Error) -> bool {
-    error
-        .get_ref()
-        .is_some_and(|error| error.is::<ControlInterrupt>())
+impl fmt::Display for ProcessingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Interrupted => {
+                formatter.write_str("input processing interrupted by lifecycle request")
+            }
+            Self::Io(error) => error.fmt(formatter),
+        }
+    }
 }
 
 pub fn start_signals(sender: InputEventSender) -> io::Result<()> {
@@ -127,9 +135,8 @@ mod tests {
         let error = Lifecycle::Shutdown(ShutdownReason::Stop)
             .check()
             .unwrap_err();
-        assert!(is_control_interrupt(&error));
-        assert!(!is_control_interrupt(&io::Error::from(
-            io::ErrorKind::Interrupted
-        )));
+        assert!(matches!(error, ProcessingError::Interrupted));
+        let io_error = ProcessingError::from(io::Error::from(io::ErrorKind::Interrupted));
+        assert!(matches!(io_error, ProcessingError::Io(_)));
     }
 }

@@ -1,4 +1,4 @@
-use crate::lifecycle::{ShutdownReason, is_control_interrupt};
+use crate::lifecycle::{ProcessingError, ProcessingResult, ShutdownReason};
 use crate::{config, input, kde, layout, output, sound, statistics, word};
 use std::io;
 use std::sync::Arc;
@@ -22,33 +22,25 @@ struct Correction {
 }
 
 impl Correction {
-    fn from_input(
-        input: &input::Input,
-        is_auto_sound: bool,
-        is_manual_sound: bool,
-    ) -> Option<Self> {
-        let is_auto = input.is_auto_request();
-        let target = if is_auto {
-            Some(input.automatic_target()?)
-        } else {
-            None
-        };
-        Some(Self {
-            previous: input.previous_word().cloned(),
-            word: input.latest_word().cloned(),
-            target,
-            mode: if is_auto {
-                SwitchMode::Auto
-            } else {
-                SwitchMode::Manual
+    fn from_request(request: input::SwitchRequest, config: &config::Configuration) -> Self {
+        Self {
+            previous: request.previous,
+            word: request.word,
+            target: request.target,
+            mode: request.mode,
+            is_sound_enabled: match request.mode {
+                SwitchMode::Auto => config.auto_switch_sound,
+                SwitchMode::Manual => config.manual_switch_sound,
             },
-            is_sound_enabled: if is_auto {
-                is_auto_sound
-            } else {
-                is_manual_sound
-            },
-        })
+        }
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CorrectionOutcome {
+    Completed,
+    Cancelled,
+    Interrupted,
 }
 
 pub struct Switcher {
@@ -66,13 +58,11 @@ impl Switcher {
         config: &config::Configuration,
     ) -> io::Result<ShutdownReason> {
         loop {
-            if let Some(reason) = input.wait_for_resume()? {
-                return Ok(reason);
-            }
-            match self.process_request(input, config) {
-                Err(error) if is_control_interrupt(&error) => continue,
-                Err(error) => return Err(error),
-                Ok(()) => {}
+            match input.next_request()? {
+                input::InputRequest::Switch(request) => {
+                    self.process_request(input, request, config)?;
+                }
+                input::InputRequest::Shutdown(reason) => return Ok(reason),
             }
         }
     }
@@ -80,25 +70,34 @@ impl Switcher {
     fn process_request(
         &mut self,
         input: &mut input::Input,
+        request: input::SwitchRequest,
         config: &config::Configuration,
-    ) -> io::Result<()> {
-        input.wait_for_switch_request()?;
-
-        let Some(correction) =
-            Correction::from_input(input, config.auto_switch_sound, config.manual_switch_sound)
-        else {
-            return Ok(());
-        };
-        let Some(mut interception) = input::enter_interceptor(input)? else {
-            return Ok(());
-        };
-
-        if !interception.read_available()? {
-            self.begin_correction(interception.as_mut(), &correction)?;
-            self.correct(interception.as_mut(), &correction)?;
+    ) -> io::Result<CorrectionOutcome> {
+        let correction = Correction::from_request(request, config);
+        match self.execute_correction(input, &correction) {
+            Ok(outcome) => Ok(outcome),
+            Err(ProcessingError::Interrupted) => Ok(CorrectionOutcome::Interrupted),
+            Err(ProcessingError::Io(error)) => Err(error),
         }
+    }
 
-        interception.finish()
+    fn execute_correction(
+        &mut self,
+        input: &mut input::Input,
+        correction: &Correction,
+    ) -> ProcessingResult<CorrectionOutcome> {
+        let Some(mut interception) = input::enter_interceptor(input)? else {
+            return Ok(CorrectionOutcome::Cancelled);
+        };
+
+        let outcome = if interception.read_available()? {
+            CorrectionOutcome::Cancelled
+        } else {
+            self.begin_correction(interception.as_mut(), correction)?;
+            self.correct(interception.as_mut(), correction)?
+        };
+        interception.finish()?;
+        Ok(outcome)
     }
 
     fn begin_correction(
@@ -133,9 +132,9 @@ impl Switcher {
         &mut self,
         interception: &mut dyn input::CorrectionInterceptor,
         correction: &Correction,
-    ) -> io::Result<()> {
+    ) -> ProcessingResult<CorrectionOutcome> {
         let is_cancelled = AtomicBool::new(interception.read_available()?);
-        thread::scope(|scope| -> io::Result<()> {
+        thread::scope(|scope| -> ProcessingResult<CorrectionOutcome> {
             let worker = scope.spawn(|| {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     correct_word(correction, &mut self.keyboard, &is_cancelled)
@@ -170,7 +169,12 @@ impl Switcher {
             if is_cancelled.load(Ordering::Relaxed) {
                 interception.input().reset_history();
             }
-            result
+            result?;
+            Ok(if is_cancelled.load(Ordering::Relaxed) {
+                CorrectionOutcome::Cancelled
+            } else {
+                CorrectionOutcome::Completed
+            })
         })
     }
 }

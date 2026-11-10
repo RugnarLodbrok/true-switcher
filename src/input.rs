@@ -21,7 +21,7 @@ pub use interception::{CorrectionInterceptor, enter_interceptor};
 use crate::history::History;
 use crate::hold::HoldDetector;
 use crate::input_events::{InputEventMessage, InputEventSender, InputEvents};
-use crate::lifecycle::{Lifecycle, ShutdownReason};
+use crate::lifecycle::{Lifecycle, ProcessingError, ProcessingResult, ShutdownReason};
 
 const MODIFIERS: [KeyCode; 8] = [
     KeyCode::KEY_LEFTSHIFT,
@@ -49,6 +49,20 @@ const NAVIGATION_KEYS: [KeyCode; 9] = [
     KeyCode::KEY_END,
     KeyCode::KEY_ESC,
 ];
+
+#[derive(Debug)]
+pub enum InputRequest {
+    Switch(SwitchRequest),
+    Shutdown(ShutdownReason),
+}
+
+#[derive(Debug)]
+pub struct SwitchRequest {
+    pub previous: Option<crate::word::Word>,
+    pub word: Option<crate::word::Word>,
+    pub target: Option<Arc<crate::layout::Layout>>,
+    pub mode: crate::switcher::SwitchMode,
+}
 
 #[derive(Default)]
 struct EntryRecording {
@@ -196,7 +210,7 @@ impl Input {
         Ok(())
     }
 
-    pub fn wait_for_keyboard_discovery(&mut self, duration: Duration) -> io::Result<()> {
+    pub fn wait_for_keyboard_discovery(&mut self, duration: Duration) -> ProcessingResult<()> {
         let deadline = Instant::now() + duration;
         loop {
             self.process_available_events(None)?;
@@ -212,7 +226,43 @@ impl Input {
         }
     }
 
-    pub fn wait_for_switch_request(&mut self) -> io::Result<()> {
+    pub fn next_request(&mut self) -> io::Result<InputRequest> {
+        loop {
+            match self.wait_for_resume() {
+                Ok(Some(reason)) => return Ok(InputRequest::Shutdown(reason)),
+                Ok(None) => {}
+                Err(ProcessingError::Interrupted) => continue,
+                Err(ProcessingError::Io(error)) => return Err(error),
+            }
+            match self.wait_for_switch_request() {
+                Ok(()) => {
+                    if let Some(request) = self.switch_request() {
+                        return Ok(InputRequest::Switch(request));
+                    }
+                    self.pending = None;
+                }
+                Err(ProcessingError::Interrupted) => continue,
+                Err(ProcessingError::Io(error)) => return Err(error),
+            }
+        }
+    }
+
+    fn switch_request(&self) -> Option<SwitchRequest> {
+        use crate::switcher::SwitchMode;
+        let (mode, target) = if self.is_auto_request {
+            (SwitchMode::Auto, Some(self.automatic_target()?))
+        } else {
+            (SwitchMode::Manual, None)
+        };
+        Some(SwitchRequest {
+            previous: self.previous_word().cloned(),
+            word: self.latest_word().cloned(),
+            target,
+            mode,
+        })
+    }
+
+    fn wait_for_switch_request(&mut self) -> ProcessingResult<()> {
         self.lifecycle.check()?;
         if self.pending.is_some() {
             return Ok(());
@@ -224,7 +274,8 @@ impl Input {
         self.history.latest_word()
     }
 
-    pub fn is_auto_request(&self) -> bool {
+    #[cfg(test)]
+    fn is_auto_request(&self) -> bool {
         self.is_auto_request
     }
 
@@ -269,7 +320,7 @@ impl Input {
         &mut self,
         is_ready: impl Fn(&Self) -> bool,
         mut state: Option<&mut InterceptionState>,
-    ) -> io::Result<()> {
+    ) -> ProcessingResult<()> {
         self.process_available_events(state.as_deref_mut())?;
         while !is_ready(self) {
             self.wait_for_events(None, state.as_deref_mut())?;
@@ -280,14 +331,14 @@ impl Input {
     fn process_available_events(
         &mut self,
         mut state: Option<&mut InterceptionState>,
-    ) -> io::Result<()> {
+    ) -> ProcessingResult<()> {
         self.drain_events(state.as_deref_mut())?;
         self.synchronize_history(state.as_deref());
         self.update_back_off(Instant::now());
         self.lifecycle.check()
     }
 
-    fn drain_events(&mut self, mut state: Option<&mut InterceptionState>) -> io::Result<()> {
+    fn drain_events(&mut self, mut state: Option<&mut InterceptionState>) -> ProcessingResult<()> {
         while let Some(event) = self.events.available()? {
             self.process_message(event, state.as_deref_mut())?;
             self.lifecycle.check()?;
@@ -298,7 +349,7 @@ impl Input {
     fn process_cleanup_events(
         &mut self,
         mut state: Option<&mut InterceptionState>,
-    ) -> io::Result<()> {
+    ) -> ProcessingResult<()> {
         let mut error = None;
         while let Some(event) = self.events.available()? {
             if let Err(err) = self.process_message(event, state.as_deref_mut()) {
@@ -322,7 +373,7 @@ impl Input {
         &mut self,
         deadline: Option<Instant>,
         mut state: Option<&mut InterceptionState>,
-    ) -> io::Result<()> {
+    ) -> ProcessingResult<()> {
         let hold_deadline = if self.is_backing_off {
             None
         } else {
@@ -339,11 +390,11 @@ impl Input {
         &mut self,
         event: InputEventMessage,
         state: Option<&mut InterceptionState>,
-    ) -> io::Result<()> {
+    ) -> ProcessingResult<()> {
         let is_captured = state.as_ref().is_some_and(|state| state.is_captured);
         match event {
             InputEventMessage::Keyboard(index, event) => self.process(index, event, state)?,
-            InputEventMessage::DeviceError(error) => return Err(error),
+            InputEventMessage::DeviceError(error) => return Err(error.into()),
             InputEventMessage::DevicesChanged(at) => self.devices_changed(at),
             InputEventMessage::DeviceDisconnected(index, at) => {
                 log::info!(
@@ -400,7 +451,7 @@ impl Input {
         self.is_correction_cancelled = true;
     }
 
-    pub fn wait_for_resume(&mut self) -> io::Result<Option<ShutdownReason>> {
+    fn wait_for_resume(&mut self) -> ProcessingResult<Option<ShutdownReason>> {
         if self.lifecycle != Lifecycle::Running
             && let Err(error) = self.process_cleanup_events(None)
         {
@@ -439,7 +490,7 @@ impl Input {
     fn wait_for_correction(
         &mut self,
         state: Option<&mut InterceptionState>,
-    ) -> io::Result<Option<io::Result<()>>> {
+    ) -> ProcessingResult<Option<io::Result<()>>> {
         if self.correction_result.is_none() {
             self.wait_for_events(None, state)?;
         }
@@ -451,7 +502,7 @@ impl Input {
         index: usize,
         event: InputEvent,
         state: Option<&mut InterceptionState>,
-    ) -> io::Result<()> {
+    ) -> ProcessingResult<()> {
         let now = Instant::now();
         let time = event.timestamp();
         let elapsed = SystemTime::now().duration_since(time).ok();
@@ -469,7 +520,7 @@ impl Input {
         event: InputEvent,
         now: Instant,
         state: Option<&mut InterceptionState>,
-    ) -> io::Result<()> {
+    ) -> ProcessingResult<()> {
         if self.lifecycle != Lifecycle::Running && state.is_none() {
             return Ok(());
         }
@@ -479,7 +530,8 @@ impl Input {
             return Err(io::Error::other(format!(
                 "{}: SYN_DROPPED",
                 self.keyboards[index].path.display()
-            )));
+            ))
+            .into());
         }
         if event.event_type() != EventType::KEY {
             return Ok(());
@@ -536,7 +588,7 @@ impl Input {
         key: KeyCode,
         value: i32,
         is_captured: bool,
-    ) -> io::Result<()> {
+    ) -> ProcessingResult<()> {
         let is_hard_separator = matches!(
             key,
             KeyCode::KEY_TAB | KeyCode::KEY_ENTER | KeyCode::KEY_KPENTER
@@ -720,7 +772,7 @@ impl Input {
         std::mem::take(&mut self.is_cancel_requested)
     }
 
-    fn write_source(&mut self, index: usize, key: KeyCode, value: i32) -> io::Result<()> {
+    fn write_source(&mut self, index: usize, key: KeyCode, value: i32) -> ProcessingResult<()> {
         let keyboard = &mut self.keyboards[index];
         log::trace!(
             "SOURCE_WRITE attempt {} {key:?} value={value} grabbed={}",
@@ -750,7 +802,7 @@ impl Input {
         Ok(())
     }
 
-    fn release_modifiers(&mut self) -> io::Result<()> {
+    fn release_modifiers(&mut self) -> ProcessingResult<()> {
         let mut error = None;
         for index in 0..self.keyboards.len() {
             for key in MODIFIERS {
@@ -765,7 +817,7 @@ impl Input {
         error.map_or(Ok(()), Err)
     }
 
-    fn release_locks(&mut self) -> io::Result<()> {
+    fn release_locks(&mut self) -> ProcessingResult<()> {
         let mut error = None;
         for index in 0..self.keyboards.len() {
             for key in LOCK_KEYS {
@@ -778,7 +830,7 @@ impl Input {
         error.map_or(Ok(()), Err)
     }
 
-    fn grab(&mut self) -> io::Result<()> {
+    fn grab(&mut self) -> ProcessingResult<()> {
         for index in 0..self.keyboards.len() {
             let result = self.keyboards[index].device.grab();
             if result.is_ok() {
@@ -789,7 +841,7 @@ impl Input {
         Ok(())
     }
 
-    fn ungrab(&mut self) -> io::Result<()> {
+    fn ungrab(&mut self) -> ProcessingResult<()> {
         let mut error = None;
         for keyboard in &mut self.keyboards {
             if keyboard.device.is_grabbed() {
@@ -806,7 +858,7 @@ impl Input {
         self.device_result(error.map_or(Ok(()), Err))
     }
 
-    fn snapshot(&mut self, mut state: Option<&mut InterceptionState>) -> io::Result<()> {
+    fn snapshot(&mut self, mut state: Option<&mut InterceptionState>) -> ProcessingResult<()> {
         let mut error = None;
         for index in 0..self.keyboards.len() {
             let keys = self.keyboards[index].device.keys();
@@ -833,14 +885,14 @@ impl Input {
         error.map_or(Ok(()), Err)
     }
 
-    fn device_result<T>(&mut self, result: io::Result<T>) -> io::Result<T> {
+    fn device_result<T>(&mut self, result: io::Result<T>) -> ProcessingResult<T> {
         match result {
             Err(error) if is_disconnection(&error) && self.lifecycle == Lifecycle::Running => {
                 log::info!("Keyboard disconnected during device operation: {error}");
                 self.devices_changed(Instant::now());
                 self.lifecycle.check().map(|()| unreachable!())
             }
-            result => result,
+            result => result.map_err(ProcessingError::Io),
         }
     }
 }
@@ -1256,13 +1308,51 @@ patterns = ['^\.тф']
         let (mut input, sender) = channel_input();
         sender.send(InputEventMessage::FocusChanged);
 
-        input.wait_for_switch_request().unwrap();
+        let InputRequest::Switch(request) = input.next_request().unwrap() else {
+            panic!("expected a switch request");
+        };
+        assert_eq!(request.mode, crate::switcher::SwitchMode::Manual);
+        assert!(request.target.is_none());
 
         assert_eq!(input.pending, Some(0));
         assert!(matches!(
             input.events.available().unwrap(),
             Some(InputEventMessage::FocusChanged)
         ));
+    }
+
+    #[test]
+    fn automatic_request_owns_word_and_target_after_input_changes() {
+        let (mut input, _) = channel_input();
+        press(&mut input, KeyCode::KEY_A);
+        let expected_word = input.latest_word().cloned();
+        input.is_auto_request = true;
+        input.automatic_target = Some(layout("ru"));
+
+        let InputRequest::Switch(request) = input.next_request().unwrap() else {
+            panic!("expected an automatic switch request");
+        };
+        input.reset_history();
+        input.automatic_target = Some(layout("us"));
+
+        assert_eq!(request.mode, crate::switcher::SwitchMode::Auto);
+        assert_eq!(request.word, expected_word);
+        assert_eq!(request.target.unwrap().name(), "ru");
+    }
+
+    #[test]
+    fn io_interrupted_is_returned_as_an_error_instead_of_lifecycle_interrupt() {
+        let (mut input, sender) = channel_input();
+        input.pending = None;
+        sender.send(InputEventMessage::DeviceError(io::Error::from(
+            io::ErrorKind::Interrupted,
+        )));
+
+        assert_eq!(
+            input.next_request().unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(input.lifecycle, Lifecycle::Running);
     }
 
     #[test]
@@ -1321,7 +1411,10 @@ patterns = ['^\.тф']
         });
         worker.join().unwrap();
 
-        input.wait_for_switch_request().unwrap();
+        assert!(matches!(
+            input.next_request().unwrap(),
+            InputRequest::Switch(_)
+        ));
 
         assert_eq!(input.pending, Some(0));
         assert!(!input.is_original_switch_key_held);
@@ -1338,7 +1431,7 @@ patterns = ['^\.тф']
         )));
 
         assert_eq!(
-            input.wait_for_switch_request().unwrap_err().to_string(),
+            input.next_request().unwrap_err().to_string(),
             "device disconnected"
         );
     }
@@ -1351,13 +1444,17 @@ patterns = ['^\.тф']
             let (sender, events) = InputEvents::new();
             input.events = events;
             sender.shutdown(ShutdownReason::Stop).unwrap();
-            let result = if is_discovering {
-                input.wait_for_keyboard_discovery(TEST_STEP)
+            if is_discovering {
+                assert!(matches!(
+                    input.wait_for_keyboard_discovery(TEST_STEP),
+                    Err(ProcessingError::Interrupted)
+                ));
             } else {
-                input.wait_for_switch_request()
-            };
-            assert!(crate::lifecycle::is_control_interrupt(&result.unwrap_err()));
-            assert_eq!(input.wait_for_resume().unwrap(), Some(ShutdownReason::Stop));
+                assert!(matches!(
+                    input.next_request().unwrap(),
+                    InputRequest::Shutdown(ShutdownReason::Stop)
+                ));
+            }
         }
     }
 
@@ -1372,7 +1469,7 @@ patterns = ['^\.тф']
         let Err(error) = Interceptor::enter(&mut input) else {
             panic!("entry must be interrupted");
         };
-        assert!(crate::lifecycle::is_control_interrupt(&error));
+        assert!(matches!(error, ProcessingError::Interrupted));
         let keyboard = source.borrow();
         assert!(!keyboard.is_grabbed);
         assert!(keyboard.writes.contains(&(KeyCode::KEY_A, 1, true)));
@@ -1396,8 +1493,9 @@ patterns = ['^\.тф']
             InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTSHIFT.0, 1),
         ]);
         sender.send(InputEventMessage::DeviceDisconnected(0, Instant::now()));
-        assert!(crate::lifecycle::is_control_interrupt(
-            &interception.wait_for_correction().unwrap_err()
+        assert!(matches!(
+            interception.wait_for_correction().unwrap_err(),
+            ProcessingError::Interrupted
         ));
         assert!(interception.take_cancel_request());
         sender.shutdown(ShutdownReason::Stop).unwrap();
@@ -1427,8 +1525,9 @@ patterns = ['^\.тф']
             .unwrap()
             .shutdown(ShutdownReason::Restart)
             .unwrap();
-        assert!(crate::lifecycle::is_control_interrupt(
-            &interception.finish().unwrap_err()
+        assert!(matches!(
+            interception.finish().unwrap_err(),
+            ProcessingError::Interrupted
         ));
         assert!(!source.borrow().is_grabbed);
         assert!(source.borrow().held.contains(&KeyCode::KEY_A.0));
@@ -1485,7 +1584,10 @@ patterns = ['^\.тф']
             } else {
                 ShutdownReason::Restart
             };
-            assert_eq!(input.wait_for_resume().unwrap(), Some(reason));
+            assert!(matches!(
+                input.next_request().unwrap(),
+                InputRequest::Shutdown(actual) if actual == reason
+            ));
         }
     }
 

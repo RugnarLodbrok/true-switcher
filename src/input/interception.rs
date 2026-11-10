@@ -1,4 +1,5 @@
 use super::{EntryRecording, Input, is_repair_key};
+use crate::lifecycle::ProcessingResult;
 use evdev::KeyCode;
 use std::collections::BTreeSet;
 use std::io;
@@ -29,7 +30,7 @@ pub struct Interceptor<'a> {
 }
 
 impl<'a> Interceptor<'a> {
-    pub fn enter(input: &'a mut Input) -> io::Result<Option<Self>> {
+    pub fn enter(input: &'a mut Input) -> ProcessingResult<Option<Self>> {
         let mut interception = Self {
             input,
             state: InterceptionState::default(),
@@ -72,14 +73,14 @@ impl<'a> Interceptor<'a> {
         }
     }
 
-    fn wait_ordinary(&mut self) -> io::Result<bool> {
+    fn wait_ordinary(&mut self) -> ProcessingResult<bool> {
         log::trace!("WAIT_ORDINARY begin");
         self.input
             .process_events_until(|input| !input.is_ordinary_key_held(), Some(&mut self.state))?;
         Ok(self.input.pending.is_some())
     }
 
-    fn begin_entry(&mut self, is_switch_key_reset: &mut bool) -> io::Result<()> {
+    fn begin_entry(&mut self, is_switch_key_reset: &mut bool) -> ProcessingResult<()> {
         self.is_cleanup_needed = true;
         self.is_lock_release_complete = false;
         self.state.recording = Some(EntryRecording::default());
@@ -108,12 +109,12 @@ impl<'a> Interceptor<'a> {
         self.input
     }
 
-    pub fn read_captured(&mut self) -> io::Result<bool> {
+    pub fn read_captured(&mut self) -> ProcessingResult<bool> {
         self.process_available_events()?;
         Ok(self.take_cancel_request())
     }
 
-    pub fn wait_for_correction(&mut self) -> io::Result<Option<io::Result<()>>> {
+    pub fn wait_for_correction(&mut self) -> ProcessingResult<Option<io::Result<()>>> {
         self.input.wait_for_correction(Some(&mut self.state))
     }
 
@@ -121,15 +122,15 @@ impl<'a> Interceptor<'a> {
         self.input.take_cancel_request()
     }
 
-    fn process_available_events(&mut self) -> io::Result<()> {
+    fn process_available_events(&mut self) -> ProcessingResult<()> {
         self.input.process_available_events(Some(&mut self.state))
     }
 
-    fn process_cleanup_events(&mut self) -> io::Result<()> {
+    fn process_cleanup_events(&mut self) -> ProcessingResult<()> {
         self.input.process_cleanup_events(Some(&mut self.state))
     }
 
-    pub fn finish(mut self) -> io::Result<()> {
+    pub fn finish(mut self) -> ProcessingResult<()> {
         self.phase = Phase::Finishing;
         self.wait_releases()?;
         self.is_release_wait_complete = true;
@@ -142,7 +143,7 @@ impl<'a> Interceptor<'a> {
         Ok(())
     }
 
-    fn wait_releases(&mut self) -> io::Result<()> {
+    fn wait_releases(&mut self) -> ProcessingResult<()> {
         log::trace!("WAIT_RELEASES begin");
         loop {
             self.process_available_events()?;
@@ -160,7 +161,7 @@ impl<'a> Interceptor<'a> {
         }
     }
 
-    fn release_locks(&mut self) -> io::Result<()> {
+    fn release_locks(&mut self) -> ProcessingResult<()> {
         if !self.is_lock_release_complete {
             self.input.release_locks()?;
             self.is_lock_release_complete = true;
@@ -168,7 +169,7 @@ impl<'a> Interceptor<'a> {
         Ok(())
     }
 
-    fn prepare_repair(&mut self) -> io::Result<()> {
+    fn prepare_repair(&mut self) -> ProcessingResult<()> {
         let mut error = None;
         for (index, code) in self.state.repair.clone() {
             if !is_repair_key(KeyCode::new(code)) {
@@ -192,7 +193,7 @@ impl<'a> Interceptor<'a> {
         error.map_or(Ok(()), Err)
     }
 
-    fn repair_releases(&mut self) -> io::Result<()> {
+    fn repair_releases(&mut self) -> ProcessingResult<()> {
         let mut error = None;
         for (index, code) in self.state.repair.clone() {
             if !self.input.keyboards[index].device.is_grabbed() {
@@ -211,7 +212,7 @@ impl<'a> Interceptor<'a> {
         error.map_or(Ok(()), Err)
     }
 
-    fn rollback(&mut self) -> io::Result<()> {
+    fn rollback(&mut self) -> ProcessingResult<()> {
         if !self.is_cleanup_needed {
             return Ok(());
         }
@@ -244,7 +245,7 @@ impl<'a> Interceptor<'a> {
             .extend(self.state.recording.take().unwrap().presses);
     }
 
-    fn log_cleanup(stage: &str, result: io::Result<()>) {
+    fn log_cleanup(stage: &str, result: ProcessingResult<()>) {
         if let Err(error) = result {
             log::error!("CLEANUP {stage}: {error}");
         }
@@ -278,14 +279,14 @@ const IS_CAPTURE_ENABLED: bool = false;
 
 pub trait CorrectionInterceptor {
     fn input(&mut self) -> &mut Input;
-    fn read_available(&mut self) -> io::Result<bool>;
-    fn wait_for_correction(&mut self) -> io::Result<Option<io::Result<()>>>;
-    fn finish(self: Box<Self>) -> io::Result<()>;
+    fn read_available(&mut self) -> ProcessingResult<bool>;
+    fn wait_for_correction(&mut self) -> ProcessingResult<Option<io::Result<()>>>;
+    fn finish(self: Box<Self>) -> ProcessingResult<()>;
 }
 
 pub fn enter_interceptor(
     input: &mut Input,
-) -> io::Result<Option<Box<dyn CorrectionInterceptor + '_>>> {
+) -> ProcessingResult<Option<Box<dyn CorrectionInterceptor + '_>>> {
     if IS_CAPTURE_ENABLED {
         Ok(Interceptor::enter(input)?
             .map(|interceptor| Box::new(interceptor) as Box<dyn CorrectionInterceptor>))
@@ -299,15 +300,15 @@ impl CorrectionInterceptor for Interceptor<'_> {
         self.input
     }
 
-    fn read_available(&mut self) -> io::Result<bool> {
+    fn read_available(&mut self) -> ProcessingResult<bool> {
         self.read_captured()
     }
 
-    fn wait_for_correction(&mut self) -> io::Result<Option<io::Result<()>>> {
+    fn wait_for_correction(&mut self) -> ProcessingResult<Option<io::Result<()>>> {
         Interceptor::wait_for_correction(self)
     }
 
-    fn finish(self: Box<Self>) -> io::Result<()> {
+    fn finish(self: Box<Self>) -> ProcessingResult<()> {
         Interceptor::finish(*self)
     }
 }
@@ -317,7 +318,7 @@ pub(super) struct UncapturedInterceptor<'a> {
 }
 
 impl<'a> UncapturedInterceptor<'a> {
-    pub(super) fn enter(input: &'a mut Input) -> io::Result<Self> {
+    pub(super) fn enter(input: &'a mut Input) -> ProcessingResult<Self> {
         input.is_correcting = true;
         input.is_correction_cancelled = false;
         input.pending = None;
@@ -340,16 +341,16 @@ impl CorrectionInterceptor for UncapturedInterceptor<'_> {
         self.input
     }
 
-    fn read_available(&mut self) -> io::Result<bool> {
+    fn read_available(&mut self) -> ProcessingResult<bool> {
         self.input.process_available_events(None)?;
         Ok(self.input.take_cancel_request())
     }
 
-    fn wait_for_correction(&mut self) -> io::Result<Option<io::Result<()>>> {
+    fn wait_for_correction(&mut self) -> ProcessingResult<Option<io::Result<()>>> {
         self.input.wait_for_correction(None)
     }
 
-    fn finish(self: Box<Self>) -> io::Result<()> {
+    fn finish(self: Box<Self>) -> ProcessingResult<()> {
         Ok(())
     }
 }
