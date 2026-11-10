@@ -46,9 +46,14 @@ impl AutoSwitchRules {
             if rule.target.name() == current.name() {
                 return None;
             }
-            let text = conversions
-                .entry(rule.target.as_ref())
-                .or_insert_with(|| rule.target.to_text(word.strokes()));
+            let text = conversions.entry(rule.target.as_ref()).or_insert_with(|| {
+                rule.target.to_text(word.strokes()).map(|mut text| {
+                    if word.trailing_spaces > 0 {
+                        text.push(' ');
+                    }
+                    text
+                })
+            });
             rule.patterns
                 .is_match(text.as_ref().ok()?)
                 .then(|| rule.target.clone())
@@ -160,5 +165,21 @@ mod tests {
         let embedded = word(&[KeyCode::KEY_A, KeyCode::KEY_SLASH, KeyCode::KEY_N]);
         assert_eq!(switch.target(&embedded, &ru).unwrap().name(), "gb");
         assert!(switch.target(&word(&[KeyCode::KEY_SLASH]), &ru).is_none());
+    }
+
+    #[test]
+    fn matches_one_trailing_space_only_after_successful_conversion() {
+        let settings = parse_config(
+            "auto_switch = true\n[[switch_rules]]\ntarget = 'us'\npatterns = ['^foo $', '^foo  $']",
+        )
+        .unwrap();
+        let rules = AutoSwitchRules::compile(&settings, resolve).unwrap();
+        let current = resolve("ru").unwrap();
+        let mut word = word(&[KeyCode::KEY_F, KeyCode::KEY_O, KeyCode::KEY_O]);
+        assert!(rules.target(&word, &current).is_none());
+        word.trailing_spaces = 1;
+        assert_eq!(rules.target(&word, &current).unwrap().name(), "us");
+        word.trailing_spaces = 3;
+        assert_eq!(rules.target(&word, &current).unwrap().name(), "us");
     }
 }

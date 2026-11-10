@@ -559,13 +559,18 @@ impl Input {
                     .keyboard_input
                     .held_keys()
                     .any(|(_, code)| is_shift(KeyCode::new(code)));
-                self.history.process(key, is_shift, self.layout.clone());  // spaces go here too
+                self.history.process(key, is_shift, self.layout.clone());
             }
         }
         if key == KeyCode::KEY_BACKSPACE {
             self.automatic_target = None;
         }
-        if crate::history::is_text_key(key)
+        let is_first_space = key == KeyCode::KEY_SPACE
+            && self
+                .history
+                .latest_word()
+                .is_some_and(|word| word.trailing_spaces == 1);
+        if (crate::history::is_text_key(key) || is_first_space)
             && !self.keyboard_input.has_shortcut_modifier()
             && !self.correction.is_active()
             && (self.pending.is_none() || self.is_auto_request)
@@ -1055,6 +1060,18 @@ patterns = ['^\.тф']
             Some(Arc::new(crate::layout::Layout::new("ru", "", "", ""))),
             false,
         );
+        input
+    }
+
+    fn auto_input_with_patterns(patterns: &str) -> Input {
+        let mut input = auto_input();
+        let settings = crate::config::from_contents(&format!(
+            "switch_key = 'KEY_PAUSE'\nauto_switch = true\n[[switch_rules]]\ntarget = 'us'\npatterns = [{patterns}]"
+        ))
+        .unwrap();
+        input.auto_switch =
+            crate::switch_rules::AutoSwitchRules::compile(&settings, |name| Ok(layout(name)))
+                .unwrap();
         input
     }
 
@@ -1988,6 +2005,42 @@ patterns = ['^\.тф']
         assert!(input.pending.is_some());
         assert_eq!(input.automatic_target().unwrap().name(), "us");
         press(&mut input, KeyCode::KEY_A);
+        assert!(input.automatic_target().is_none());
+    }
+
+    #[test]
+    fn first_space_matches_pattern_and_later_spaces_do_not_recheck() {
+        let mut input = auto_input_with_patterns("'^foo $'");
+        press(&mut input, KeyCode::KEY_SPACE);
+        assert!(input.automatic_target().is_none());
+        for key in [KeyCode::KEY_F, KeyCode::KEY_O, KeyCode::KEY_O] {
+            press(&mut input, key);
+        }
+        assert!(input.automatic_target().is_none());
+        press(&mut input, KeyCode::KEY_SPACE);
+        assert_eq!(input.automatic_target().unwrap().name(), "us");
+        input.automatic_target = None;
+        press(&mut input, KeyCode::KEY_SPACE);
+        assert!(input.automatic_target().is_none());
+        assert_eq!(input.latest_word().unwrap().trailing_spaces, 2);
+    }
+
+    #[test]
+    fn first_space_clears_unmatched_target_and_respects_manual_block() {
+        let mut input = auto_input_with_patterns("'^foo$'");
+        for key in [KeyCode::KEY_F, KeyCode::KEY_O, KeyCode::KEY_O] {
+            press(&mut input, key);
+        }
+        assert_eq!(input.automatic_target().unwrap().name(), "us");
+        press(&mut input, KeyCode::KEY_SPACE);
+        assert!(input.automatic_target().is_none());
+
+        let mut input = auto_input_with_patterns("'^foo $'");
+        press(&mut input, KeyCode::KEY_F);
+        complete_manual_correction(&mut input, "us");
+        for key in [KeyCode::KEY_O, KeyCode::KEY_O, KeyCode::KEY_SPACE] {
+            press(&mut input, key);
+        }
         assert!(input.automatic_target().is_none());
     }
 
