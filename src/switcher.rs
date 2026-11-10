@@ -84,38 +84,61 @@ impl Switcher {
     ) -> io::Result<()> {
         input.wait_for_switch_request()?;
 
-        let Some(mut interception) = input::Interceptor::enter(input)? else {
+        let Some(correction) =
+            Correction::from_input(input, config.auto_switch_sound, config.manual_switch_sound)
+        else {
+            return Ok(());
+        };
+        let Some(mut interception) = input::enter_interceptor(input)? else {
             return Ok(());
         };
 
-        if let Some(correction) = Correction::from_input(
-            interception.input(),
-            config.auto_switch_sound,
-            config.manual_switch_sound,
-        ) {
-            self.correct(&mut interception, &correction)?;
+        if !interception.read_available()? {
+            self.begin_correction(interception.as_mut(), &correction)?;
+            self.correct(interception.as_mut(), &correction)?;
         }
 
         interception.finish()
     }
 
-    fn correct(
+    fn begin_correction(
         &mut self,
-        interception: &mut input::Interceptor<'_>,
+        interception: &mut dyn input::CorrectionInterceptor,
         correction: &Correction,
     ) -> io::Result<()> {
-        let is_cancelled = AtomicBool::new(interception.read_captured()?);
+        let target = switch_and_record(
+            || match &correction.target {
+                Some(target) => self.desktop.switch_to_layout(target.name()),
+                None => self.desktop.switch_to_next_layout(),
+            },
+            || {
+                if correction.is_sound_enabled {
+                    self.sound.play();
+                }
+            },
+            || {
+                record_switch(
+                    &self.statistics,
+                    correction.previous.as_ref(),
+                    correction.word.as_ref(),
+                    correction.mode,
+                )
+            },
+        )?;
+        interception.input().begin_correction(target);
+        Ok(())
+    }
+
+    fn correct(
+        &mut self,
+        interception: &mut dyn input::CorrectionInterceptor,
+        correction: &Correction,
+    ) -> io::Result<()> {
+        let is_cancelled = AtomicBool::new(interception.read_available()?);
         thread::scope(|scope| -> io::Result<()> {
             let worker = scope.spawn(|| {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    correct_word(
-                        correction,
-                        &mut self.keyboard,
-                        &self.desktop,
-                        &self.statistics,
-                        &self.sound,
-                        &is_cancelled,
-                    )
+                    correct_word(correction, &mut self.keyboard, &is_cancelled)
                 }))
                 .unwrap_or_else(|_| Err(io::Error::other("correction thread panicked")));
                 self.layouts.finish_correction(result);
@@ -124,7 +147,7 @@ impl Switcher {
             let result = loop {
                 match interception.wait_for_correction() {
                     Ok(result) => {
-                        if interception.take_cancel_request() {
+                        if interception.input().take_cancel_request() {
                             is_cancelled.store(true, Ordering::Relaxed);
                         }
                         if let Some(result) = result {
@@ -145,7 +168,7 @@ impl Switcher {
                 return Err(error);
             }
             if is_cancelled.load(Ordering::Relaxed) {
-                interception.reset_history();
+                interception.input().reset_history();
             }
             result
         })
@@ -155,9 +178,6 @@ impl Switcher {
 fn correct_word(
     correction: &Correction,
     keyboard: &mut output::KeyboardOutput,
-    desktop: &kde::KdePlasma,
-    statistics: &statistics::Statistics,
-    sound: &sound::Sound,
     is_cancelled: &AtomicBool,
 ) -> io::Result<()> {
     if is_cancelled.load(Ordering::Relaxed) {
@@ -165,39 +185,16 @@ fn correct_word(
     }
     log::debug!("SYNTHETIC erase");
     if let Some(word) = &correction.word {
-        keyboard.erase(word.entries.len() + word.trailing_spaces)?;
+        keyboard.erase(word.entries.len() + word.trailing_spaces, is_cancelled)?;
     }
     if is_cancelled.load(Ordering::Relaxed) {
         return Ok(());
     }
-    switch_and_replay(
-        || match &correction.target {
-            Some(target) => desktop.switch_to_layout(target.name()),
-            None => desktop.switch_to_next_layout(),
-        },
-        || {
-            if correction.is_sound_enabled {
-                sound.play();
-            }
-        },
-        || {
-            record_switch(
-                statistics,
-                correction.previous.as_ref(),
-                correction.word.as_ref(),
-                correction.mode,
-            )
-        },
-        || {
-            log::debug!("SYNTHETIC replay");
-            if let Some(word) = &correction.word {
-                keyboard.replay(word)?;
-            }
-            Ok(())
-        },
-        is_cancelled,
-    )
-    .map(|_| ())
+    log::debug!("SYNTHETIC replay");
+    if let Some(word) = &correction.word {
+        keyboard.replay(word, is_cancelled)?;
+    }
+    Ok(())
 }
 
 fn record_switch(
@@ -219,6 +216,17 @@ fn record_switch(
     }
 }
 
+fn switch_and_record<T>(
+    switch: impl FnOnce() -> io::Result<()>,
+    play_sound: impl FnOnce(),
+    record: impl FnOnce() -> T,
+) -> io::Result<T> {
+    switch()?;
+    play_sound();
+    Ok(record())
+}
+
+#[cfg(test)]
 pub(crate) fn switch_and_replay<T>(
     switch: impl FnOnce() -> io::Result<()>,
     play_sound: impl FnOnce(),
@@ -226,9 +234,7 @@ pub(crate) fn switch_and_replay<T>(
     replay: impl FnOnce() -> io::Result<()>,
     is_cancelled: &AtomicBool,
 ) -> io::Result<T> {
-    switch()?;
-    play_sound();
-    let result = record();
+    let result = switch_and_record(switch, play_sound, record)?;
     if !is_cancelled.load(Ordering::Relaxed) {
         replay()?;
     }

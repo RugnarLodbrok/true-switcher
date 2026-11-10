@@ -61,6 +61,7 @@ impl<'a> Interceptor<'a> {
                 interception.state.is_captured = true;
                 interception.phase = Phase::Captured;
                 interception.input.is_correction_cancelled = false;
+                interception.input.is_correcting = true;
                 interception.input.pending = None;
                 log::debug!("ENTRY accepted");
                 return Ok(Some(interception));
@@ -102,6 +103,7 @@ impl<'a> Interceptor<'a> {
         self.process_available_events()
     }
 
+    #[cfg(test)]
     pub fn input(&self) -> &Input {
         self.input
     }
@@ -117,10 +119,6 @@ impl<'a> Interceptor<'a> {
 
     pub fn take_cancel_request(&mut self) -> bool {
         self.input.take_cancel_request()
-    }
-
-    pub fn reset_history(&mut self) {
-        self.input.reset_history();
     }
 
     fn process_available_events(&mut self) -> io::Result<()> {
@@ -255,6 +253,7 @@ impl<'a> Interceptor<'a> {
 
 impl Drop for Interceptor<'_> {
     fn drop(&mut self) {
+        self.input.is_correcting = false;
         if self.phase == Phase::Finished || !self.is_cleanup_needed {
             return;
         }
@@ -272,5 +271,91 @@ impl Drop for Interceptor<'_> {
         }
         Self::log_cleanup("locks", self.release_locks());
         log::debug!("CLEANUP end");
+    }
+}
+
+const IS_CAPTURE_ENABLED: bool = false;
+
+pub trait CorrectionInterceptor {
+    fn input(&mut self) -> &mut Input;
+    fn read_available(&mut self) -> io::Result<bool>;
+    fn wait_for_correction(&mut self) -> io::Result<Option<io::Result<()>>>;
+    fn finish(self: Box<Self>) -> io::Result<()>;
+}
+
+pub fn enter_interceptor(
+    input: &mut Input,
+) -> io::Result<Option<Box<dyn CorrectionInterceptor + '_>>> {
+    if IS_CAPTURE_ENABLED {
+        Ok(Interceptor::enter(input)?
+            .map(|interceptor| Box::new(interceptor) as Box<dyn CorrectionInterceptor>))
+    } else {
+        Ok(Some(Box::new(UncapturedInterceptor::enter(input)?)))
+    }
+}
+
+impl CorrectionInterceptor for Interceptor<'_> {
+    fn input(&mut self) -> &mut Input {
+        self.input
+    }
+
+    fn read_available(&mut self) -> io::Result<bool> {
+        self.read_captured()
+    }
+
+    fn wait_for_correction(&mut self) -> io::Result<Option<io::Result<()>>> {
+        Interceptor::wait_for_correction(self)
+    }
+
+    fn finish(self: Box<Self>) -> io::Result<()> {
+        Interceptor::finish(*self)
+    }
+}
+
+pub(super) struct UncapturedInterceptor<'a> {
+    input: &'a mut Input,
+}
+
+impl<'a> UncapturedInterceptor<'a> {
+    pub(super) fn enter(input: &'a mut Input) -> io::Result<Self> {
+        input.is_correcting = true;
+        input.is_correction_cancelled = false;
+        input.pending = None;
+        input.is_original_switch_key_held = false;
+        let interceptor = Self { input };
+        let mut error = None;
+        for index in 0..interceptor.input.keyboards.len() {
+            for code in interceptor.input.keyboards[index].held.clone() {
+                if let Err(err) = interceptor.input.write_source(index, KeyCode::new(code), 0) {
+                    error.get_or_insert(err);
+                }
+            }
+        }
+        error.map_or(Ok(interceptor), Err)
+    }
+}
+
+impl CorrectionInterceptor for UncapturedInterceptor<'_> {
+    fn input(&mut self) -> &mut Input {
+        self.input
+    }
+
+    fn read_available(&mut self) -> io::Result<bool> {
+        self.input.process_available_events(None)?;
+        Ok(self.input.take_cancel_request())
+    }
+
+    fn wait_for_correction(&mut self) -> io::Result<Option<io::Result<()>>> {
+        self.input.wait_for_correction(None)
+    }
+
+    fn finish(self: Box<Self>) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for UncapturedInterceptor<'_> {
+    fn drop(&mut self) {
+        self.input.is_correcting = false;
     }
 }

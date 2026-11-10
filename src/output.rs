@@ -1,4 +1,5 @@
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use evdev::{
     AttributeSet, EventType, InputEvent, KeyCode, SynchronizationCode, SynchronizationEvent,
@@ -71,33 +72,54 @@ impl KeyboardOutput {
     }
 
     /// Send one Backspace tap per character to remove, including trailing spaces.
-    pub fn erase(&mut self, count: usize) -> io::Result<()> {
-        self.strokes(std::iter::repeat_n(
-            Stroke {
-                key: KeyCode::KEY_BACKSPACE,
-                shift: false,
-            },
-            count,
-        ))
+    pub fn erase(&mut self, count: usize, is_cancelled: &AtomicBool) -> io::Result<()> {
+        self.strokes(
+            std::iter::repeat_n(
+                Stroke {
+                    key: KeyCode::KEY_BACKSPACE,
+                    shift: false,
+                },
+                count,
+            ),
+            is_cancelled,
+        )
     }
 
     /// Replay each stored stroke as a tap, including repeats, then all spaces.
     /// This does not change the active layout or the stored word.
-    pub fn replay(&mut self, word: &Word) -> io::Result<()> {
-        self.strokes(replay_strokes(word)?)
+    pub fn replay(&mut self, word: &Word, is_cancelled: &AtomicBool) -> io::Result<()> {
+        self.strokes(replay_strokes(word)?, is_cancelled)
     }
 
-    fn strokes(&mut self, strokes: impl IntoIterator<Item = Stroke>) -> io::Result<()> {
-        if IS_BATCH_OUTPUT_ENABLED {
-            return emit_batch(strokes, |events| self.device.emit(events));
-        }
-        emit_strokes(strokes, |key, value| {
-            // emit appends SYN_REPORT. Press and release need separate frames,
-            // including repeated taps of the same key.
-            self.device
-                .emit(&[InputEvent::new(EventType::KEY.0, key.0, value)])
+    fn strokes(
+        &mut self,
+        strokes: impl IntoIterator<Item = Stroke>,
+        is_cancelled: &AtomicBool,
+    ) -> io::Result<()> {
+        emit_cancellable_strokes(strokes, is_cancelled, |stroke| {
+            if IS_BATCH_OUTPUT_ENABLED {
+                return emit_batch([stroke], |events| self.device.emit(events));
+            }
+            emit_stroke(stroke, |key, value| {
+                self.device
+                    .emit(&[InputEvent::new(EventType::KEY.0, key.0, value)])
+            })
         })
     }
+}
+
+fn emit_cancellable_strokes(
+    strokes: impl IntoIterator<Item = Stroke>,
+    is_cancelled: &AtomicBool,
+    mut emit: impl FnMut(Stroke) -> io::Result<()>,
+) -> io::Result<()> {
+    for stroke in strokes {
+        if is_cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+        emit(stroke)?;
+    }
+    Ok(())
 }
 
 fn emit_batch(
@@ -190,6 +212,23 @@ fn emit_stroke(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancellation_stops_before_next_synthetic_stroke() {
+        let is_cancelled = AtomicBool::new(false);
+        let mut emitted = Vec::new();
+        emit_cancellable_strokes(
+            [KeyCode::KEY_BACKSPACE, KeyCode::KEY_A].map(|key| Stroke { key, shift: false }),
+            &is_cancelled,
+            |stroke| {
+                emitted.push(stroke.key);
+                is_cancelled.store(true, Ordering::Relaxed);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(emitted, [KeyCode::KEY_BACKSPACE]);
+    }
 
     fn assert_batch_matches_legacy(strokes: Vec<Stroke>) {
         let syn = *SynchronizationEvent::new(SynchronizationCode::SYN_REPORT, 0);

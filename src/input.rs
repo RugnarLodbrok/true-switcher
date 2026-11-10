@@ -14,7 +14,9 @@ mod interception;
 mod pointer;
 
 use interception::InterceptionState;
-pub use interception::Interceptor;
+#[cfg(test)]
+use interception::Interceptor;
+pub use interception::{CorrectionInterceptor, enter_interceptor};
 
 use crate::history::History;
 use crate::hold::HoldDetector;
@@ -109,6 +111,7 @@ pub struct Input {
     holds: HoldDetector,
     correction_result: Option<io::Result<()>>,
     is_correction_cancelled: bool,
+    is_correcting: bool,
     switch_key: KeyCode,
     is_cancel_requested: bool,
     pending: Option<usize>,
@@ -138,6 +141,7 @@ impl Input {
             holds: HoldDetector::default(),
             correction_result: None,
             is_correction_cancelled: false,
+            is_correcting: false,
             switch_key,
             is_cancel_requested: false,
             pending: None,
@@ -241,6 +245,12 @@ impl Input {
         self.history.set_latest_layout(layout);
     }
 
+    pub fn begin_correction(&mut self, layout: Option<Arc<crate::layout::Layout>>) {
+        self.set_latest_layout(layout);
+        self.history.block_auto_switch();
+        self.automatic_target = None;
+    }
+
     fn is_ordinary_key_held(&self) -> bool {
         let Some(switch_source) = self.pending else {
             return false;
@@ -273,7 +283,7 @@ impl Input {
     ) -> io::Result<()> {
         self.drain_events(state.as_deref_mut())?;
         self.synchronize_history(state.as_deref());
-        self.update_back_off(Instant::now(), state.is_some_and(|state| state.is_captured));
+        self.update_back_off(Instant::now());
         self.lifecycle.check()
     }
 
@@ -350,7 +360,7 @@ impl Input {
             }
             InputEventMessage::FocusChanged
             | InputEventMessage::PointerPressed
-            | InputEventMessage::PointerEventsLost => self.request_history_reset(is_captured),
+            | InputEventMessage::PointerEventsLost => self.request_history_reset(),
             InputEventMessage::LayoutChanged(layout) => {
                 self.accept_layout(
                     layout,
@@ -362,13 +372,7 @@ impl Input {
             }
             InputEventMessage::CorrectionFinished { result, layout } => {
                 self.accept_layout(layout.clone(), true);
-                if result.is_ok() && !self.is_correction_cancelled {
-                    self.set_latest_layout(layout);
-                    if !self.is_auto_request {
-                        self.history.block_auto_switch();
-                        self.automatic_target = None;
-                    }
-                } else {
+                if result.is_err() || self.is_correction_cancelled {
                     self.accept_layout(layout, false);
                     self.reset_history();
                 }
@@ -483,7 +487,7 @@ impl Input {
         let key = KeyCode::new(event.code());
         let value = event.value();
         let is_captured = state.as_ref().is_some_and(|state| state.is_captured);
-        self.update_back_off(now, is_captured);
+        self.update_back_off(now);
         self.holds.update(index, key.0, value, now);
         self.track_key(index, event);
         if let Some(recording) = state.and_then(|state| state.recording.as_mut()) {
@@ -493,13 +497,13 @@ impl Input {
             return Ok(());
         }
         if value == 2 && !is_shift(key) {
-            self.start_back_off(is_captured);
+            self.start_back_off();
         }
         if self.is_backing_off {
             if value == 0 {
-                self.request_history_reset(is_captured);
+                self.request_history_reset();
             }
-            self.update_back_off(now, is_captured);
+            self.update_back_off(now);
             return Ok(());
         }
         self.process_history_event(index, key, value, is_captured)
@@ -537,8 +541,10 @@ impl Input {
             key,
             KeyCode::KEY_TAB | KeyCode::KEY_ENTER | KeyCode::KEY_KPENTER
         ) && !self.has_shortcut_modifier();
-        if self.should_reset_for_key(key, value) && (!is_hard_separator || is_captured) {
-            self.request_history_reset(is_captured);
+        if self.should_reset_for_key(key, value)
+            && (!is_hard_separator || is_captured || self.is_correcting)
+        {
+            self.request_history_reset();
         }
         if is_captured || self.keyboards[index].device.is_grabbed() {
             return Ok(());
@@ -547,7 +553,10 @@ impl Input {
             if value == 0 && self.pending == Some(index) {
                 self.is_original_switch_key_held = false;
             }
-            if value == 1 && self.pending.is_none() && !self.has_other_switch_modifiers(index, key)
+            if value == 1
+                && !self.is_correcting
+                && self.pending.is_none()
+                && !self.has_other_switch_modifiers(index, key)
             {
                 self.pending = Some(index);
                 self.is_auto_request = false;
@@ -585,6 +594,7 @@ impl Input {
         if matches!(value, 1 | 2)
             && crate::history::is_text_key(key)
             && !self.has_shortcut_modifier()
+            && !self.is_correcting
             && (self.pending.is_none() || self.is_auto_request)
             && !self.history.is_auto_switch_blocked()
         {
@@ -636,33 +646,33 @@ impl Input {
         })
     }
 
-    fn request_history_reset(&mut self, is_captured: bool) {
+    fn request_history_reset(&mut self) {
         self.automatic_target = None;
         if self.is_auto_request {
             self.pending = None;
             self.is_auto_request = false;
         }
         self.reset_history();
-        if is_captured {
+        if self.is_correcting {
             self.is_cancel_requested = true;
             self.is_correction_cancelled = true;
         }
     }
 
-    fn start_back_off(&mut self, is_captured: bool) {
+    fn start_back_off(&mut self) {
         if self.is_backing_off {
             return;
         }
         self.is_backing_off = true;
-        self.request_history_reset(is_captured);
+        self.request_history_reset();
         self.pending = None;
         self.is_auto_request = false;
         self.is_original_switch_key_held = false;
     }
 
-    fn update_back_off(&mut self, now: Instant, is_captured: bool) {
+    fn update_back_off(&mut self, now: Instant) {
         if self.holds.expire(now) {
-            self.start_back_off(is_captured);
+            self.start_back_off();
         }
         if self.is_backing_off
             && self
@@ -1098,6 +1108,7 @@ pub(crate) mod tests {
             holds,
             correction_result: None,
             is_correction_cancelled: false,
+            is_correcting: false,
             switch_key: KeyCode::KEY_PAUSE,
             is_cancel_requested: false,
             pending: Some(0),
@@ -1213,6 +1224,7 @@ patterns = ['^\.тф']
         assert!(input.latest_word().unwrap().entries[0].stroke.shift);
         let mut state = InterceptionState::default();
         state.is_captured = true;
+        input.is_correcting = true;
         input
             .process(
                 0,
@@ -1491,7 +1503,7 @@ patterns = ['^\.тф']
     }
 
     #[test]
-    fn completion_replaces_deferred_layout_and_late_duplicate_preserves_corrected_word() {
+    fn completion_preserves_early_history_update_and_late_duplicate() {
         let (mut input, sender) = channel_input();
         input.accept_layout(Some(layout("us")), false);
         press(&mut input, KeyCode::KEY_A);
@@ -1508,6 +1520,7 @@ patterns = ['^\.тф']
                 .as_deref(),
             Ok("a")
         );
+        CorrectionInterceptor::input(&mut interception).begin_correction(Some(layout("ru")));
         sender.send(InputEventMessage::CorrectionFinished {
             result: Ok(()),
             layout: Some(layout("ru")),
@@ -1535,6 +1548,7 @@ patterns = ['^\.тф']
         press(&mut input, KeyCode::KEY_A);
         event_at(&mut input, 0, KeyCode::KEY_A, 0, Instant::now());
         let mut interception = Interceptor::enter(&mut input).unwrap().unwrap();
+        CorrectionInterceptor::input(&mut interception).begin_correction(Some(layout("ru")));
         sender.send(InputEventMessage::CorrectionFinished {
             result: Ok(()),
             layout: Some(layout("ru")),
@@ -1616,6 +1630,7 @@ patterns = ['^\.тф']
         let (mut input, _sender) = channel_input();
         let mut state = InterceptionState::default();
         state.is_captured = true;
+        input.is_correcting = true;
         input
             .process_at(
                 0,
@@ -1676,7 +1691,7 @@ patterns = ['^\.тф']
         event_at(&mut input, 0, KeyCode::KEY_A, 1, now);
         event_at(&mut input, 0, KeyCode::KEY_B, 1, now + HOLD_TIMEOUT / 2);
         event_at(&mut input, 0, KeyCode::KEY_A, 0, now + HOLD_TIMEOUT / 2);
-        input.update_back_off(now + HOLD_TIMEOUT, false);
+        input.update_back_off(now + HOLD_TIMEOUT);
         assert!(!input.is_backing_off);
         input.holds.update(0, KeyCode::KEY_B.0, 0, now);
         input.holds.update(
@@ -1717,7 +1732,7 @@ patterns = ['^\.тф']
             event_at(&mut input, 1, key, 2, now);
         }
         let later = now + HOLD_TIMEOUT + TEST_STEP;
-        input.update_back_off(later, false);
+        input.update_back_off(later);
         assert!(!input.is_backing_off);
         event_at(&mut input, 0, KeyCode::KEY_A, 1, later);
         event_at(&mut input, 0, KeyCode::KEY_A, 2, later);
@@ -1745,6 +1760,7 @@ patterns = ['^\.тф']
         assert!(input.automatic_target().is_some());
         let mut state = InterceptionState::default();
         state.is_captured = true;
+        input.is_correcting = true;
         input
             .process(
                 0,
@@ -1808,9 +1824,9 @@ patterns = ['^\.тф']
             let mut input = auto_input();
             let now = Instant::now();
             event_at(&mut input, 0, key, 1, now);
-            input.update_back_off(now + HOLD_TIMEOUT, false);
+            input.update_back_off(now + HOLD_TIMEOUT);
             assert!(!input.is_backing_off);
-            input.update_back_off(now + HOLD_TIMEOUT + TEST_STEP, false);
+            input.update_back_off(now + HOLD_TIMEOUT + TEST_STEP);
             assert!(input.is_backing_off, "{key:?}");
             assert!(input.pending.is_none());
         }
@@ -1840,6 +1856,7 @@ patterns = ['^\.тф']
         assert!(input.pending.is_some());
         assert!(!input.is_auto_request());
         input.pending = None;
+        input.begin_correction(Some(layout(target)));
         input
             .process_message(
                 InputEventMessage::CorrectionFinished {
@@ -1940,7 +1957,7 @@ patterns = ['^\.тф']
     }
 
     #[test]
-    fn auto_switches_before_separator_and_can_switch_same_word_again() {
+    fn auto_switch_blocks_further_automatic_corrections_of_same_word() {
         let mut input = auto_input();
         press(&mut input, KeyCode::KEY_SLASH);
         assert!(input.pending.is_none());
@@ -1949,6 +1966,7 @@ patterns = ['^\.тф']
         let us = input.automatic_target().unwrap();
         assert_eq!(us.name(), "us");
         assert_eq!(input.latest_word().unwrap().text().as_deref(), Ok(".т"));
+        input.begin_correction(Some(us.clone()));
         input
             .process_message(
                 InputEventMessage::CorrectionFinished {
@@ -1958,10 +1976,11 @@ patterns = ['^\.тф']
                 None,
             )
             .unwrap();
-        assert!(!input.history.is_auto_switch_blocked());
+        assert!(input.history.is_auto_switch_blocked());
         input.pending = None;
         press(&mut input, KeyCode::KEY_A);
-        assert_eq!(input.automatic_target().unwrap().name(), "ru");
+        assert!(input.automatic_target().is_none());
+        assert!(input.pending.is_none());
         assert_eq!(input.latest_word().unwrap().text().as_deref(), Ok("/na"));
     }
 
@@ -2076,6 +2095,176 @@ patterns = ['^\.тф']
                 .to_string()
                 .contains("SYN_DROPPED")
         );
+    }
+
+    #[test]
+    fn default_interceptor_releases_all_sources_without_grabbing_or_waiting() {
+        let keys = [KeyCode::KEY_A, KeyCode::KEY_LEFTCTRL, KeyCode::KEY_PAUSE]
+            .into_iter()
+            .chain(LOCK_KEYS)
+            .map(|key| key.0)
+            .collect();
+        let first = Rc::new(RefCell::new(SimulatedKeyboard {
+            held: keys,
+            ..Default::default()
+        }));
+        let second = Rc::new(RefCell::new(SimulatedKeyboard {
+            held: BTreeSet::from([KeyCode::KEY_B.0, KeyCode::KEY_RIGHTSHIFT.0]),
+            ..Default::default()
+        }));
+        let mut input = simulated_input(&[first.clone(), second.clone()]);
+        let mut interceptor = enter_interceptor(&mut input).unwrap().unwrap();
+        assert!(!interceptor.read_available().unwrap());
+        assert!(interceptor.input().holds.deadline().is_none());
+        for source in [&first, &second] {
+            let keyboard = source.borrow();
+            assert!(keyboard.held.is_empty());
+            assert_eq!(keyboard.grab_count, 0);
+            assert!(
+                keyboard
+                    .writes
+                    .iter()
+                    .all(|(_, value, captured)| *value == 0 && !captured)
+            );
+        }
+        assert_eq!(first.borrow().writes.len(), 6);
+        assert_eq!(second.borrow().writes.len(), 2);
+        press(interceptor.input(), KeyCode::KEY_C);
+        interceptor.finish().unwrap();
+        assert!(input.keyboards[0].held.contains(&KeyCode::KEY_C.0));
+        assert!(!input.is_correcting);
+        assert_eq!(first.borrow().ungrab_count, 0);
+    }
+
+    #[test]
+    fn both_interceptors_preserve_early_history_update_through_common_interface() {
+        for is_captured in [false, true] {
+            let (mut input, sender) = channel_input();
+            input.accept_layout(Some(layout("us")), false);
+            press(&mut input, KeyCode::KEY_A);
+            statistics_event(&mut input, KeyCode::KEY_A, 0);
+            let mut interceptor: Box<dyn CorrectionInterceptor> = if is_captured {
+                Box::new(Interceptor::enter(&mut input).unwrap().unwrap())
+            } else {
+                Box::new(interception::UncapturedInterceptor::enter(&mut input).unwrap())
+            };
+            interceptor.input().begin_correction(Some(layout("ru")));
+            assert_eq!(
+                interceptor.input().latest_word().unwrap().text().as_deref(),
+                Ok("ф")
+            );
+            assert!(interceptor.input().history.is_auto_switch_blocked());
+            sender.send(InputEventMessage::CorrectionFinished {
+                result: Ok(()),
+                layout: Some(layout("ru")),
+            });
+            assert!(interceptor.wait_for_correction().unwrap().unwrap().is_ok());
+            interceptor.finish().unwrap();
+            assert!(!input.is_correcting);
+            assert_eq!(input.latest_word().unwrap().text().as_deref(), Ok("ф"));
+            assert!(input.history.is_auto_switch_blocked());
+        }
+    }
+
+    #[test]
+    fn uncaptured_text_uses_new_layout_and_completion_does_not_rewrite_new_word() {
+        let (mut input, sender) = channel_input();
+        input.accept_layout(Some(layout("us")), false);
+        press(&mut input, KeyCode::KEY_A);
+        let mut interceptor = interception::UncapturedInterceptor::enter(&mut input).unwrap();
+        interceptor.input().begin_correction(Some(layout("ru")));
+        press(interceptor.input(), KeyCode::KEY_B);
+        assert_eq!(
+            interceptor.input().latest_word().unwrap().text().as_deref(),
+            Ok("фи")
+        );
+        assert!(interceptor.input().history.is_auto_switch_blocked());
+        press(interceptor.input(), KeyCode::KEY_SPACE);
+        press(interceptor.input(), KeyCode::KEY_C);
+        assert!(!interceptor.input().history.is_auto_switch_blocked());
+        sender.send(InputEventMessage::CorrectionFinished {
+            result: Ok(()),
+            layout: Some(layout("ru")),
+        });
+        assert!(!interceptor.read_available().unwrap());
+        assert!(interceptor.wait_for_correction().unwrap().unwrap().is_ok());
+        assert_eq!(interceptor.input().latest_word().unwrap().entries.len(), 1);
+        assert_eq!(
+            interceptor.input().latest_word().unwrap().text().as_deref(),
+            Ok("с")
+        );
+        assert!(!interceptor.input().history.is_auto_switch_blocked());
+    }
+
+    #[test]
+    fn uncaptured_correction_ignores_switch_requests_but_records_text() {
+        let mut input = auto_input();
+        press(&mut input, KeyCode::KEY_A);
+        let mut interceptor = interception::UncapturedInterceptor::enter(&mut input).unwrap();
+        interceptor.input().begin_correction(Some(layout("us")));
+        for key in [
+            KeyCode::KEY_SPACE,
+            KeyCode::KEY_SLASH,
+            KeyCode::KEY_N,
+            KeyCode::KEY_A,
+            KeyCode::KEY_PAUSE,
+        ] {
+            press(interceptor.input(), key);
+            statistics_event(interceptor.input(), key, 0);
+        }
+        assert!(!interceptor.read_available().unwrap());
+        assert!(interceptor.input().pending.is_none());
+        assert!(interceptor.input().automatic_target().is_none());
+        assert_eq!(
+            interceptor.input().latest_word().unwrap().text().as_deref(),
+            Ok("/na")
+        );
+        Box::new(interceptor).finish().unwrap();
+        assert!(input.pending.is_none());
+        press(&mut input, KeyCode::KEY_PAUSE);
+        assert!(input.pending.is_some());
+    }
+
+    #[test]
+    fn uncaptured_correction_cancels_on_focus_navigation_and_long_hold() {
+        for event in [
+            InputEventMessage::FocusChanged,
+            InputEventMessage::PointerPressed,
+        ] {
+            let (mut input, sender) = channel_input();
+            let mut interceptor = interception::UncapturedInterceptor::enter(&mut input).unwrap();
+            sender.send(event);
+            assert!(interceptor.read_available().unwrap());
+            assert!(interceptor.input().is_correction_cancelled);
+        }
+        for key in [KeyCode::KEY_LEFT, KeyCode::KEY_TAB, KeyCode::KEY_A] {
+            let (mut input, _) = channel_input();
+            let mut interceptor = interception::UncapturedInterceptor::enter(&mut input).unwrap();
+            let now = Instant::now();
+            event_at(interceptor.input(), 0, key, 1, now);
+            if key == KeyCode::KEY_A {
+                assert!(!interceptor.input().take_cancel_request());
+                interceptor
+                    .input()
+                    .update_back_off(now + HOLD_TIMEOUT + TEST_STEP);
+            }
+            assert!(interceptor.input().take_cancel_request(), "{key:?}");
+        }
+    }
+
+    #[test]
+    fn uncaptured_release_failure_attempts_other_keys_and_clears_operation_state() {
+        let source = Rc::new(RefCell::new(SimulatedKeyboard {
+            held: BTreeSet::from([KeyCode::KEY_A.0, KeyCode::KEY_B.0]),
+            write_failures: BTreeMap::from([((KeyCode::KEY_A.0, 0), 1)]),
+            ..Default::default()
+        }));
+        let mut input = simulated_input(std::slice::from_ref(&source));
+        assert!(interception::UncapturedInterceptor::enter(&mut input).is_err());
+        assert!(!input.is_correcting);
+        assert_eq!(source.borrow().writes.len(), 2);
+        assert_eq!(source.borrow().grab_count, 0);
+        assert!(!source.borrow().held.contains(&KeyCode::KEY_B.0));
     }
 
     #[test]
