@@ -575,7 +575,11 @@ impl Input {
         value: i32,
         is_hard_separator: bool,
     ) {
-        if matches!(value, 1 | 2) && !self.has_shortcut_modifier() {
+        if !matches!(value, 1 | 2) {
+            return;
+        }
+
+        if !self.has_shortcut_modifier() {
             if is_hard_separator {
                 self.reset_history();
             } else {
@@ -588,11 +592,10 @@ impl Input {
                 self.history.process(key, is_shift, self.layout.clone());
             }
         }
-        if matches!(value, 1 | 2) && key == KeyCode::KEY_BACKSPACE {
+        if key == KeyCode::KEY_BACKSPACE {
             self.automatic_target = None;
         }
-        if matches!(value, 1 | 2)
-            && crate::history::is_text_key(key)
+        if crate::history::is_text_key(key)
             && !self.has_shortcut_modifier()
             && !self.is_correcting
             && (self.pending.is_none() || self.is_auto_request)

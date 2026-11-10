@@ -74,7 +74,7 @@ pub fn start_signals(sender: InputEventSender) -> io::Result<()> {
     let mut signals = SigSet::empty();
     signals.add(Signal::SIGTERM);
     signals.add(Signal::SIGINT);
-    signals.thread_block()?;  // Все последующие потоки наследуют маску для `sigwait`.
+    signals.thread_block()?; // Все последующие потоки наследуют маску для `sigwait`.
     thread::Builder::new()
         .name("shutdown-signals".into())
         .spawn(move || {
