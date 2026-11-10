@@ -1,8 +1,6 @@
 use std::collections::BTreeSet;
-use std::fs::OpenOptions;
 use std::io;
-use std::os::fd::AsFd;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -12,6 +10,7 @@ use evdev::{EventType, InputEvent, KeyCode, SynchronizationCode, raw_stream::Raw
 mod correction;
 mod devices;
 mod interception;
+mod keyboard;
 mod pointer;
 
 use correction::CorrectionState;
@@ -19,9 +18,11 @@ use interception::InterceptionState;
 #[cfg(test)]
 use interception::Interceptor;
 pub use interception::{CorrectionInterceptor, enter_interceptor};
+use keyboard::KeyboardInput;
+#[cfg(test)]
+use keyboard::Source;
 
 use crate::history::History;
-use crate::hold::HoldDetector;
 use crate::input_events::{InputEventMessage, InputEventSender, InputEvents};
 use crate::lifecycle::{Lifecycle, ProcessingError, ProcessingResult, ShutdownReason};
 
@@ -96,44 +97,8 @@ impl EntryRecording {
     }
 }
 
-struct Keyboard {
-    path: PathBuf,
-    device: Box<dyn Source>,
-    held: BTreeSet<u16>,
-}
-
-trait Source {
-    fn keys(&self) -> io::Result<BTreeSet<u16>>;
-    fn send(&mut self, events: &[InputEvent]) -> io::Result<()>;
-    fn grab(&mut self) -> io::Result<()>;
-    fn ungrab(&mut self) -> io::Result<()>;
-    fn is_grabbed(&self) -> bool;
-}
-
-impl Source for RawDevice {
-    fn keys(&self) -> io::Result<BTreeSet<u16>> {
-        Ok(self.get_key_state()?.iter().map(|key| key.0).collect())
-    }
-
-    fn send(&mut self, events: &[InputEvent]) -> io::Result<()> {
-        self.send_events(events)
-    }
-
-    fn grab(&mut self) -> io::Result<()> {
-        RawDevice::grab(self)
-    }
-
-    fn ungrab(&mut self) -> io::Result<()> {
-        RawDevice::ungrab(self)
-    }
-
-    fn is_grabbed(&self) -> bool {
-        RawDevice::is_grabbed(self)
-    }
-}
-
 pub struct Input {
-    keyboards: Vec<Keyboard>,
+    keyboard_input: KeyboardInput,
     lifecycle: Lifecycle,
     history: History,
     statistics: Option<crate::statistics::Statistics>,
@@ -141,7 +106,6 @@ pub struct Input {
     layout: Option<Arc<crate::layout::Layout>>,
     observed_layout: Option<Arc<crate::layout::Layout>>,
     events: InputEvents,
-    holds: HoldDetector,
     correction: CorrectionState,
     switch_key: KeyCode,
     pending: Option<usize>,
@@ -160,7 +124,7 @@ impl Input {
         auto_switch: crate::switch_rules::AutoSwitchRules,
     ) -> io::Result<Self> {
         let mut input = Self {
-            keyboards: Vec::new(),
+            keyboard_input: KeyboardInput::default(),
             lifecycle: Lifecycle::Running,
             history: History::default(),
             statistics: Some(statistics),
@@ -168,7 +132,6 @@ impl Input {
             layout: None,
             observed_layout: None,
             events,
-            holds: HoldDetector::default(),
             correction: CorrectionState::default(),
             switch_key,
             pending: None,
@@ -190,7 +153,7 @@ impl Input {
         monitor: &devices::Monitor,
     ) -> io::Result<()> {
         for path in monitor.keyboards.keys() {
-            if let Err(error) = self.open_keyboard(path.clone(), sender) {
+            if let Err(error) = self.keyboard_input.open(path.clone(), sender) {
                 if is_disconnection(&error) {
                     self.devices_changed(Instant::now());
                 } else if error.kind() == io::ErrorKind::PermissionDenied {
@@ -200,26 +163,9 @@ impl Input {
                 }
             }
         }
-        if self.keyboards.is_empty() {
+        if self.keyboard_input.len() == 0 {
             log::info!("No accessible keyboards; waiting for a keyboard to appear");
         }
-        Ok(())
-    }
-
-    fn open_keyboard(&mut self, path: PathBuf, sender: &InputEventSender) -> io::Result<()> {
-        let device = open_device(&path)?;
-        let held: BTreeSet<_> = device.get_key_state()?.iter().map(|key| key.0).collect();
-        self.holds
-            .snapshot(self.keyboards.len(), &held, Instant::now());
-        log::debug!("OPEN {} {:?}", path.display(), device.name());
-        log::trace!("OPEN {} held={held:?}", path.display());
-        let reader = RawDevice::from_fd(device.as_fd().try_clone_to_owned()?)?;
-        start_reader(reader, path.clone(), self.keyboards.len(), sender.clone())?;
-        self.keyboards.push(Keyboard {
-            path,
-            device: Box::new(device),
-            held,
-        });
         Ok(())
     }
 
@@ -320,13 +266,11 @@ impl Input {
         let Some(switch_source) = self.pending else {
             return false;
         };
-        self.keyboards.iter().enumerate().any(|(index, keyboard)| {
-            keyboard.held.iter().any(|&code| {
-                !MODIFIERS.contains(&KeyCode::new(code))
-                    && !(self.is_original_switch_key_held
-                        && index == switch_source
-                        && code == self.switch_key.0)
-            })
+        self.keyboard_input.held_keys().any(|(index, code)| {
+            !MODIFIERS.contains(&KeyCode::new(code))
+                && !(self.is_original_switch_key_held
+                    && index == switch_source
+                    && code == self.switch_key.0)
         })
     }
 
@@ -391,7 +335,7 @@ impl Input {
         let hold_deadline = if self.is_backing_off {
             None
         } else {
-            self.holds.deadline()
+            self.keyboard_input.hold_deadline()
         };
         let deadline = deadline.into_iter().chain(hold_deadline).min();
         if let Some(event) = self.events.wait(deadline)? {
@@ -415,7 +359,7 @@ impl Input {
             InputEventMessage::DeviceDisconnected(index, at) => {
                 log::info!(
                     "Keyboard disconnected: {}",
-                    self.keyboards[index].path.display()
+                    self.keyboard_input.path(index).display()
                 );
                 if self.lifecycle == Lifecycle::Running {
                     self.devices_changed(at);
@@ -527,7 +471,7 @@ impl Input {
         {
             return Err(io::Error::other(format!(
                 "{}: SYN_DROPPED",
-                self.keyboards[index].path.display()
+                self.keyboard_input.path(index).display()
             ))
             .into());
         }
@@ -538,15 +482,14 @@ impl Input {
         let value = event.value();
         let is_captured = state.as_ref().is_some_and(|state| state.is_captured);
         self.update_back_off(now);
-        self.holds.update(index, key.0, value, now);
-        self.track_key(index, event);
+        let is_hold = self.keyboard_input.update(index, event, now);
         if let Some(recording) = state.and_then(|state| state.recording.as_mut()) {
             recording.record(index, key.0, value);
         }
         if self.lifecycle != Lifecycle::Running {
             return Ok(());
         }
-        if value == 2 && !is_shift(key) {
+        if is_hold {
             self.start_back_off();
         }
         if self.is_backing_off {
@@ -559,27 +502,6 @@ impl Input {
         self.process_history_event(index, key, value, is_captured)
     }
 
-    fn track_key(&mut self, index: usize, event: InputEvent) {
-        let keyboard = &mut self.keyboards[index];
-        let key = KeyCode::new(event.code());
-        let value = event.value();
-        log::trace!(
-            "EVDEV {} {key:?} value={value} kernel_time={:?} grabbed={}",
-            keyboard.path.display(),
-            event.timestamp(),
-            keyboard.device.is_grabbed()
-        );
-        match value {
-            0 => {
-                keyboard.held.remove(&key.0);
-            }
-            1 | 2 => {
-                keyboard.held.insert(key.0);
-            }
-            _ => {}
-        }
-    }
-
     fn process_history_event(
         &mut self,
         index: usize,
@@ -590,13 +512,13 @@ impl Input {
         let is_hard_separator = matches!(
             key,
             KeyCode::KEY_TAB | KeyCode::KEY_ENTER | KeyCode::KEY_KPENTER
-        ) && !self.has_shortcut_modifier();
+        ) && !self.keyboard_input.has_shortcut_modifier();
         if self.should_reset_for_key(key, value)
             && (!is_hard_separator || is_captured || self.correction.is_active())
         {
             self.request_history_reset();
         }
-        if is_captured || self.keyboards[index].device.is_grabbed() {
+        if is_captured || self.keyboard_input.is_grabbed(index) {
             return Ok(());
         }
         if key == self.switch_key {
@@ -629,16 +551,14 @@ impl Input {
             return;
         }
 
-        if !self.has_shortcut_modifier() {
+        if !self.keyboard_input.has_shortcut_modifier() {
             if is_hard_separator {
                 self.reset_history();
             } else {
-                let is_shift = self.keyboards.iter().any(|keyboard| {
-                    keyboard
-                        .held
-                        .iter()
-                        .any(|&code| is_shift(KeyCode::new(code)))
-                });
+                let is_shift = self
+                    .keyboard_input
+                    .held_keys()
+                    .any(|(_, code)| is_shift(KeyCode::new(code)));
                 self.history.process(key, is_shift, self.layout.clone());
             }
         }
@@ -646,7 +566,7 @@ impl Input {
             self.automatic_target = None;
         }
         if crate::history::is_text_key(key)
-            && !self.has_shortcut_modifier()
+            && !self.keyboard_input.has_shortcut_modifier()
             && !self.correction.is_active()
             && (self.pending.is_none() || self.is_auto_request)
             && !self.history.is_auto_switch_blocked()
@@ -671,31 +591,12 @@ impl Input {
         if NAVIGATION_KEYS.contains(&key) || key == KeyCode::KEY_TAB || key == KeyCode::KEY_DELETE {
             return true;
         }
-        self.has_shortcut_modifier() && !MODIFIERS.contains(&key)
-    }
-
-    fn has_shortcut_modifier(&self) -> bool {
-        self.keyboards.iter().any(|keyboard| {
-            keyboard.held.iter().any(|&code| {
-                matches!(
-                    KeyCode::new(code),
-                    KeyCode::KEY_LEFTCTRL
-                        | KeyCode::KEY_RIGHTCTRL
-                        | KeyCode::KEY_LEFTALT
-                        | KeyCode::KEY_RIGHTALT
-                        | KeyCode::KEY_LEFTMETA
-                        | KeyCode::KEY_RIGHTMETA
-                )
-            })
-        })
+        self.keyboard_input.has_shortcut_modifier() && !MODIFIERS.contains(&key)
     }
 
     fn has_other_switch_modifiers(&self, source: usize, switch_key: KeyCode) -> bool {
-        self.keyboards.iter().enumerate().any(|(index, keyboard)| {
-            keyboard.held.iter().any(|&code| {
-                MODIFIERS.contains(&KeyCode::new(code))
-                    && !(index == source && code == switch_key.0)
-            })
+        self.keyboard_input.held_keys().any(|(index, code)| {
+            MODIFIERS.contains(&KeyCode::new(code)) && !(index == source && code == switch_key.0)
         })
     }
 
@@ -723,15 +624,10 @@ impl Input {
     }
 
     fn update_back_off(&mut self, now: Instant) {
-        if self.holds.expire(now) {
+        if self.keyboard_input.expire_holds(now) {
             self.start_back_off();
         }
-        if self.is_backing_off
-            && self
-                .keyboards
-                .iter()
-                .all(|keyboard| keyboard.held.is_empty())
-        {
+        if self.is_backing_off && self.keyboard_input.all_released() {
             self.is_backing_off = false;
         }
     }
@@ -770,40 +666,15 @@ impl Input {
     }
 
     fn write_source(&mut self, index: usize, key: KeyCode, value: i32) -> ProcessingResult<()> {
-        let keyboard = &mut self.keyboards[index];
-        log::trace!(
-            "SOURCE_WRITE attempt {} {key:?} value={value} grabbed={}",
-            keyboard.path.display(),
-            keyboard.device.is_grabbed()
-        );
-        let result = keyboard.device.send(&[
-            InputEvent::new(EventType::KEY.0, key.0, value),
-            InputEvent::new(
-                EventType::SYNCHRONIZATION.0,
-                SynchronizationCode::SYN_REPORT.0,
-                0,
-            ),
-        ]);
-        log::trace!(
-            "SOURCE_WRITE result {} {key:?} value={value}: {result:?}",
-            keyboard.path.display()
-        );
-        self.device_result(result)?;
-        self.holds.update(index, key.0, value, Instant::now());
-        let keyboard = &mut self.keyboards[index];
-        if value == 0 {
-            keyboard.held.remove(&key.0);
-        } else {
-            keyboard.held.insert(key.0);
-        }
-        Ok(())
+        let result = self.keyboard_input.write_source(index, key, value);
+        self.device_result(result)
     }
 
     fn release_modifiers(&mut self) -> ProcessingResult<()> {
         let mut error = None;
-        for index in 0..self.keyboards.len() {
+        for index in 0..self.keyboard_input.len() {
             for key in MODIFIERS {
-                if self.keyboards[index].held.contains(&key.0)
+                if self.keyboard_input.is_key_held(index, key.0)
                     && let Err(err) = self.write_source(index, key, 0)
                 {
                     log::error!("RELEASE modifier keyboard={index} {key:?}: {err}");
@@ -816,7 +687,7 @@ impl Input {
 
     fn release_locks(&mut self) -> ProcessingResult<()> {
         let mut error = None;
-        for index in 0..self.keyboards.len() {
+        for index in 0..self.keyboard_input.len() {
             for key in LOCK_KEYS {
                 if let Err(err) = self.write_source(index, key, 0) {
                     log::error!("RELEASE lock keyboard={index} {key:?}: {err}");
@@ -828,37 +699,22 @@ impl Input {
     }
 
     fn grab(&mut self) -> ProcessingResult<()> {
-        for index in 0..self.keyboards.len() {
-            let result = self.keyboards[index].device.grab();
-            if result.is_ok() {
-                log::debug!("GRAB {}", self.keyboards[index].path.display());
-            }
+        for index in 0..self.keyboard_input.len() {
+            let result = self.keyboard_input.grab(index);
             self.device_result(result)?;
         }
         Ok(())
     }
 
     fn ungrab(&mut self) -> ProcessingResult<()> {
-        let mut error = None;
-        for keyboard in &mut self.keyboards {
-            if keyboard.device.is_grabbed() {
-                let result = keyboard.device.ungrab();
-                if result.is_ok() {
-                    log::debug!("UNGRAB {}", keyboard.path.display());
-                }
-                if let Err(err) = result {
-                    log::error!("UNGRAB {}: {err}", keyboard.path.display());
-                    error.get_or_insert(err);
-                }
-            }
-        }
-        self.device_result(error.map_or(Ok(()), Err))
+        let result = self.keyboard_input.ungrab();
+        self.device_result(result)
     }
 
     fn snapshot(&mut self, mut state: Option<&mut InterceptionState>) -> ProcessingResult<()> {
         let mut error = None;
-        for index in 0..self.keyboards.len() {
-            let keys = self.keyboards[index].device.keys();
+        for index in 0..self.keyboard_input.len() {
+            let keys = self.keyboard_input.snapshot(index).cloned();
             let keys = match self.device_result(keys) {
                 Ok(keys) => keys,
                 Err(err) => {
@@ -867,16 +723,13 @@ impl Input {
                     continue;
                 }
             };
-            let keyboard = &mut self.keyboards[index];
-            keyboard.held = keys;
-            self.holds.snapshot(index, &keyboard.held, Instant::now());
             if let Some(recording) = state
                 .as_deref_mut()
                 .and_then(|state| state.recording.as_mut())
             {
                 recording
                     .presses
-                    .extend(keyboard.held.iter().map(|&code| (index, code)));
+                    .extend(keys.iter().map(|&code| (index, code)));
             }
         }
         error.map_or(Ok(()), Err)
@@ -896,17 +749,6 @@ impl Input {
 
 fn is_shift(key: KeyCode) -> bool {
     matches!(key, KeyCode::KEY_LEFTSHIFT | KeyCode::KEY_RIGHTSHIFT)
-}
-
-fn open_device(path: &Path) -> io::Result<RawDevice> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .inspect_err(|error| {
-            log::warn!("{} requires read/write access: {error}", path.display());
-        })?;
-    RawDevice::try_from(file)
 }
 
 fn is_disconnection(error: &io::Error) -> bool {
@@ -1131,7 +973,6 @@ pub(crate) mod tests {
 
     fn simulated_input(sources: &[Rc<RefCell<SimulatedKeyboard>>]) -> Input {
         let (sender, events) = InputEvents::new();
-        let mut holds = HoldDetector::default();
         let keyboards = sources
             .iter()
             .enumerate()
@@ -1140,16 +981,15 @@ pub(crate) mod tests {
                     sender: Some(sender.clone()),
                     index,
                 };
-                holds.snapshot(index, &source.borrow().held, Instant::now());
-                Keyboard {
-                    path: PathBuf::from(format!("keyboard-{index}")),
-                    device: Box::new(SimulatedSource(source.clone())),
-                    held: source.borrow().held.clone(),
-                }
+                (
+                    PathBuf::from(format!("keyboard-{index}")),
+                    Box::new(SimulatedSource(source.clone())) as Box<dyn Source>,
+                    source.borrow().held.clone(),
+                )
             })
             .collect();
         Input {
-            keyboards,
+            keyboard_input: KeyboardInput::from_sources(keyboards),
             lifecycle: Lifecycle::Running,
             history: History::default(),
             statistics: None,
@@ -1157,7 +997,6 @@ pub(crate) mod tests {
             layout: None,
             observed_layout: None,
             events,
-            holds,
             correction: CorrectionState::default(),
             switch_key: KeyCode::KEY_PAUSE,
             pending: Some(0),
@@ -1442,7 +1281,7 @@ patterns = ['^\.тф']
 
         assert_eq!(input.pending, Some(0));
         assert!(!input.is_original_switch_key_held);
-        assert!(!input.keyboards[0].held.contains(&KeyCode::KEY_PAUSE.0));
+        assert!(!input.keyboard_input.is_key_held(0, KeyCode::KEY_PAUSE.0));
         assert!(input.events.available().unwrap().is_none());
     }
 
@@ -1835,11 +1674,14 @@ patterns = ['^\.тф']
         event_at(&mut input, 0, KeyCode::KEY_A, 0, now + HOLD_TIMEOUT / 2);
         input.update_back_off(now + HOLD_TIMEOUT);
         assert!(!input.is_backing_off);
-        input.holds.update(0, KeyCode::KEY_B.0, 0, now);
-        input.holds.update(
+        input.keyboard_input.update(
             0,
-            KeyCode::KEY_B.0,
-            1,
+            InputEvent::new(EventType::KEY.0, KeyCode::KEY_B.0, 0),
+            now,
+        );
+        input.keyboard_input.update(
+            0,
+            InputEvent::new(EventType::KEY.0, KeyCode::KEY_B.0, 1),
             Instant::now() - HOLD_TIMEOUT - TEST_STEP,
         );
         input.process_available_events(None).unwrap();
@@ -2198,8 +2040,12 @@ patterns = ['^\.тф']
         assert!(input.events.available().unwrap().is_none());
         assert_eq!(input.pending, None);
         assert!(!input.is_original_switch_key_held);
-        assert!(input.keyboards[0].held.contains(&KeyCode::KEY_LEFTSHIFT.0));
-        assert!(!input.keyboards[0].held.contains(&KeyCode::KEY_PAUSE.0));
+        assert!(
+            input
+                .keyboard_input
+                .is_key_held(0, KeyCode::KEY_LEFTSHIFT.0)
+        );
+        assert!(!input.keyboard_input.is_key_held(0, KeyCode::KEY_PAUSE.0));
         source.borrow_mut().events.push(InputEvent::new(
             EventType::KEY.0,
             KeyCode::KEY_LEFTSHIFT.0,
@@ -2258,7 +2104,7 @@ patterns = ['^\.тф']
         let mut input = simulated_input(&[first.clone(), second.clone()]);
         let mut interceptor = enter_interceptor(&mut input).unwrap().unwrap();
         assert!(!interceptor.read_available().unwrap());
-        assert!(interceptor.input().holds.deadline().is_none());
+        assert!(interceptor.input().keyboard_input.hold_deadline().is_none());
         for source in [&first, &second] {
             let keyboard = source.borrow();
             assert!(keyboard.held.is_empty());
@@ -2274,7 +2120,7 @@ patterns = ['^\.тф']
         assert_eq!(second.borrow().writes.len(), 2);
         press(interceptor.input(), KeyCode::KEY_C);
         interceptor.finish().unwrap();
-        assert!(input.keyboards[0].held.contains(&KeyCode::KEY_C.0));
+        assert!(input.keyboard_input.is_key_held(0, KeyCode::KEY_C.0));
         assert!(!input.correction.is_active());
         assert_eq!(first.borrow().ungrab_count, 0);
     }
@@ -2561,12 +2407,7 @@ patterns = ['^\.тф']
         );
         drop(interception);
         assert!(!source.borrow().is_grabbed);
-        assert!(
-            input
-                .keyboards
-                .iter()
-                .all(|keyboard| !keyboard.device.is_grabbed())
-        );
+        assert!(!input.keyboard_input.is_any_grabbed());
     }
 
     #[test]
@@ -2660,12 +2501,7 @@ patterns = ['^\.тф']
                 .writes
                 .contains(&(KeyCode::KEY_CAPSLOCK, 0, false))
         );
-        assert!(
-            input
-                .keyboards
-                .iter()
-                .all(|keyboard| !keyboard.device.is_grabbed())
-        );
+        assert!(!input.keyboard_input.is_any_grabbed());
     }
 
     #[test]

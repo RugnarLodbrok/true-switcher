@@ -87,9 +87,10 @@ impl<'a> Interceptor<'a> {
         self.input.release_modifiers()?;
         if !*is_switch_key_reset {
             let source = self.input.pending.unwrap();
-            if self.input.keyboards[source]
-                .held
-                .contains(&self.input.switch_key.0)
+            if self
+                .input
+                .keyboard_input
+                .is_key_held(source, self.input.switch_key.0)
             {
                 self.input.write_source(source, self.input.switch_key, 0)?;
             }
@@ -148,12 +149,7 @@ impl<'a> Interceptor<'a> {
             self.process_available_events()?;
             self.input.release_modifiers()?;
             self.process_available_events()?;
-            if self
-                .input
-                .keyboards
-                .iter()
-                .all(|keyboard| keyboard.held.is_empty())
-            {
+            if self.input.keyboard_input.all_released() {
                 return Ok(());
             }
             self.input.wait_for_events(None, Some(&mut self.state))?;
@@ -175,7 +171,7 @@ impl<'a> Interceptor<'a> {
                 self.state.repair.remove(&(index, code));
                 continue;
             }
-            if !self.input.keyboards[index].device.is_grabbed() {
+            if !self.input.keyboard_input.is_grabbed(index) {
                 if !self.state.repair_prepared.contains(&(index, code)) {
                     self.state.repair.remove(&(index, code));
                 }
@@ -195,7 +191,7 @@ impl<'a> Interceptor<'a> {
     fn repair_releases(&mut self) -> ProcessingResult<()> {
         let mut error = None;
         for (index, code) in self.state.repair.clone() {
-            if !self.input.keyboards[index].device.is_grabbed() {
+            if !self.input.keyboard_input.is_grabbed(index) {
                 match self.input.write_source(index, KeyCode::new(code), 0) {
                     Ok(()) => {
                         self.state.repair.remove(&(index, code));
@@ -323,11 +319,14 @@ impl<'a> UncapturedInterceptor<'a> {
         input.is_original_switch_key_held = false;
         let interceptor = Self { input };
         let mut error = None;
-        for index in 0..interceptor.input.keyboards.len() {
-            for code in interceptor.input.keyboards[index].held.clone() {
-                if let Err(err) = interceptor.input.write_source(index, KeyCode::new(code), 0) {
-                    error.get_or_insert(err);
-                }
+        let held = interceptor
+            .input
+            .keyboard_input
+            .held_keys()
+            .collect::<Vec<_>>();
+        for (index, code) in held {
+            if let Err(err) = interceptor.input.write_source(index, KeyCode::new(code), 0) {
+                error.get_or_insert(err);
             }
         }
         error.map_or(Ok(interceptor), Err)
