@@ -50,6 +50,23 @@ const NAVIGATION_KEYS: [KeyCode; 9] = [
     KeyCode::KEY_ESC,
 ];
 
+trait InputEventExt {
+    fn instant(&self) -> Instant;
+}
+
+impl InputEventExt for InputEvent {
+    fn instant(&self) -> Instant {
+        let now = Instant::now();
+        let time = self.timestamp();
+        let elapsed = SystemTime::now().duration_since(time).ok();
+        if time == SystemTime::UNIX_EPOCH {
+            now
+        } else {
+            elapsed.and_then(|age| now.checked_sub(age)).unwrap_or(now)
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum InputRequest {
     Switch(SwitchRequest),
@@ -228,19 +245,15 @@ impl Input {
 
     pub fn next_request(&mut self) -> io::Result<InputRequest> {
         loop {
-            match self.wait_for_resume() {
+            match self.wait_for_resume() { // pause after devide chaged
                 Ok(Some(reason)) => return Ok(InputRequest::Shutdown(reason)),
                 Ok(None) => {}
                 Err(ProcessingError::Interrupted) => continue,
                 Err(ProcessingError::Io(error)) => return Err(error),
             }
             match self.wait_for_switch_request() {
-                Ok(()) => {
-                    if let Some(request) = self.switch_request() {
-                        return Ok(InputRequest::Switch(request));
-                    }
-                    self.pending = None;
-                }
+                Ok(Some(request)) => return Ok(InputRequest::Switch(request)),
+                Ok(None) => {}
                 Err(ProcessingError::Interrupted) => continue,
                 Err(ProcessingError::Io(error)) => return Err(error),
             }
@@ -262,12 +275,16 @@ impl Input {
         })
     }
 
-    fn wait_for_switch_request(&mut self) -> ProcessingResult<()> {
+    fn wait_for_switch_request(&mut self) -> ProcessingResult<Option<SwitchRequest>> {
         self.lifecycle.check()?;
-        if self.pending.is_some() {
-            return Ok(());
+        if self.pending.is_none() {
+            self.process_events_until(|input| input.pending.is_some(), None)?;
         }
-        self.process_events_until(|input| input.pending.is_some(), None)
+        let request = self.switch_request();
+        if request.is_none() {
+            self.pending = None;
+        }
+        Ok(request)
     }
 
     pub fn latest_word(&self) -> Option<&crate::word::Word> {
@@ -393,7 +410,9 @@ impl Input {
     ) -> ProcessingResult<()> {
         let is_captured = state.as_ref().is_some_and(|state| state.is_captured);
         match event {
-            InputEventMessage::Keyboard(index, event) => self.process(index, event, state)?,
+            InputEventMessage::Keyboard(index, event) => {
+                self.process_at(index, event, event.instant(), state)?
+            }
             InputEventMessage::DeviceError(error) => return Err(error.into()),
             InputEventMessage::DevicesChanged(at) => self.devices_changed(at),
             InputEventMessage::DeviceDisconnected(index, at) => {
@@ -495,23 +514,6 @@ impl Input {
             self.wait_for_events(None, state)?;
         }
         Ok(self.correction_result.take())
-    }
-
-    fn process(
-        &mut self,
-        index: usize,
-        event: InputEvent,
-        state: Option<&mut InterceptionState>,
-    ) -> ProcessingResult<()> {
-        let now = Instant::now();
-        let time = event.timestamp();
-        let elapsed = SystemTime::now().duration_since(time).ok();
-        let now = if time == SystemTime::UNIX_EPOCH {
-            now
-        } else {
-            elapsed.and_then(|age| now.checked_sub(age)).unwrap_or(now)
-        };
-        self.process_at(index, event, now, state)
     }
 
     fn process_at(
@@ -622,9 +624,9 @@ impl Input {
 
     fn process_text_event(
         &mut self,
-        index: usize,
+        index: usize, // keyboard index
         key: KeyCode,
-        value: i32,
+        value: i32,  // 0 = release, 1 = press, 2 = repeated press while holding
         is_hard_separator: bool,
     ) {
         if !matches!(value, 1 | 2) {
@@ -1186,7 +1188,12 @@ pub(crate) mod tests {
 
     pub(crate) fn statistics_event(input: &mut Input, key: KeyCode, value: i32) {
         input
-            .process(0, InputEvent::new(EventType::KEY.0, key.0, value), None)
+            .process_at(
+                0,
+                InputEvent::new(EventType::KEY.0, key.0, value),
+                Instant::now(),
+                None,
+            )
             .unwrap();
     }
 
@@ -1222,7 +1229,12 @@ patterns = ['^\.тф']
 
     fn press(input: &mut Input, key: KeyCode) {
         input
-            .process(0, InputEvent::new(EventType::KEY.0, key.0, 1), None)
+            .process_at(
+                0,
+                InputEvent::new(EventType::KEY.0, key.0, 1),
+                Instant::now(),
+                None,
+            )
             .unwrap();
     }
 
@@ -1281,9 +1293,10 @@ patterns = ['^\.тф']
         state.is_captured = true;
         input.is_correcting = true;
         input
-            .process(
+            .process_at(
                 0,
                 InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTSHIFT.0, 0),
+                Instant::now(),
                 Some(&mut state),
             )
             .unwrap();
@@ -1867,9 +1880,10 @@ patterns = ['^\.тф']
         state.is_captured = true;
         input.is_correcting = true;
         input
-            .process(
+            .process_at(
                 0,
                 InputEvent::new(EventType::KEY.0, KeyCode::KEY_N.0, 2),
+                Instant::now(),
                 Some(&mut state),
             )
             .unwrap();
