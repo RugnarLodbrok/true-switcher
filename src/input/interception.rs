@@ -61,8 +61,7 @@ impl<'a> Interceptor<'a> {
             if presses.is_empty() {
                 interception.state.is_captured = true;
                 interception.phase = Phase::Captured;
-                interception.input.is_correction_cancelled = false;
-                interception.input.is_correcting = true;
+                interception.input.correction.activate();
                 interception.input.pending = None;
                 log::debug!("ENTRY accepted");
                 return Ok(Some(interception));
@@ -254,7 +253,7 @@ impl<'a> Interceptor<'a> {
 
 impl Drop for Interceptor<'_> {
     fn drop(&mut self) {
-        self.input.is_correcting = false;
+        self.input.correction.deactivate();
         if self.phase == Phase::Finished || !self.is_cleanup_needed {
             return;
         }
@@ -319,8 +318,7 @@ pub(super) struct UncapturedInterceptor<'a> {
 
 impl<'a> UncapturedInterceptor<'a> {
     pub(super) fn enter(input: &'a mut Input) -> ProcessingResult<Self> {
-        input.is_correcting = true;
-        input.is_correction_cancelled = false;
+        input.correction.activate();
         input.pending = None;
         input.is_original_switch_key_held = false;
         let interceptor = Self { input };
@@ -357,6 +355,6 @@ impl CorrectionInterceptor for UncapturedInterceptor<'_> {
 
 impl Drop for UncapturedInterceptor<'_> {
     fn drop(&mut self) {
-        self.input.is_correcting = false;
+        self.input.correction.deactivate();
     }
 }

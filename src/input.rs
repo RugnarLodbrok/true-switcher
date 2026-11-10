@@ -9,10 +9,12 @@ use std::time::{Duration, Instant, SystemTime};
 
 use evdev::{EventType, InputEvent, KeyCode, SynchronizationCode, raw_stream::RawDevice};
 
+mod correction;
 mod devices;
 mod interception;
 mod pointer;
 
+use correction::CorrectionState;
 use interception::InterceptionState;
 #[cfg(test)]
 use interception::Interceptor;
@@ -140,11 +142,8 @@ pub struct Input {
     observed_layout: Option<Arc<crate::layout::Layout>>,
     events: InputEvents,
     holds: HoldDetector,
-    correction_result: Option<io::Result<()>>,
-    is_correction_cancelled: bool,
-    is_correcting: bool,
+    correction: CorrectionState,
     switch_key: KeyCode,
-    is_cancel_requested: bool,
     pending: Option<usize>,
     is_original_switch_key_held: bool,
     is_backing_off: bool,
@@ -170,11 +169,8 @@ impl Input {
             observed_layout: None,
             events,
             holds: HoldDetector::default(),
-            correction_result: None,
-            is_correction_cancelled: false,
-            is_correcting: false,
+            correction: CorrectionState::default(),
             switch_key,
-            is_cancel_requested: false,
             pending: None,
             is_original_switch_key_held: false,
             is_backing_off: false,
@@ -245,7 +241,8 @@ impl Input {
 
     pub fn next_request(&mut self) -> io::Result<InputRequest> {
         loop {
-            match self.wait_for_resume() { // pause after devide chaged
+            match self.wait_for_resume() {
+                // pause after devide chaged
                 Ok(Some(reason)) => return Ok(InputRequest::Shutdown(reason)),
                 Ok(None) => {}
                 Err(ProcessingError::Interrupted) => continue,
@@ -442,11 +439,11 @@ impl Input {
             }
             InputEventMessage::CorrectionFinished { result, layout } => {
                 self.accept_layout(layout.clone(), true);
-                if result.is_err() || self.is_correction_cancelled {
+                if result.is_err() || self.correction.is_cancelled() {
                     self.accept_layout(layout, false);
                     self.reset_history();
                 }
-                self.correction_result = Some(result);
+                self.correction.store_result(result);
             }
         }
         Ok(())
@@ -466,8 +463,7 @@ impl Input {
         self.automatic_target = None;
         self.is_auto_request = false;
         self.is_original_switch_key_held = false;
-        self.is_cancel_requested = true;
-        self.is_correction_cancelled = true;
+        self.correction.request_cancel();
     }
 
     fn wait_for_resume(&mut self) -> ProcessingResult<Option<ShutdownReason>> {
@@ -510,10 +506,10 @@ impl Input {
         &mut self,
         state: Option<&mut InterceptionState>,
     ) -> ProcessingResult<Option<io::Result<()>>> {
-        if self.correction_result.is_none() {
+        if !self.correction.has_result() {
             self.wait_for_events(None, state)?;
         }
-        Ok(self.correction_result.take())
+        Ok(self.correction.take_result())
     }
 
     fn process_at(
@@ -596,7 +592,7 @@ impl Input {
             KeyCode::KEY_TAB | KeyCode::KEY_ENTER | KeyCode::KEY_KPENTER
         ) && !self.has_shortcut_modifier();
         if self.should_reset_for_key(key, value)
-            && (!is_hard_separator || is_captured || self.is_correcting)
+            && (!is_hard_separator || is_captured || self.correction.is_active())
         {
             self.request_history_reset();
         }
@@ -608,7 +604,7 @@ impl Input {
                 self.is_original_switch_key_held = false;
             }
             if value == 1
-                && !self.is_correcting
+                && !self.correction.is_active()
                 && self.pending.is_none()
                 && !self.has_other_switch_modifiers(index, key)
             {
@@ -626,7 +622,7 @@ impl Input {
         &mut self,
         index: usize, // keyboard index
         key: KeyCode,
-        value: i32,  // 0 = release, 1 = press, 2 = repeated press while holding
+        value: i32, // 0 = release, 1 = press, 2 = repeated press while holding
         is_hard_separator: bool,
     ) {
         if !matches!(value, 1 | 2) {
@@ -651,7 +647,7 @@ impl Input {
         }
         if crate::history::is_text_key(key)
             && !self.has_shortcut_modifier()
-            && !self.is_correcting
+            && !self.correction.is_active()
             && (self.pending.is_none() || self.is_auto_request)
             && !self.history.is_auto_switch_blocked()
         {
@@ -710,9 +706,8 @@ impl Input {
             self.is_auto_request = false;
         }
         self.reset_history();
-        if self.is_correcting {
-            self.is_cancel_requested = true;
-            self.is_correction_cancelled = true;
+        if self.correction.is_active() {
+            self.correction.request_cancel();
         }
     }
 
@@ -771,7 +766,7 @@ impl Input {
     }
 
     pub fn take_cancel_request(&mut self) -> bool {
-        std::mem::take(&mut self.is_cancel_requested)
+        self.correction.take_cancel_request()
     }
 
     fn write_source(&mut self, index: usize, key: KeyCode, value: i32) -> ProcessingResult<()> {
@@ -1163,11 +1158,8 @@ pub(crate) mod tests {
             observed_layout: None,
             events,
             holds,
-            correction_result: None,
-            is_correction_cancelled: false,
-            is_correcting: false,
+            correction: CorrectionState::default(),
             switch_key: KeyCode::KEY_PAUSE,
-            is_cancel_requested: false,
             pending: Some(0),
             is_original_switch_key_held: true,
             is_backing_off: false,
@@ -1291,7 +1283,7 @@ patterns = ['^\.тф']
         assert!(input.latest_word().unwrap().entries[0].stroke.shift);
         let mut state = InterceptionState::default();
         state.is_captured = true;
-        input.is_correcting = true;
+        input.correction.activate();
         input
             .process_at(
                 0,
@@ -1388,6 +1380,25 @@ patterns = ['^\.тф']
         input.process_available_events(None).unwrap();
         assert!(input.latest_word().is_none());
         assert_eq!(input.lifecycle, Lifecycle::Running);
+    }
+
+    #[test]
+    fn inactive_history_reset_does_not_cancel_but_lifecycle_changes_do() {
+        let (mut input, _) = channel_input();
+        input.request_history_reset();
+        assert!(!input.take_cancel_request());
+        assert!(!input.correction.is_cancelled());
+
+        input.devices_changed(Instant::now());
+        assert!(input.take_cancel_request());
+        assert!(input.correction.is_cancelled());
+
+        let (mut input, _) = channel_input();
+        input
+            .process_message(InputEventMessage::Shutdown(ShutdownReason::Stop), None)
+            .unwrap();
+        assert!(input.take_cancel_request());
+        assert!(input.correction.is_cancelled());
     }
 
     #[test]
@@ -1679,23 +1690,36 @@ patterns = ['^\.тф']
 
     #[test]
     fn consumed_cancellation_still_prevents_applying_successful_correction() {
-        let (mut input, sender) = channel_input();
-        press(&mut input, KeyCode::KEY_A);
-        event_at(&mut input, 0, KeyCode::KEY_A, 0, Instant::now());
-        let mut interception = Interceptor::enter(&mut input).unwrap().unwrap();
-        sender.send(InputEventMessage::FocusChanged);
-        assert!(interception.read_captured().unwrap());
-        assert!(!interception.take_cancel_request());
-        sender.send(InputEventMessage::CorrectionFinished {
-            result: Ok(()),
-            layout: Some(layout("ru")),
-        });
-        assert!(interception.wait_for_correction().unwrap().unwrap().is_ok());
-        assert!(interception.input().latest_word().is_none());
-        interception.finish().unwrap();
-        assert!(!input.history.is_auto_switch_blocked());
-        press(&mut input, KeyCode::KEY_B);
-        assert_eq!(input.latest_word().unwrap().text().as_deref(), Ok("и"));
+        for is_captured in [false, true] {
+            let (mut input, sender) = channel_input();
+            press(&mut input, KeyCode::KEY_A);
+            event_at(&mut input, 0, KeyCode::KEY_A, 0, Instant::now());
+            let mut interceptor: Box<dyn CorrectionInterceptor> = if is_captured {
+                Box::new(Interceptor::enter(&mut input).unwrap().unwrap())
+            } else {
+                Box::new(interception::UncapturedInterceptor::enter(&mut input).unwrap())
+            };
+            sender.send(InputEventMessage::FocusChanged);
+            assert!(interceptor.read_available().unwrap());
+            assert!(!interceptor.input().take_cancel_request());
+            if !is_captured {
+                press(interceptor.input(), KeyCode::KEY_C);
+                assert!(interceptor.input().latest_word().is_some());
+                statistics_event(interceptor.input(), KeyCode::KEY_C, 0);
+            }
+            sender.send(InputEventMessage::CorrectionFinished {
+                result: Ok(()),
+                layout: Some(layout("ru")),
+            });
+            assert!(interceptor.wait_for_correction().unwrap().unwrap().is_ok());
+            assert!(interceptor.input().latest_word().is_none());
+            assert!(interceptor.input().correction.is_active());
+            interceptor.finish().unwrap();
+            assert!(!input.correction.is_active());
+            assert!(!input.history.is_auto_switch_blocked());
+            press(&mut input, KeyCode::KEY_B);
+            assert_eq!(input.latest_word().unwrap().text().as_deref(), Ok("и"));
+        }
     }
 
     #[test]
@@ -1748,7 +1772,7 @@ patterns = ['^\.тф']
         let (mut input, _sender) = channel_input();
         let mut state = InterceptionState::default();
         state.is_captured = true;
-        input.is_correcting = true;
+        input.correction.activate();
         input
             .process_at(
                 0,
@@ -1766,7 +1790,7 @@ patterns = ['^\.тф']
         );
         assert!(input.is_backing_off);
         assert!(input.take_cancel_request());
-        assert!(input.is_correction_cancelled);
+        assert!(input.correction.is_cancelled());
     }
 
     #[test]
@@ -1878,7 +1902,7 @@ patterns = ['^\.тф']
         assert!(input.automatic_target().is_some());
         let mut state = InterceptionState::default();
         state.is_captured = true;
-        input.is_correcting = true;
+        input.correction.activate();
         input
             .process_at(
                 0,
@@ -2251,7 +2275,7 @@ patterns = ['^\.тф']
         press(interceptor.input(), KeyCode::KEY_C);
         interceptor.finish().unwrap();
         assert!(input.keyboards[0].held.contains(&KeyCode::KEY_C.0));
-        assert!(!input.is_correcting);
+        assert!(!input.correction.is_active());
         assert_eq!(first.borrow().ungrab_count, 0);
     }
 
@@ -2278,8 +2302,9 @@ patterns = ['^\.тф']
                 layout: Some(layout("ru")),
             });
             assert!(interceptor.wait_for_correction().unwrap().unwrap().is_ok());
+            assert!(interceptor.input().correction.is_active());
             interceptor.finish().unwrap();
-            assert!(!input.is_correcting);
+            assert!(!input.correction.is_active());
             assert_eq!(input.latest_word().unwrap().text().as_deref(), Ok("ф"));
             assert!(input.history.is_auto_switch_blocked());
         }
@@ -2354,7 +2379,7 @@ patterns = ['^\.тф']
             let mut interceptor = interception::UncapturedInterceptor::enter(&mut input).unwrap();
             sender.send(event);
             assert!(interceptor.read_available().unwrap());
-            assert!(interceptor.input().is_correction_cancelled);
+            assert!(interceptor.input().correction.is_cancelled());
         }
         for key in [KeyCode::KEY_LEFT, KeyCode::KEY_TAB, KeyCode::KEY_A] {
             let (mut input, _) = channel_input();
@@ -2380,7 +2405,7 @@ patterns = ['^\.тф']
         }));
         let mut input = simulated_input(std::slice::from_ref(&source));
         assert!(interception::UncapturedInterceptor::enter(&mut input).is_err());
-        assert!(!input.is_correcting);
+        assert!(!input.correction.is_active());
         assert_eq!(source.borrow().writes.len(), 2);
         assert_eq!(source.borrow().grab_count, 0);
         assert!(!source.borrow().held.contains(&KeyCode::KEY_B.0));
@@ -2474,6 +2499,7 @@ patterns = ['^\.тф']
         }));
         let mut input = simulated_input(&[first.clone(), second.clone()]);
         assert!(Interceptor::enter(&mut input).is_err());
+        assert!(!input.correction.is_active());
         let first = first.borrow();
         let repairs: Vec<_> = first
             .writes
