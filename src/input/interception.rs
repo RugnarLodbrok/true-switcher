@@ -62,7 +62,7 @@ impl<'a> Interceptor<'a> {
                 interception.state.is_captured = true;
                 interception.phase = Phase::Captured;
                 interception.input.correction.activate();
-                interception.input.pending = None;
+                interception.input.pending.cancel();
                 log::debug!("ENTRY accepted");
                 return Ok(Some(interception));
             }
@@ -86,7 +86,7 @@ impl<'a> Interceptor<'a> {
         self.input.release_locks()?;
         self.input.release_modifiers()?;
         if !*is_switch_key_reset {
-            let source = self.input.pending.unwrap();
+            let source = self.input.pending.source().unwrap();
             if self
                 .input
                 .keyboard_input
@@ -95,7 +95,7 @@ impl<'a> Interceptor<'a> {
                 self.input.write_source(source, self.input.switch_key, 0)?;
             }
             *is_switch_key_reset = true;
-            self.input.is_original_switch_key_held = false;
+            self.input.pending.release_original_key();
         }
         self.process_available_events()?;
         self.input.grab()?;
@@ -315,8 +315,7 @@ pub(super) struct UncapturedInterceptor<'a> {
 impl<'a> UncapturedInterceptor<'a> {
     pub(super) fn enter(input: &'a mut Input) -> ProcessingResult<Self> {
         input.correction.activate();
-        input.pending = None;
-        input.is_original_switch_key_held = false;
+        input.pending.cancel();
         let interceptor = Self { input };
         let mut error = None;
         let held = interceptor

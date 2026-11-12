@@ -1,40 +1,27 @@
 use std::collections::BTreeMap;
-use std::fs::{self, File};
 use std::io;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Instant;
 
 use evdev::{AttributeSetRef, KeyCode, PropType, raw_stream::RawDevice};
-use nix::errno::Errno;
-use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
+use nix::sys::inotify::AddWatchFlags;
+
+use super::device_watch::{self, DirectoryWatcher, INPUT_DIRECTORY, Identity};
 
 use crate::input_events::{InputEventMessage, InputEventSender};
 use crate::output::is_own_keyboard;
 
-const INPUT_DIRECTORY: &str = "/dev/input";
-const DEVICE_PREFIX: &[u8] = b"event";
-type Devices = BTreeMap<PathBuf, (u64, u64)>;
+type Devices = BTreeMap<PathBuf, Identity>;
 
 pub(super) struct Monitor {
-    watcher: Inotify,
+    watcher: DirectoryWatcher,
     pub(super) keyboards: Devices,
 }
 
 impl Monitor {
     pub(super) fn new() -> io::Result<Self> {
-        let watcher = Inotify::init(InitFlags::IN_CLOEXEC)?;
-        watcher.add_watch(
-            INPUT_DIRECTORY,
-            AddWatchFlags::IN_CREATE
-                | AddWatchFlags::IN_DELETE
-                | AddWatchFlags::IN_MOVED_FROM
-                | AddWatchFlags::IN_MOVED_TO
-                | AddWatchFlags::IN_ATTRIB
-                | AddWatchFlags::IN_DELETE_SELF
-                | AddWatchFlags::IN_MOVE_SELF,
-        )?;
+        let watcher = DirectoryWatcher::new(Path::new(INPUT_DIRECTORY))?;
         Ok(Self {
             watcher,
             keyboards: discover(Path::new(INPUT_DIRECTORY))?,
@@ -54,25 +41,17 @@ impl Monitor {
 
     fn watch(&mut self, sender: &InputEventSender) -> io::Result<()> {
         loop {
-            let events = match self.watcher.read_events() {
-                Ok(events) => events,
-                Err(Errno::EINTR) => continue,
-                Err(error) => return Err(error.into()),
-            };
+            let events = self.watcher.read_events()?;
             let mut is_relevant = false;
             for event in events {
-                if event.mask.intersects(
-                    AddWatchFlags::IN_DELETE_SELF
-                        | AddWatchFlags::IN_MOVE_SELF
-                        | AddWatchFlags::IN_IGNORED,
-                ) {
+                if device_watch::is_watch_lost(event.mask) {
                     return Err(io::Error::other("input directory watch lost"));
                 }
                 let Some(name) = event.name else {
                     is_relevant |= event.mask.contains(AddWatchFlags::IN_Q_OVERFLOW);
                     continue;
                 };
-                if !name.as_encoded_bytes().starts_with(DEVICE_PREFIX) {
+                if !device_watch::is_device_name(&name) {
                     continue;
                 }
                 is_relevant = true;
@@ -103,16 +82,8 @@ impl Monitor {
 
 fn discover(directory: &Path) -> io::Result<Devices> {
     let mut keyboards = Devices::new();
-    for entry in fs::read_dir(directory)? {
-        let entry = entry?;
-        if !entry
-            .file_name()
-            .as_encoded_bytes()
-            .starts_with(DEVICE_PREFIX)
-        {
-            continue;
-        }
-        let path = entry.path();
+    for path in device_watch::device_paths(directory)? {
+        let path = path?;
         match probe(&path) {
             Ok(Some(identity)) => {
                 keyboards.insert(path, identity);
@@ -124,12 +95,10 @@ fn discover(directory: &Path) -> io::Result<Devices> {
     Ok(keyboards)
 }
 
-fn probe(path: &Path) -> io::Result<Option<(u64, u64)>> {
-    let file = File::open(path)?;
-    let metadata = file.metadata()?;
-    let device = RawDevice::try_from(file)?;
+fn probe(path: &Path) -> io::Result<Option<Identity>> {
+    let (identity, device) = device_watch::open_device(path)?;
     if is_keyboard(&device) {
-        Ok(Some((metadata.rdev(), metadata.ino())))
+        Ok(Some(identity))
     } else {
         Ok(None)
     }

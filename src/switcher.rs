@@ -93,43 +93,52 @@ impl Switcher {
         let outcome = if interception.read_available()? {
             CorrectionOutcome::Cancelled
         } else {
-            self.begin_correction(interception.as_mut(), correction)?;
-            self.correct(interception.as_mut(), correction)?
+            self.begin_and_correct(interception.as_mut(), correction)?
         };
         interception.finish()?;
         Ok(outcome)
     }
 
-    fn begin_correction(
+    fn begin_and_correct(
         &mut self,
         interception: &mut dyn input::CorrectionInterceptor,
         correction: &Correction,
-    ) -> io::Result<()> {
-        let target = switch_and_record(
+    ) -> ProcessingResult<CorrectionOutcome> {
+        let Self {
+            desktop,
+            keyboard,
+            statistics,
+            sound,
+            layouts,
+        } = self;
+        switch_and_correct(
             || match &correction.target {
-                Some(target) => self.desktop.switch_to_layout(target.name()),
-                None => self.desktop.switch_to_next_layout(),
+                Some(target) => desktop.switch_to_layout(target.name()),
+                None => desktop.switch_to_next_layout(),
             },
             || {
                 if correction.is_sound_enabled {
-                    self.sound.play();
+                    sound.play();
                 }
             },
             || {
                 record_switch(
-                    &self.statistics,
+                    statistics,
                     correction.previous.as_ref(),
                     correction.word.as_ref(),
                     correction.mode,
                 )
             },
-        )?;
-        interception.input().begin_correction(target);
-        Ok(())
+            |target| {
+                interception.input().begin_correction(target);
+                Self::correct(keyboard, layouts, interception, correction)
+            },
+        )
     }
 
     fn correct(
-        &mut self,
+        keyboard: &mut output::KeyboardOutput,
+        layouts: &kde::LayoutTracker,
         interception: &mut dyn input::CorrectionInterceptor,
         correction: &Correction,
     ) -> ProcessingResult<CorrectionOutcome> {
@@ -137,10 +146,10 @@ impl Switcher {
         thread::scope(|scope| -> ProcessingResult<CorrectionOutcome> {
             let worker = scope.spawn(|| {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    correct_word(correction, &mut self.keyboard, &is_cancelled)
+                    correct_word(correction, keyboard, &is_cancelled)
                 }))
                 .unwrap_or_else(|_| Err(io::Error::other("correction thread panicked")));
-                self.layouts.finish_correction(result);
+                layouts.finish_correction(result);
             });
             let mut read_error = None;
             let result = loop {
@@ -184,21 +193,40 @@ fn correct_word(
     keyboard: &mut output::KeyboardOutput,
     is_cancelled: &AtomicBool,
 ) -> io::Result<()> {
+    replay_correction(
+        keyboard,
+        is_cancelled,
+        |keyboard| {
+            log::debug!("SYNTHETIC erase");
+            if let Some(word) = &correction.word {
+                keyboard.erase(word.entries.len() + word.trailing_spaces, is_cancelled)?;
+            }
+            Ok(())
+        },
+        |keyboard| {
+            log::debug!("SYNTHETIC replay");
+            if let Some(word) = &correction.word {
+                keyboard.replay(word, is_cancelled)?;
+            }
+            Ok(())
+        },
+    )
+}
+
+pub(crate) fn replay_correction<T>(
+    output: &mut T,
+    is_cancelled: &AtomicBool,
+    erase: impl FnOnce(&mut T) -> io::Result<()>,
+    replay: impl FnOnce(&mut T) -> io::Result<()>,
+) -> io::Result<()> {
     if is_cancelled.load(Ordering::Relaxed) {
         return Ok(());
     }
-    log::debug!("SYNTHETIC erase");
-    if let Some(word) = &correction.word {
-        keyboard.erase(word.entries.len() + word.trailing_spaces, is_cancelled)?;
-    }
+    erase(output)?;
     if is_cancelled.load(Ordering::Relaxed) {
         return Ok(());
     }
-    log::debug!("SYNTHETIC replay");
-    if let Some(word) = &correction.word {
-        keyboard.replay(word, is_cancelled)?;
-    }
-    Ok(())
+    replay(output)
 }
 
 fn record_switch(
@@ -220,29 +248,16 @@ fn record_switch(
     }
 }
 
-fn switch_and_record<T>(
+pub(crate) fn switch_and_correct<T, R, E: From<io::Error>>(
     switch: impl FnOnce() -> io::Result<()>,
     play_sound: impl FnOnce(),
     record: impl FnOnce() -> T,
-) -> io::Result<T> {
+    correct: impl FnOnce(T) -> Result<R, E>,
+) -> Result<R, E> {
     switch()?;
     play_sound();
-    Ok(record())
-}
-
-#[cfg(test)]
-pub(crate) fn switch_and_replay<T>(
-    switch: impl FnOnce() -> io::Result<()>,
-    play_sound: impl FnOnce(),
-    record: impl FnOnce() -> T,
-    replay: impl FnOnce() -> io::Result<()>,
-    is_cancelled: &AtomicBool,
-) -> io::Result<T> {
-    let result = switch_and_record(switch, play_sound, record)?;
-    if !is_cancelled.load(Ordering::Relaxed) {
-        replay()?;
-    }
-    Ok(result)
+    let target = record();
+    correct(target)
 }
 
 #[cfg(test)]
@@ -251,10 +266,43 @@ mod tests {
     use std::cell::RefCell;
 
     #[test]
+    fn cancellation_after_erase_skips_replay() {
+        let is_cancelled = AtomicBool::new(false);
+        let mut calls = Vec::new();
+        replay_correction(
+            &mut calls,
+            &is_cancelled,
+            |calls| {
+                calls.push("erase");
+                is_cancelled.store(true, Ordering::Relaxed);
+                Ok(())
+            },
+            |calls| {
+                calls.push("replay");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, ["erase"]);
+    }
+
+    #[test]
+    fn erase_error_skips_replay_and_preserves_error() {
+        let error = replay_correction(
+            &mut (),
+            &AtomicBool::new(false),
+            |_| Err(io::Error::other("erase failed")),
+            |_| panic!("replay after failed erase"),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "erase failed");
+    }
+
+    #[test]
     fn records_successful_switch_even_when_cancelled_before_replay() {
         let is_cancelled = AtomicBool::new(false);
         let calls = RefCell::new(Vec::new());
-        switch_and_replay(
+        switch_and_correct::<_, _, io::Error>(
             || {
                 calls.borrow_mut().push("switch");
                 is_cancelled.store(true, Ordering::Relaxed);
@@ -262,11 +310,17 @@ mod tests {
             },
             || calls.borrow_mut().push("sound"),
             || calls.borrow_mut().push("record"),
-            || {
-                calls.borrow_mut().push("replay");
-                Ok(())
+            |_| {
+                replay_correction(
+                    &mut (),
+                    &is_cancelled,
+                    |_| Ok(()),
+                    |_| {
+                        calls.borrow_mut().push("replay");
+                        Ok(())
+                    },
+                )
             },
-            &is_cancelled,
         )
         .unwrap();
         assert_eq!(*calls.borrow(), ["switch", "sound", "record"]);
@@ -276,31 +330,49 @@ mod tests {
     fn records_before_replay_error_and_skips_record_when_switch_fails() {
         let is_cancelled = AtomicBool::new(false);
         let calls = RefCell::new(Vec::new());
-        let result = switch_and_replay(
+        let result: io::Result<()> = switch_and_correct(
             || {
                 calls.borrow_mut().push("switch");
                 Ok(())
             },
             || calls.borrow_mut().push("sound"),
             || calls.borrow_mut().push("record"),
-            || {
-                calls.borrow_mut().push("replay");
-                Err(io::Error::other("replay failed"))
+            |_| {
+                replay_correction(
+                    &mut (),
+                    &is_cancelled,
+                    |_| {
+                        calls.borrow_mut().push("erase");
+                        Ok(())
+                    },
+                    |_| {
+                        calls.borrow_mut().push("replay");
+                        Err(io::Error::other("replay failed"))
+                    },
+                )
             },
-            &is_cancelled,
         );
-        assert!(result.is_err());
-        assert_eq!(*calls.borrow(), ["switch", "sound", "record", "replay"]);
+        assert_eq!(result.unwrap_err().to_string(), "replay failed");
+        assert_eq!(
+            *calls.borrow(),
+            ["switch", "sound", "record", "erase", "replay"]
+        );
         calls.borrow_mut().clear();
-        let result = switch_and_replay(
+        let result: io::Result<()> = switch_and_correct(
             || Err(io::Error::other("switch failed")),
             || calls.borrow_mut().push("sound"),
             || calls.borrow_mut().push("record"),
-            || {
-                calls.borrow_mut().push("replay");
-                Ok(())
+            |_| {
+                replay_correction(
+                    &mut (),
+                    &is_cancelled,
+                    |_| Ok(()),
+                    |_| {
+                        calls.borrow_mut().push("replay");
+                        Ok(())
+                    },
+                )
             },
-            &is_cancelled,
         );
         assert!(result.is_err());
         assert!(calls.borrow().is_empty());

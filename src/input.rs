@@ -8,10 +8,13 @@ use std::time::{Duration, Instant, SystemTime};
 use evdev::{EventType, InputEvent, KeyCode, SynchronizationCode, raw_stream::RawDevice};
 
 mod correction;
+mod device_watch;
 mod devices;
 mod interception;
 mod keyboard;
+mod pending;
 mod pointer;
+use pending::PendingSwitch;
 
 use correction::CorrectionState;
 use interception::InterceptionState;
@@ -108,11 +111,8 @@ pub struct Input {
     events: InputEvents,
     correction: CorrectionState,
     switch_key: KeyCode,
-    pending: Option<usize>, // index of keyboard with pending switch
-    is_original_switch_key_held: bool,
+    pending: PendingSwitch,
     is_backing_off: bool,
-    is_auto_request: bool,
-    automatic_target: Option<Arc<crate::layout::Layout>>,
 }
 
 impl Input {
@@ -134,11 +134,8 @@ impl Input {
             events,
             correction: CorrectionState::default(),
             switch_key,
-            pending: None,
-            is_original_switch_key_held: false,
+            pending: PendingSwitch::default(),
             is_backing_off: false,
-            is_auto_request: false,
-            automatic_target: None,
         };
         let monitor = devices::Monitor::new()?;
         input.discover_devices(&sender, &monitor)?;
@@ -173,10 +170,7 @@ impl Input {
         let deadline = Instant::now() + duration;
         loop {
             self.process_available_events(None)?;
-            self.pending = None;
-            self.is_auto_request = false;
-            self.automatic_target = None;
-            self.is_original_switch_key_held = false;
+            self.pending.cancel();
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Ok(());
@@ -205,7 +199,8 @@ impl Input {
 
     fn switch_request(&self) -> Option<SwitchRequest> {
         use crate::switcher::SwitchMode;
-        let (mode, target) = if self.is_auto_request {
+        self.pending.source()?;
+        let (mode, target) = if self.pending.is_auto() {
             (SwitchMode::Auto, Some(self.automatic_target()?))
         } else {
             (SwitchMode::Manual, None)
@@ -225,7 +220,7 @@ impl Input {
         }
         let request = self.switch_request();
         if request.is_none() {
-            self.pending = None;
+            self.pending.cancel();
         }
         Ok(request)
     }
@@ -236,12 +231,12 @@ impl Input {
 
     #[cfg(test)]
     fn is_auto_request(&self) -> bool {
-        self.is_auto_request
+        self.pending.is_auto()
     }
 
     pub fn automatic_target(&self) -> Option<Arc<crate::layout::Layout>> {
         self.history.latest_word()?;
-        self.automatic_target.clone()
+        self.pending.target()
     }
 
     pub fn previous_word(&self) -> Option<&crate::word::Word> {
@@ -259,16 +254,16 @@ impl Input {
     pub fn begin_correction(&mut self, layout: Option<Arc<crate::layout::Layout>>) {
         self.set_latest_layout(layout);
         self.history.block_auto_switch();
-        self.automatic_target = None;
+        self.pending.cancel_auto();
     }
 
     fn is_ordinary_key_held(&self) -> bool {
-        let Some(switch_source) = self.pending else {
+        let Some(switch_source) = self.pending.source() else {
             return false;
         };
         self.keyboard_input.held_keys().any(|(index, code)| {
             !MODIFIERS.contains(&KeyCode::new(code))
-                && !(self.is_original_switch_key_held
+                && !(self.pending.is_original_key_held()
                     && index == switch_source
                     && code == self.switch_key.0)
         })
@@ -322,7 +317,7 @@ impl Input {
         if !state.is_some_and(|state| state.is_captured || state.recording.is_some()) {
             self.synchronize_layout();
             if self.history.latest_word().is_none() {
-                self.automatic_target = None;
+                self.pending.cancel_auto();
             }
         }
     }
@@ -378,7 +373,7 @@ impl Input {
                     is_captured || state.is_some_and(|state| state.recording.is_some()),
                 );
                 if self.history.latest_word().is_none() {
-                    self.automatic_target = None;
+                    self.pending.cancel_auto();
                 }
             }
             InputEventMessage::CorrectionFinished { result, layout } => {
@@ -403,10 +398,7 @@ impl Input {
 
     fn cancel_processing(&mut self) {
         self.reset_history();
-        self.pending = None;
-        self.automatic_target = None;
-        self.is_auto_request = false;
-        self.is_original_switch_key_held = false;
+        self.pending.cancel();
         self.correction.request_cancel();
     }
 
@@ -522,17 +514,15 @@ impl Input {
             return Ok(());
         }
         if key == self.switch_key {
-            if value == 0 && self.pending == Some(index) {
-                self.is_original_switch_key_held = false;
+            if value == 0 && self.pending.source() == Some(index) {
+                self.pending.release_original_key();
             }
             if value == 1
                 && !self.correction.is_active()
                 && self.pending.is_none()
                 && !self.has_other_switch_modifiers(index, key)
             {
-                self.pending = Some(index);
-                self.is_auto_request = false;
-                self.is_original_switch_key_held = true;
+                self.pending = PendingSwitch::manual(index);
             }
             return Ok(());
         }
@@ -563,7 +553,7 @@ impl Input {
             }
         }
         if key == KeyCode::KEY_BACKSPACE {
-            self.automatic_target = None;
+            self.pending.cancel_auto();
         }
         let is_first_space = key == KeyCode::KEY_SPACE
             && self
@@ -573,19 +563,17 @@ impl Input {
         if (crate::history::is_text_key(key) || is_first_space)
             && !self.keyboard_input.has_shortcut_modifier()
             && !self.correction.is_active()
-            && (self.pending.is_none() || self.is_auto_request)
+            && (self.pending.is_none() || self.pending.is_auto())
             && !self.history.is_auto_switch_blocked()
         {
-            self.automatic_target = self.history.latest_word().and_then(|word| {
-                self.layout
-                    .as_ref()
-                    .and_then(|layout| self.auto_switch.target(word, layout))
-            });
-            if self.automatic_target.is_some() {
-                self.pending = Some(index);
-                self.is_auto_request = true;
-                self.is_original_switch_key_held = false;
-            }
+            self.pending.update_auto(
+                index,
+                self.history.latest_word().and_then(|word| {
+                    self.layout
+                        .as_ref()
+                        .and_then(|layout| self.auto_switch.target(word, layout))
+                }),
+            );
         }
     }
 
@@ -606,11 +594,7 @@ impl Input {
     }
 
     fn request_history_reset(&mut self) {
-        self.automatic_target = None;
-        if self.is_auto_request {
-            self.pending = None;
-            self.is_auto_request = false;
-        }
+        self.pending.cancel_auto();
         self.reset_history();
         if self.correction.is_active() {
             self.correction.request_cancel();
@@ -623,9 +607,7 @@ impl Input {
         }
         self.is_backing_off = true;
         self.request_history_reset();
-        self.pending = None;
-        self.is_auto_request = false;
-        self.is_original_switch_key_held = false;
+        self.pending.cancel();
     }
 
     fn update_back_off(&mut self, now: Instant) {
@@ -1004,19 +986,15 @@ pub(crate) mod tests {
             events,
             correction: CorrectionState::default(),
             switch_key: KeyCode::KEY_PAUSE,
-            pending: Some(0),
-            is_original_switch_key_held: true,
+            pending: PendingSwitch::manual(0),
             is_backing_off: false,
-            is_auto_request: false,
-            automatic_target: None,
         }
     }
 
     pub(crate) fn statistics_input(statistics: crate::statistics::Statistics) -> Input {
         let source = Rc::new(RefCell::new(SimulatedKeyboard::default()));
         let mut input = simulated_input(&[source]);
-        input.pending = None;
-        input.is_original_switch_key_held = false;
+        input.pending.cancel();
         input.statistics = Some(statistics);
         input.accept_layout(Some(layout("us")), false);
         input
@@ -1036,8 +1014,7 @@ pub(crate) mod tests {
     fn auto_input() -> Input {
         let source = Rc::new(RefCell::new(SimulatedKeyboard::default()));
         let mut input = simulated_input(&[source]);
-        input.pending = None;
-        input.is_original_switch_key_held = false;
+        input.pending.cancel();
         let settings = crate::config::from_contents(
             r#"
 switch_key = 'KEY_PAUSE'
@@ -1113,7 +1090,7 @@ patterns = ['^\.тф']
         let first = Rc::new(RefCell::new(SimulatedKeyboard::default()));
         let second = Rc::new(RefCell::new(SimulatedKeyboard::default()));
         let mut input = simulated_input(&[first, second]);
-        input.pending = None;
+        input.pending.cancel();
         let now = Instant::now();
         event_at(&mut input, 0, KeyCode::KEY_LEFTSHIFT, 1, now);
         event_at(&mut input, 1, KeyCode::KEY_RIGHTSHIFT, 1, now);
@@ -1134,7 +1111,7 @@ patterns = ['^\.тф']
         let source = Rc::new(RefCell::new(SimulatedKeyboard::default()));
         source.borrow_mut().held.insert(KeyCode::KEY_LEFTSHIFT.0);
         let mut input = simulated_input(&[source]);
-        input.pending = None;
+        input.pending.cancel();
         press(&mut input, KeyCode::KEY_A);
         assert!(input.latest_word().unwrap().entries[0].stroke.shift);
         let mut state = InterceptionState::default();
@@ -1175,7 +1152,7 @@ patterns = ['^\.тф']
         assert_eq!(request.mode, crate::switcher::SwitchMode::Manual);
         assert!(request.target.is_none());
 
-        assert_eq!(input.pending, Some(0));
+        assert_eq!(input.pending.source(), Some(0));
         assert!(matches!(
             input.events.available().unwrap(),
             Some(InputEventMessage::FocusChanged)
@@ -1187,14 +1164,13 @@ patterns = ['^\.тф']
         let (mut input, _) = channel_input();
         press(&mut input, KeyCode::KEY_A);
         let expected_word = input.latest_word().cloned();
-        input.is_auto_request = true;
-        input.automatic_target = Some(layout("ru"));
+        input.pending.update_auto(0, Some(layout("ru")));
 
         let InputRequest::Switch(request) = input.next_request().unwrap() else {
             panic!("expected an automatic switch request");
         };
         input.reset_history();
-        input.automatic_target = Some(layout("us"));
+        input.pending.update_auto(0, Some(layout("us")));
 
         assert_eq!(request.mode, crate::switcher::SwitchMode::Auto);
         assert_eq!(request.word, expected_word);
@@ -1204,7 +1180,7 @@ patterns = ['^\.тф']
     #[test]
     fn io_interrupted_is_returned_as_an_error_instead_of_lifecycle_interrupt() {
         let (mut input, sender) = channel_input();
-        input.pending = None;
+        input.pending.cancel();
         sender.send(InputEventMessage::DeviceError(io::Error::from(
             io::ErrorKind::Interrupted,
         )));
@@ -1219,16 +1195,14 @@ patterns = ['^\.тф']
     #[test]
     fn pointer_press_and_event_loss_reset_history_without_restarting() {
         let (mut input, sender) = channel_input();
-        input.pending = None;
+        input.pending.cancel();
         press(&mut input, KeyCode::KEY_A);
-        input.pending = Some(0);
-        input.is_auto_request = true;
-        input.automatic_target = Some(layout("us"));
+        input.pending.update_auto(0, Some(layout("us")));
         sender.send(InputEventMessage::PointerPressed);
         input.process_available_events(None).unwrap();
         assert!(input.latest_word().is_none());
         assert!(input.pending.is_none());
-        assert!(input.automatic_target.is_none());
+        assert!(input.pending.target().is_none());
         assert_eq!(input.lifecycle, Lifecycle::Running);
 
         press(&mut input, KeyCode::KEY_B);
@@ -1279,8 +1253,7 @@ patterns = ['^\.тф']
     #[test]
     fn switch_request_wait_processes_the_entire_event_batch() {
         let (mut input, sender) = channel_input();
-        input.pending = None;
-        input.is_original_switch_key_held = false;
+        input.pending.cancel();
         let worker = thread::spawn(move || {
             for value in [1, 0] {
                 sender.send(InputEventMessage::Keyboard(
@@ -1296,8 +1269,8 @@ patterns = ['^\.тф']
             InputRequest::Switch(_)
         ));
 
-        assert_eq!(input.pending, Some(0));
-        assert!(!input.is_original_switch_key_held);
+        assert_eq!(input.pending.source(), Some(0));
+        assert!(!input.pending.is_original_key_held());
         assert!(!input.keyboard_input.is_key_held(0, KeyCode::KEY_PAUSE.0));
         assert!(input.events.available().unwrap().is_none());
     }
@@ -1305,7 +1278,7 @@ patterns = ['^\.тф']
     #[test]
     fn switch_request_wait_propagates_device_errors() {
         let (mut input, sender) = channel_input();
-        input.pending = None;
+        input.pending.cancel();
         sender.send(InputEventMessage::DeviceError(io::Error::other(
             "device disconnected",
         )));
@@ -1320,7 +1293,7 @@ patterns = ['^\.тф']
     fn shutdown_wakes_input_and_discovery_without_any_keyboards() {
         for is_discovering in [false, true] {
             let mut input = simulated_input(&[]);
-            input.pending = None;
+            input.pending.cancel();
             let (sender, events) = InputEvents::new();
             input.events = events;
             sender.shutdown(ShutdownReason::Stop).unwrap();
@@ -1673,7 +1646,7 @@ patterns = ['^\.тф']
             assert!(input.latest_word().is_none());
             assert!(input.previous_word().is_none());
             assert!(input.pending.is_none());
-            assert!(!input.is_original_switch_key_held);
+            assert!(!input.pending.is_original_key_held());
             assert!(source.borrow().writes.is_empty());
             event_at(&mut input, 0, key, 0, now);
             assert!(!input.is_backing_off);
@@ -1857,7 +1830,7 @@ patterns = ['^\.тф']
         press(input, KeyCode::KEY_PAUSE);
         assert!(input.pending.is_some());
         assert!(!input.is_auto_request());
-        input.pending = None;
+        input.pending.cancel();
         input.begin_correction(Some(layout(target)));
         input
             .process_message(
@@ -1979,7 +1952,7 @@ patterns = ['^\.тф']
             )
             .unwrap();
         assert!(input.history.is_auto_switch_blocked());
-        input.pending = None;
+        input.pending.cancel();
         press(&mut input, KeyCode::KEY_A);
         assert!(input.automatic_target().is_none());
         assert!(input.pending.is_none());
@@ -2019,7 +1992,7 @@ patterns = ['^\.тф']
         assert!(input.automatic_target().is_none());
         press(&mut input, KeyCode::KEY_SPACE);
         assert_eq!(input.automatic_target().unwrap().name(), "us");
-        input.automatic_target = None;
+        input.pending.cancel_auto();
         press(&mut input, KeyCode::KEY_SPACE);
         assert!(input.automatic_target().is_none());
         assert_eq!(input.latest_word().unwrap().trailing_spaces, 2);
@@ -2056,24 +2029,41 @@ patterns = ['^\.тф']
             press(&mut input, KeyCode::KEY_SLASH);
             press(&mut input, KeyCode::KEY_N);
             press(&mut input, separator);
+            input.process_available_events(None).unwrap();
             assert!(input.automatic_target().is_none());
+            assert!(input.pending.is_none());
+            assert!(!input.is_auto_request());
+            assert!(input.switch_request().is_none());
         }
         let mut input = auto_input();
         for key in [KeyCode::KEY_SLASH, KeyCode::KEY_N, KeyCode::KEY_A] {
             press(&mut input, key);
         }
-        input.pending = None;
-        input.automatic_target = None;
+        input.pending.cancel();
         press(&mut input, KeyCode::KEY_BACKSPACE);
         assert!(input.pending.is_none());
         assert!(input.automatic_target().is_none());
     }
 
     #[test]
+    fn typing_after_backspace_creates_a_new_automatic_request() {
+        let mut input = auto_input();
+        press(&mut input, KeyCode::KEY_SLASH);
+        press(&mut input, KeyCode::KEY_N);
+        assert!(input.pending.is_auto());
+        press(&mut input, KeyCode::KEY_BACKSPACE);
+        assert!(input.switch_request().is_none());
+        press(&mut input, KeyCode::KEY_N);
+        let request = input.switch_request().unwrap();
+        assert_eq!(request.mode, crate::switcher::SwitchMode::Auto);
+        assert_eq!(request.target.unwrap().name(), "us");
+    }
+
+    #[test]
     fn discovery_drains_channel_and_ignores_switch_requests() {
         let source = Rc::new(RefCell::new(SimulatedKeyboard::default()));
         let mut input = simulated_input(std::slice::from_ref(&source));
-        input.pending = None;
+        input.pending.cancel();
         source.borrow_mut().events.extend([
             InputEvent::new(EventType::KEY.0, KeyCode::KEY_LEFTSHIFT.0, 1),
             InputEvent::new(EventType::KEY.0, KeyCode::KEY_PAUSE.0, 1),
@@ -2091,8 +2081,8 @@ patterns = ['^\.тф']
             ));
         input.wait_for_keyboard_discovery(TEST_STEP * 3).unwrap();
         assert!(input.events.available().unwrap().is_none());
-        assert_eq!(input.pending, None);
-        assert!(!input.is_original_switch_key_held);
+        assert_eq!(input.pending.source(), None);
+        assert!(!input.pending.is_original_key_held());
         assert!(
             input
                 .keyboard_input
@@ -2109,7 +2099,7 @@ patterns = ['^\.тф']
             .events
             .push(InputEvent::new(EventType::KEY.0, KeyCode::KEY_PAUSE.0, 1));
         input.process_available_events(None).unwrap();
-        assert_eq!(input.pending, Some(0));
+        assert_eq!(input.pending.source(), Some(0));
     }
 
     #[test]

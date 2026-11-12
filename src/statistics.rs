@@ -681,12 +681,18 @@ mod tests {
             let previous = word("ru");
             let original = word("us");
             let time = UNIX_EPOCH + Duration::from_secs(123);
-            let result = crate::switcher::switch_and_replay(
+            let result = crate::switcher::switch_and_correct::<_, _, io::Error>(
                 || Ok(()),
                 || {},
                 || statistics.record_switch(Some(&previous), Some(&original), &layout("ru"), time),
-                || Err(io::Error::other("replay failed")),
-                &std::sync::atomic::AtomicBool::new(is_cancelled),
+                |_| {
+                    crate::switcher::replay_correction(
+                        &mut (),
+                        &std::sync::atomic::AtomicBool::new(is_cancelled),
+                        |_| Ok(()),
+                        |_| Err(io::Error::other("replay failed")),
+                    )
+                },
             );
             assert_eq!(result.is_ok(), is_cancelled);
             assert_eq!(
@@ -709,21 +715,20 @@ mod tests {
             finished.send(()).unwrap();
             Ok(())
         });
-        crate::switcher::switch_and_replay(
+        crate::switcher::switch_and_correct::<_, _, io::Error>(
             || Ok(()),
             || {},
             || {
                 statistics.record_switch(None, None, &layout("us"), UNIX_EPOCH);
                 writing.recv_timeout(TEST_TIMEOUT).unwrap();
             },
-            || {
+            |_| {
                 assert!(matches!(
                     completed.try_recv(),
                     Err(mpsc::TryRecvError::Empty)
                 ));
                 Ok(())
             },
-            &std::sync::atomic::AtomicBool::new(false),
         )
         .unwrap();
         drop(statistics);
@@ -745,7 +750,7 @@ mod tests {
         });
         for is_expected_success in [false, true] {
             let mut is_replayed = false;
-            crate::switcher::switch_and_replay(
+            crate::switcher::switch_and_correct::<_, _, io::Error>(
                 || Ok(()),
                 || {},
                 || {
@@ -755,11 +760,10 @@ mod tests {
                         is_expected_success
                     );
                 },
-                || {
+                |_| {
                     is_replayed = true;
                     Ok(())
                 },
-                &std::sync::atomic::AtomicBool::new(false),
             )
             .unwrap();
             assert!(is_replayed);
@@ -772,15 +776,14 @@ mod tests {
         drop(receiver);
         let statistics = Statistics { sender };
         let mut is_replayed = false;
-        crate::switcher::switch_and_replay(
+        crate::switcher::switch_and_correct::<_, _, io::Error>(
             || Ok(()),
             || {},
             || statistics.record_switch(None, None, &layout("us"), UNIX_EPOCH),
-            || {
+            |_| {
                 is_replayed = true;
                 Ok(())
             },
-            &std::sync::atomic::AtomicBool::new(false),
         )
         .unwrap();
         assert!(is_replayed);

@@ -1,7 +1,5 @@
 use std::collections::BTreeMap;
-use std::fs::{self, File};
 use std::io;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -10,18 +8,15 @@ use evdev::{
     AbsoluteAxisCode, EventType, InputEvent, KeyCode, PropType, RelativeAxisCode,
     SynchronizationCode, raw_stream::RawDevice,
 };
-use nix::errno::Errno;
-use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify};
+use nix::sys::inotify::AddWatchFlags;
+
+use super::device_watch::{self, DirectoryWatcher, INPUT_DIRECTORY, Identity};
 
 use crate::input_events::{InputEventMessage, InputEventSender};
 
-const INPUT_DIRECTORY: &str = "/dev/input";
-const DEVICE_PREFIX: &[u8] = b"event";
 const TAP_DURATION: Duration = Duration::from_millis(250);
 const TAP_TRAVEL_MM: i32 = 3;
 const FALLBACK_TRAVEL_DIVISOR: i32 = 70;
-
-type Identity = (u64, u64);
 
 pub(super) fn start(sender: InputEventSender) {
     let observer_sender = sender.clone();
@@ -40,32 +35,14 @@ pub(super) fn start(sender: InputEventSender) {
 }
 
 fn watch(sender: &InputEventSender) -> io::Result<()> {
-    let watcher = Inotify::init(InitFlags::IN_CLOEXEC)?;
-    watcher.add_watch(
-        INPUT_DIRECTORY,
-        AddWatchFlags::IN_CREATE
-            | AddWatchFlags::IN_DELETE
-            | AddWatchFlags::IN_MOVED_FROM
-            | AddWatchFlags::IN_MOVED_TO
-            | AddWatchFlags::IN_ATTRIB
-            | AddWatchFlags::IN_DELETE_SELF
-            | AddWatchFlags::IN_MOVE_SELF,
-    )?;
+    let watcher = DirectoryWatcher::new(Path::new(INPUT_DIRECTORY))?;
     let mut devices = BTreeMap::new();
     refresh(&mut devices, sender)?;
     loop {
-        let events = match watcher.read_events() {
-            Ok(events) => events,
-            Err(Errno::EINTR) => continue,
-            Err(error) => return Err(error.into()),
-        };
+        let events = watcher.read_events()?;
         let mut is_relevant = false;
         for event in events {
-            if event.mask.intersects(
-                AddWatchFlags::IN_DELETE_SELF
-                    | AddWatchFlags::IN_MOVE_SELF
-                    | AddWatchFlags::IN_IGNORED,
-            ) {
+            if device_watch::is_watch_lost(event.mask) {
                 return Err(io::Error::other("pointer directory watch lost"));
             }
             if event.mask.contains(AddWatchFlags::IN_Q_OVERFLOW) {
@@ -74,7 +51,7 @@ fn watch(sender: &InputEventSender) -> io::Result<()> {
             }
             is_relevant |= event
                 .name
-                .is_some_and(|name| name.as_encoded_bytes().starts_with(DEVICE_PREFIX));
+                .is_some_and(|name| device_watch::is_device_name(&name));
         }
         if is_relevant {
             refresh(&mut devices, sender)?;
@@ -84,16 +61,8 @@ fn watch(sender: &InputEventSender) -> io::Result<()> {
 
 fn refresh(devices: &mut BTreeMap<PathBuf, Identity>, sender: &InputEventSender) -> io::Result<()> {
     let mut found = BTreeMap::new();
-    for entry in fs::read_dir(INPUT_DIRECTORY)? {
-        let entry = entry?;
-        if !entry
-            .file_name()
-            .as_encoded_bytes()
-            .starts_with(DEVICE_PREFIX)
-        {
-            continue;
-        }
-        let path = entry.path();
+    for path in device_watch::device_paths(Path::new(INPUT_DIRECTORY))? {
+        let path = path?;
         match open_pointer(&path) {
             Ok(Some((identity, device))) => {
                 if devices.get(&path) != Some(&identity) {
@@ -116,9 +85,7 @@ fn refresh(devices: &mut BTreeMap<PathBuf, Identity>, sender: &InputEventSender)
 }
 
 fn open_pointer(path: &Path) -> io::Result<Option<(Identity, RawDevice)>> {
-    let file = File::open(path)?;
-    let metadata = file.metadata()?;
-    let device = RawDevice::try_from(file)?;
+    let (identity, device) = device_watch::open_device(path)?;
     let Some(keys) = device.supported_keys() else {
         return Ok(None);
     };
@@ -128,7 +95,7 @@ fn open_pointer(path: &Path) -> io::Result<Option<(Identity, RawDevice)>> {
     let is_mouse =
         (KeyCode::BTN_LEFT.0..KeyCode::BTN_TRIGGER.0).any(|code| keys.contains(KeyCode::new(code)));
     if is_mouse || is_touchpad {
-        Ok(Some(((metadata.rdev(), metadata.ino()), device)))
+        Ok(Some((identity, device)))
     } else {
         Ok(None)
     }
