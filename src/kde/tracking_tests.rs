@@ -11,16 +11,32 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[test]
 fn uses_first_duplicate_layout_with_its_configured_variant() {
+    let bus = TestBus::start();
     let names = vec![
         ("ru".into(), String::new(), String::new()),
         ("ru".into(), String::new(), String::new()),
     ];
+    let (_service, _) = bus.service_with_layouts(false, names);
+    let client = KdeClient::new(bus.connect(), SERVICE.into()).unwrap();
     let contents = "[Layout]\nLayoutList=ru,ru\nVariantList=phonetic,\n";
+    assert_eq!(client.layout_index("ru").unwrap(), 0);
     assert_eq!(
-        configured_target(&names, contents, "ru").unwrap().variant(),
+        client
+            .target_layout("ru", &|| Ok(contents.into()))
+            .unwrap()
+            .variant(),
         "phonetic"
     );
-    assert!(configured_target(&names, contents, "us").is_err());
+    let index_error = client.layout_index("us").unwrap_err();
+    let target_error = client
+        .target_layout("us", &|| Ok(contents.into()))
+        .unwrap_err();
+    assert_eq!(index_error.to_string(), target_error.to_string());
+    assert!(
+        index_error
+            .to_string()
+            .contains("absent from KDE configuration")
+    );
 }
 
 #[test]
@@ -92,10 +108,25 @@ impl TestBus {
     }
 
     fn service(&self, is_racing: bool) -> (Connection, Arc<AtomicU32>) {
+        self.service_with_layouts(
+            is_racing,
+            vec![
+                ("us".into(), String::new(), "English (US)".into()),
+                ("ru".into(), String::new(), "Russian".into()),
+            ],
+        )
+    }
+
+    fn service_with_layouts(
+        &self,
+        is_racing: bool,
+        names: Vec<(String, String, String)>,
+    ) -> (Connection, Arc<AtomicU32>) {
         let index = Arc::new(AtomicU32::new(0));
         let mock = KeyboardLayouts {
             index: index.clone(),
             is_racing: AtomicBool::new(is_racing),
+            names,
         };
         let connection = zbus::blocking::connection::Builder::address(self.address.as_str())
             .unwrap()
@@ -119,6 +150,7 @@ impl Drop for TestBus {
 struct KeyboardLayouts {
     index: Arc<AtomicU32>,
     is_racing: AtomicBool,
+    names: Vec<(String, String, String)>,
 }
 
 #[zbus::interface(name = "org.kde.KeyboardLayouts")]
@@ -138,11 +170,79 @@ impl KeyboardLayouts {
 
     #[zbus(name = "getLayoutsList")]
     fn get_layouts_list(&self) -> Vec<(String, String, String)> {
-        vec![
-            ("us".into(), String::new(), "English (US)".into()),
-            ("ru".into(), String::new(), "Russian".into()),
-        ]
+        self.names.clone()
     }
+}
+
+#[test]
+fn client_reads_current_and_target_layouts_without_caching() {
+    let bus = TestBus::start();
+    let (_service, index) = bus.service(false);
+    let client = KdeClient::new(bus.connect(), SERVICE.into()).unwrap();
+    let read_config = || Ok(CONFIG.into());
+    assert_eq!(client.current_layout(&read_config).unwrap().name(), "us");
+    assert_eq!(client.layout_index("ru").unwrap(), 1);
+    let target = client.target_layout("ru", &read_config).unwrap();
+    assert_eq!(target.variant(), "phonetic");
+    assert_eq!(target.model(), "pc105");
+    index.store(1, Ordering::SeqCst);
+    assert_eq!(*client.current_layout(&read_config).unwrap(), *target);
+}
+
+#[test]
+fn client_rejects_unknown_indices_and_configuration_mismatch() {
+    let bus = TestBus::start();
+    let (_service, index) = bus.service(false);
+    let client = KdeClient::new(bus.connect(), SERVICE.into()).unwrap();
+    index.store(2, Ordering::SeqCst);
+    assert_eq!(
+        client
+            .current_layout(&|| Ok(CONFIG.into()))
+            .unwrap_err()
+            .to_string(),
+        "unknown KDE layout index"
+    );
+    index.store(0, Ordering::SeqCst);
+    let read_mismatch = || Ok("[Layout]\nLayoutList=ru,us\n".into());
+    assert_eq!(
+        client
+            .current_layout(&read_mismatch)
+            .unwrap_err()
+            .to_string(),
+        "cannot match KDE layout to kxkbrc"
+    );
+    assert_eq!(
+        client
+            .target_layout("ru", &read_mismatch)
+            .unwrap_err()
+            .to_string(),
+        "Cannot match KDE layout \"ru\" to kxkbrc"
+    );
+}
+
+#[test]
+fn client_propagates_configuration_and_service_errors() {
+    let bus = TestBus::start();
+    let (service, _) = bus.service(false);
+    let client = KdeClient::new(bus.connect(), SERVICE.into()).unwrap();
+    let read_error = || {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "config denied",
+        ))
+    };
+    for error in [
+        client.current_layout(&read_error).unwrap_err(),
+        client.target_layout("ru", &read_error).unwrap_err(),
+    ] {
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "config denied");
+    }
+    service.release_name(SERVICE).unwrap();
+    let unexpected_read = || panic!("must not read configuration after a D-Bus error");
+    assert!(client.current_layout(&unexpected_read).is_err());
+    assert!(client.target_layout("ru", &unexpected_read).is_err());
+    assert!(client.layout_index("ru").is_err());
 }
 
 fn wait_for(events: &crate::input_events::InputEvents, name: Option<&str>) {

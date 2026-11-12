@@ -159,9 +159,9 @@ fn receive_changes(
 ) -> zbus::Result<()> {
     let mut messages = subscribe(connection)?;
     let owner = DBusProxy::new(connection)?.get_name_owner(SERVICE.try_into()?)?;
-    let proxy = Proxy::new(connection, owner.as_str(), PATH, INTERFACE)?;
+    let client = KdeClient::new(connection.clone(), owner.to_string())?;
     tracker
-        .observe(|| query(&proxy, read_config))
+        .observe(|| client.current_layout(read_config))
         .map_err(zbus::Error::from)?;
     on_connected();
     for message in &mut messages {
@@ -190,9 +190,9 @@ fn receive_changes(
                 .is_some_and(|value| value.as_str() == INTERFACE)
         {
             // Requery instead of replaying queued indices: signals received during
-            // `query` must never overwrite the snapshot with an older layout.
+            // `current_layout` must never overwrite the snapshot with an older layout.
             tracker
-                .observe(|| query(&proxy, read_config))
+                .observe(|| client.current_layout(read_config))
                 .map_err(zbus::Error::from)?;
         }
     }
@@ -200,43 +200,74 @@ fn receive_changes(
 }
 
 pub fn current_layout() -> io::Result<Arc<Layout>> {
-    let connection = Connection::session().map_err(io::Error::other)?;
-    let proxy = Proxy::new(&connection, SERVICE, PATH, INTERFACE).map_err(io::Error::other)?;
-    query(&proxy, &read_configuration)
+    KdeClient::connect()?.current_layout(&read_configuration)
 }
 
 pub fn target_layout(name: &str) -> io::Result<Arc<Layout>> {
     crate::xkb::validate_layout_identifier(name)?;
-    let connection = Connection::session().map_err(io::Error::other)?;
-    let proxy = Proxy::new(&connection, SERVICE, PATH, INTERFACE).map_err(io::Error::other)?;
-    let names: Vec<(String, String, String)> = proxy
-        .call("getLayoutsList", &())
-        .map_err(io::Error::other)?;
-    configured_target(&names, &read_configuration()?, name)
+    KdeClient::connect()?.target_layout(name, &read_configuration)
 }
 
-fn configured_target(
-    names: &[(String, String, String)],
-    contents: &str,
-    name: &str,
-) -> io::Result<Arc<Layout>> {
-    let index = names
-        .iter()
-        .position(|entry| entry.0 == name)
-        .ok_or_else(|| {
-            io::Error::other(format!("Layout {name:?} is absent from KDE configuration"))
-        })?;
-    configured_layout(contents, index, name)
-        .map(Arc::new)
-        .ok_or_else(|| io::Error::other(format!("Cannot match KDE layout {name:?} to kxkbrc")))
+struct KdeClient {
+    proxy: Proxy<'static>,
 }
 
-fn layout_index(name: &str) -> io::Result<usize> {
-    let connection = Connection::session().map_err(io::Error::other)?;
-    let proxy = Proxy::new(&connection, SERVICE, PATH, INTERFACE).map_err(io::Error::other)?;
-    let names: Vec<(String, String, String)> = proxy
-        .call("getLayoutsList", &())
-        .map_err(io::Error::other)?;
+impl KdeClient {
+    fn connect() -> io::Result<Self> {
+        let connection = Connection::session().map_err(io::Error::other)?;
+        Self::new(connection, SERVICE.into()).map_err(io::Error::other)
+    }
+
+    fn new(connection: Connection, destination: String) -> zbus::Result<Self> {
+        Ok(Self {
+            proxy: Proxy::new_owned(connection, destination, PATH, INTERFACE)?,
+        })
+    }
+
+    fn layouts(&self) -> io::Result<Vec<(String, String, String)>> {
+        self.proxy
+            .call("getLayoutsList", &())
+            .map_err(io::Error::other)
+    }
+
+    fn layout_index(&self, name: &str) -> io::Result<usize> {
+        find_layout_index(&self.layouts()?, name)
+    }
+
+    fn target_layout(
+        &self,
+        name: &str,
+        read_config: &impl Fn() -> io::Result<String>,
+    ) -> io::Result<Arc<Layout>> {
+        let names = self.layouts()?;
+        let contents = read_config()?;
+        let index = find_layout_index(&names, name)?;
+        configured_layout(&contents, index, name)
+            .map(Arc::new)
+            .ok_or_else(|| io::Error::other(format!("Cannot match KDE layout {name:?} to kxkbrc")))
+    }
+
+    fn current_layout(
+        &self,
+        read_config: &impl Fn() -> io::Result<String>,
+    ) -> io::Result<Arc<Layout>> {
+        let names = self.layouts()?;
+        let contents = read_config()?;
+        let index: u32 = self
+            .proxy
+            .call("getLayout", &())
+            .map_err(io::Error::other)?;
+        let name = &names
+            .get(index as usize)
+            .ok_or_else(|| io::Error::other("unknown KDE layout index"))?
+            .0;
+        configured_layout(&contents, index as usize, name)
+            .map(Arc::new)
+            .ok_or_else(|| io::Error::other("cannot match KDE layout to kxkbrc"))
+    }
+}
+
+fn find_layout_index(names: &[(String, String, String)], name: &str) -> io::Result<usize> {
     names
         .iter()
         .position(|entry| entry.0 == name)
@@ -247,24 +278,6 @@ fn layout_index(name: &str) -> io::Result<usize> {
 
 fn read_configuration() -> io::Result<String> {
     fs::read_to_string(config_path()?)
-}
-
-fn query(
-    proxy: &Proxy<'_>,
-    read_config: &impl Fn() -> io::Result<String>,
-) -> io::Result<Arc<Layout>> {
-    let names: Vec<(String, String, String)> = proxy
-        .call("getLayoutsList", &())
-        .map_err(io::Error::other)?;
-    let contents = read_config()?;
-    let index: u32 = proxy.call("getLayout", &()).map_err(io::Error::other)?;
-    let name = &names
-        .get(index as usize)
-        .ok_or_else(|| io::Error::other("unknown KDE layout index"))?
-        .0;
-    configured_layout(&contents, index as usize, name)
-        .map(Arc::new)
-        .ok_or_else(|| io::Error::other("cannot match KDE layout to kxkbrc"))
 }
 
 fn config_path() -> io::Result<PathBuf> {
@@ -329,7 +342,7 @@ impl KdePlasma {
     }
 
     pub fn switch_to_layout(&self, name: &str) -> io::Result<()> {
-        let index = layout_index(name)?.to_string();
+        let index = KdeClient::connect()?.layout_index(name)?.to_string();
         self.call_layout_method("org.kde.KeyboardLayouts.setLayout", &[&index])
     }
 
