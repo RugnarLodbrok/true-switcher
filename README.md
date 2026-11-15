@@ -1,7 +1,10 @@
 # True Switcher
 
-Keyboard layout switcher. Press Pause/Break to retype the last word using a different keyboard layout
-Automatic layout switching is not supported for now.
+Keyboard layout switcher.
+ - manual: Press Pause/Break to retype the last word using a different keyboard layout
+ - automatic: 
+   - small number of custom rules in config
+   - in future: autoswitch using dictionaries  
 
 ## Why Another Switcher?
 
@@ -10,7 +13,7 @@ Automatic layout switching is not supported for now.
 | Alternative | Downsides |
 | --- | --- |
 | [XNeur](https://manpages.ubuntu.com/manpages/resolute/man1/xneur.1.html) | does not support wayland |
-| [PolterType](https://poltertype.com/) | solid switcher, but custom commands and autoswitch seemed limited to me. No way to bind switch on PauseBreak. Also switches `.туц` -> `.new`, not `/new` and it is really bad | 
+| [PolterType](https://poltertype.com/) | solid switcher, but custom commands and autoswitch seemed limited to me. No way to bind switch on PauseBreak. Also switches `.туц` -> `.new`, not `/new` and it is a dealbreakr | 
 | [layout-fix](https://github.com/AkuLinker/layout-fix) | doesn't support last word retype, but has different features|
 | [XSwitcher](https://github.com/ds-voix/xswitcher) | probably has bugs, or I couldn't configure it well. Very convoluted way of configuration |
 | [GSwitch](https://github.com/arumata/gswitch) | uses noticeable delays for switching. When delays're configured to 0 works unreliably. Slow switch often interferes with fast typing |
@@ -38,7 +41,7 @@ On Fedora:
 sudo dnf install libxkbcommon-devel pulseaudio-libs-devel
 ```
 
-On Bazzite:
+On Bazzite: <codex: does this also apply to fedora-atomic?>
 
 ```sh
 rpm-ostree install libxkbcommon-devel pulseaudio-libs-devel
@@ -50,6 +53,8 @@ The development packages are only needed to build from source; users of prebuilt
 ## Installation
 
 ### Prebuilt
+
+todo
 
 ### From sources
 
@@ -63,7 +68,7 @@ The installer checks for `qdbus` using the system service's `PATH`, which may di
 After installation, the installer starts True Switcher and enables it to start automatically in future graphical sessions.
 
 ## Tray and configuration
-
+<codex: перепиши этот раздел лучше. Пример полного конфига с комментами справа прямо в коде лучше словесного описания. Так подробно про рестарт тоже не пиши, достаточно упомянуть что есть Reload в трее>
 True Switcher shows an icon in the KDE Plasma system tray while the process is running.
 Its menu contains `Reload`, which restarts the system service `true-switcher.service` without waiting for the restart to finish. The icon briefly disappears and the new process reads `~/.config/true-switcher/config.toml` again.
 
