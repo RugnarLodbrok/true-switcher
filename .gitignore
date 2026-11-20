@@ -1,6 +1,7 @@
 mahou_reference
 context
 src-learn
+dicts
 
 # Build artifacts
 /target/

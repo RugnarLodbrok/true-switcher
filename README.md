@@ -20,6 +20,19 @@ Keyboard layout switcher.
 | [Mahou](https://gitea.com/BladeMight/Mahou) | Best of them all, but only for Windows. Inspiration for TrueSwitcher |
 | [Mahou3](https://github.com/Sippelin/Mahou3) | continuation of Mahou |
 
+## Supported environments
+
+| Desktop environment | Supported |
+| --- | :---: |
+| KDE Plasma (Wayland) | ✅ |
+| GNOME | ❌ |
+| Cinnamon | ❌ |
+| Xfce | ❌ |
+
+Everything else is also not supported.
+
+Efforts to improve this coverage are welcomed. 
+
 ## Requirements
 
 ### Runtime
@@ -41,13 +54,13 @@ On Fedora:
 sudo dnf install libxkbcommon-devel pulseaudio-libs-devel
 ```
 
-On Bazzite: <codex: does this also apply to fedora-atomic?>
+On Bazzite and Fedora Atomic Desktops (including KDE-based Kinoite):
 
 ```sh
 rpm-ostree install libxkbcommon-devel pulseaudio-libs-devel
 ```
 
-Reboot after installing the package on Bazzite to activate the new deployment.
+Reboot after installing these packages to activate the new deployment; see the [rpm-ostree package layering documentation](https://github.com/coreos/rpm-ostree/blob/main/docs/administrator-handbook.md#hybrid-imagepackaging-via-package-layering).
 The development packages are only needed to build from source; users of prebuilt binaries need the runtime libraries and XKB layout data.
 
 ## Installation
@@ -68,39 +81,32 @@ The installer checks for `qdbus` using the system service's `PATH`, which may di
 After installation, the installer starts True Switcher and enables it to start automatically in future graphical sessions.
 
 ## Tray and configuration
-<codex: перепиши этот раздел лучше. Пример полного конфига с комментами справа прямо в коде лучше словесного описания. Так подробно про рестарт тоже не пиши, достаточно упомянуть что есть Reload в трее>
-True Switcher shows an icon in the KDE Plasma system tray while the process is running.
-Its menu contains `Reload`, which restarts the system service `true-switcher.service` without waiting for the restart to finish. The icon briefly disappears and the new process reads `~/.config/true-switcher/config.toml` again.
 
-Set `log_level` in the configuration to `off`, `error`, `warn`, `info`, `debug`, or `trace`. It defaults to `info` and is not overridden by `RUST_LOG`. The `trace` level logs keyboard input, including typed words.
-`Quit` stops the system service.
+Edit `~/.config/true-switcher/config.toml`, then select `Reload` in the KDE Plasma tray menu to apply changes. Select `Quit` to stop True Switcher.
 
-If the configuration cannot be read, or `switch_key` is missing or invalid, the program uses `KEY_PAUSE` and sends a desktop notification. A failed restart request is also logged and reported in a notification.
-
-To play a short sound after a successful manual switch, set the following in `~/.config/true-switcher/config.toml` and select Reload in the tray menu:
+Complete configuration example, with default values for optional settings and one example rule:
 
 ```toml
-manual_switch_sound = false
+switch_key = "KEY_PAUSE"     # Required Linux key name; e.g. KEY_PAUSE, KEY_F12, ...
+log_level = "info"           # off, error, warn, info, debug, trace; trace logs typed words
+manual_switch_sound = false  # Play a sound after a successful manual switch
+auto_switch = false          # Use `switch_rules` below to perform automatic switch 
+auto_switch_sound = true     # Play a sound after a successful automatic switch
+
+[[switch_rules]]             # Optional; repeat this block to add more rules
+target = "us"                # XKB layout identifier configured in KDE, e.g. us or ru. The layout must be present in KDE 
+patterns = [                 # Rust regex patterns matched against the converted word.
+    '^/[a-z]'                # this rule will auto-switch words like `/start` when typed in non-`us` layout. For example `.ыефке` in `ru` 
+] 
 ```
 
-Change `false` to `true` to enable sound. When the option is missing, sound is disabled. Playback errors are logged and do not interrupt switching. Linux playback requires a PulseAudio-compatible server such as `pipewire-pulse`.
-The tray registers again when Plasma's tray service becomes available or changes its D-Bus owner.
+Rules are validated even when `auto_switch = false`; see [Automatic switching](#automatic-switching) for matching behavior and layout requirements.
 
-The installer copies the SVG from `icon/` to `/usr/local/share/true-switcher/icons/` and allows `restart` for this service in its Polkit rule. Runs from the source tree can use `icon/` directly; `Reload` always targets the installed system service.
-Use `make update-installed` to rebuild and update the installed binary, stopping and starting the system service around the update. This does not update the installed icon, service units or Polkit rule.
+`RUST_LOG` does not override `log_level`. Sound playback requires a PulseAudio-compatible server such as `pipewire-pulse`; playback errors are logged without interrupting switching.
 
 ## Automatic switching
 
-Automatic switching is disabled by default. Add these settings to `~/.config/true-switcher/config.toml` and select `Reload`:
-
-```toml
-auto_switch = true
-auto_switch_sound = true
-
-[[switch_rules]]
-target = "us"
-patterns = ['^/[a-z]']
-```
+Automatic switching is disabled by default. Set `auto_switch = true` in the configuration example above and select `Reload` to enable its rule.
 
 After each typed character, the current word is converted to each rule's `target` layout and matched against its `patterns`. The first matching rule corrects the word and selects that layout, without waiting for a separator. For example, `.т` typed in Russian becomes `/n` with this rule. The word can switch again when later characters match another target. Rules for the current layout are skipped; Backspace does not trigger matching.
 
