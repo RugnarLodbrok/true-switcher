@@ -21,6 +21,10 @@ impl History {
         self.words.last()
     }
 
+    pub(crate) fn latest_word_mut(&mut self) -> Option<&mut Word> {
+        self.words.last_mut()
+    }
+
     pub fn block_auto_switch(&mut self) {
         self.is_auto_switch_blocked = self.latest_word().is_some();
     }
@@ -57,13 +61,17 @@ impl History {
                     self.words.push(Word::default());
                     self.is_auto_switch_blocked = false;
                 }
-                self.words.last_mut().unwrap().entries.push(WordStroke {
-                    stroke: Stroke {
-                        key,
-                        shift: is_shift,
-                    },
-                    layout,
-                });
+                let word = self.words.last_mut().unwrap();
+                let stroke = Stroke {
+                    key,
+                    shift: is_shift,
+                };
+                if !word.has_dead_key {
+                    word.has_dead_key = layout.as_ref().is_some_and(|layout| {
+                        crate::xkb::has_dead_key(layout, [&stroke]) == Ok(true)
+                    });
+                }
+                word.entries.push(WordStroke { stroke, layout });
             }
             _ => {}
         }
@@ -87,6 +95,9 @@ impl History {
             return;
         }
         word.entries.pop();
+        for stack in &mut word.dictionary_prefixes {
+            stack.pop();
+        }
         if word.entries.is_empty() {
             self.words.pop();
             self.is_auto_switch_blocked = false;

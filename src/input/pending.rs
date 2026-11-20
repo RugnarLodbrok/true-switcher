@@ -2,6 +2,12 @@ use std::sync::Arc;
 
 use crate::layout::Layout;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum AutoSwitchKind {
+    Regex,
+    Dictionary,
+}
+
 #[derive(Default)]
 pub(super) enum PendingSwitch {
     #[default]
@@ -13,6 +19,7 @@ pub(super) enum PendingSwitch {
     Auto {
         source: usize,
         target: Arc<Layout>,
+        kind: AutoSwitchKind,
     },
 }
 
@@ -40,6 +47,15 @@ impl PendingSwitch {
     pub(super) fn is_auto(&self) -> bool {
         matches!(self, Self::Auto { .. })
     }
+    pub(super) fn is_dictionary(&self) -> bool {
+        matches!(
+            self,
+            Self::Auto {
+                kind: AutoSwitchKind::Dictionary,
+                ..
+            }
+        )
+    }
     pub(super) fn is_original_key_held(&self) -> bool {
         matches!(
             self,
@@ -63,9 +79,17 @@ impl PendingSwitch {
         }
     }
 
-    pub(super) fn update_auto(&mut self, source: usize, target: Option<Arc<Layout>>) {
-        if let Some(target) = target {
-            *self = Self::Auto { source, target };
+    pub(super) fn update_auto(
+        &mut self,
+        source: usize,
+        target: Option<(Arc<Layout>, AutoSwitchKind)>,
+    ) {
+        if let Some((target, kind)) = target {
+            *self = Self::Auto {
+                source,
+                target,
+                kind,
+            };
         } else {
             self.cancel_auto();
         }

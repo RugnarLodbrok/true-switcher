@@ -279,6 +279,7 @@ mod tests {
             })
             .collect(),
             trailing_spaces: 3,
+            ..Default::default()
         };
         assert_batch_matches_legacy(replay_strokes(&word).unwrap().collect());
     }
@@ -369,6 +370,7 @@ mod tests {
             })
             .collect(),
             trailing_spaces: 3,
+            ..Default::default()
         };
         let mut events = Vec::new();
         emit_strokes(replay_strokes(&word).unwrap(), |key, value| {
@@ -436,6 +438,7 @@ mod tests {
             })
             .collect(),
             trailing_spaces: 0,
+            ..Default::default()
         };
         assert!(
             matches!(replay_strokes(&word), Err(error) if error.kind() == io::ErrorKind::InvalidInput)

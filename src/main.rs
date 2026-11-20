@@ -1,4 +1,5 @@
 mod config;
+mod dictionary;
 mod focus;
 mod history;
 mod hold;

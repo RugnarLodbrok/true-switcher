@@ -12,6 +12,8 @@ pub struct Stroke {
 pub struct Word {
     pub entries: Vec<WordStroke>,
     pub trailing_spaces: usize,
+    pub(crate) dictionary_prefixes: Vec<Vec<crate::dictionary::Prefix>>,
+    pub(crate) has_dead_key: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

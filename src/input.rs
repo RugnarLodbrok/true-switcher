@@ -14,7 +14,7 @@ mod interception;
 mod keyboard;
 mod pending;
 mod pointer;
-use pending::PendingSwitch;
+use pending::{AutoSwitchKind, PendingSwitch};
 
 use correction::CorrectionState;
 use interception::InterceptionState;
@@ -75,7 +75,7 @@ impl InputEventExt for InputEvent {
 
 #[derive(Debug)]
 pub enum InputRequest {
-    Switch(SwitchRequest),
+    Switch,
     Shutdown(ShutdownReason),
 }
 
@@ -189,8 +189,8 @@ impl Input {
                 Err(ProcessingError::Io(error)) => return Err(error),
             }
             match self.wait_for_switch_request() {
-                Ok(Some(request)) => return Ok(InputRequest::Switch(request)),
-                Ok(None) => {}
+                Ok(true) => return Ok(InputRequest::Switch),
+                Ok(false) => {}
                 Err(ProcessingError::Interrupted) => continue,
                 Err(ProcessingError::Io(error)) => return Err(error),
             }
@@ -199,7 +199,9 @@ impl Input {
 
     fn switch_request(&self) -> Option<SwitchRequest> {
         use crate::switcher::SwitchMode;
-        self.pending.source()?;
+        if !self.has_valid_pending_request() {
+            return None;
+        }
         let (mode, target) = if self.pending.is_auto() {
             (SwitchMode::Auto, Some(self.automatic_target()?))
         } else {
@@ -213,16 +215,22 @@ impl Input {
         })
     }
 
-    fn wait_for_switch_request(&mut self) -> ProcessingResult<Option<SwitchRequest>> {
+    fn has_valid_pending_request(&self) -> bool {
+        self.pending.is_some()
+            && !self.latest_word().is_some_and(|word| word.has_dead_key)
+            && (!self.pending.is_auto() || self.latest_word().is_some())
+    }
+
+    fn wait_for_switch_request(&mut self) -> ProcessingResult<bool> {
         self.lifecycle.check()?;
         if self.pending.is_none() {
             self.process_events_until(|input| input.pending.is_some(), None)?;
         }
-        let request = self.switch_request();
-        if request.is_none() {
+        let is_ready = self.has_valid_pending_request();
+        if !is_ready {
             self.pending.cancel();
         }
-        Ok(request)
+        Ok(is_ready)
     }
 
     pub fn latest_word(&self) -> Option<&crate::word::Word> {
@@ -520,6 +528,7 @@ impl Input {
             if value == 1
                 && !self.correction.is_active()
                 && self.pending.is_none()
+                && !self.latest_word().is_some_and(|word| word.has_dead_key)
                 && !self.has_other_switch_modifiers(index, key)
             {
                 self.pending = PendingSwitch::manual(index);
@@ -541,39 +550,77 @@ impl Input {
             return;
         }
 
-        if !self.keyboard_input.has_shortcut_modifier() {
-            if is_hard_separator {
-                self.reset_history();
-            } else {
-                let is_shift = self
-                    .keyboard_input
-                    .held_keys()
-                    .any(|(_, code)| is_shift(KeyCode::new(code)));
-                self.history.process(key, is_shift, self.layout.clone());
-            }
-        }
         if key == KeyCode::KEY_BACKSPACE {
             self.pending.cancel_auto();
         }
-        let is_first_space = key == KeyCode::KEY_SPACE
-            && self
-                .history
-                .latest_word()
-                .is_some_and(|word| word.trailing_spaces == 1);
-        if (crate::history::is_text_key(key) || is_first_space)
-            && !self.keyboard_input.has_shortcut_modifier()
+        if self.keyboard_input.has_shortcut_modifier() {
+            return;
+        }
+        if is_hard_separator {
+            self.reset_history();
+            return;
+        }
+
+        let is_shift = self
+            .keyboard_input
+            .held_keys()
+            .any(|(_, code)| is_shift(KeyCode::new(code)));
+        self.history.process(key, is_shift, self.layout.clone());
+        let is_text = crate::history::is_text_key(key);
+        let Some(word) = self.history.latest_word_mut() else {
+            return;
+        };
+        if is_text {
+            let stroke = word.entries.last().unwrap().stroke;
+            self.auto_switch.dictionaries.push(word, &stroke);
+        }
+        let is_first_space = key == KeyCode::KEY_SPACE && word.trailing_spaces == 1;
+        if word.has_dead_key {
+            self.pending.cancel_auto();
+            if self.correction.is_active() {
+                self.correction.request_cancel();
+            }
+        } else if (is_text || is_first_space)
             && !self.correction.is_active()
             && (self.pending.is_none() || self.pending.is_auto())
             && !self.history.is_auto_switch_blocked()
         {
-            self.pending.update_auto(
-                index,
-                self.history.latest_word().and_then(|word| {
-                    self.layout
-                        .as_ref()
-                        .and_then(|layout| self.auto_switch.target(word, layout))
-                }),
+            self.update_auto_switch(index, is_first_space);
+        }
+        if is_text && let Some(word) = self.latest_word() {
+            let target = if self.pending.is_dictionary() {
+                self.pending.target()
+            } else {
+                None
+            };
+            self.auto_switch.dictionaries.trace_scores(
+                word,
+                self.layout.as_deref(),
+                target.as_deref(),
             );
+        }
+    }
+
+    fn update_auto_switch(&mut self, index: usize, is_first_space: bool) {
+        let target = self
+            .latest_word()
+            .zip(self.layout.as_ref())
+            .and_then(|(word, layout)| {
+                self.auto_switch
+                    .target(word, layout)
+                    .map(|target| (target, AutoSwitchKind::Regex))
+                    .or_else(|| {
+                        if is_first_space {
+                            return None;
+                        }
+                        self.auto_switch
+                            .dictionaries
+                            .target(word, layout)
+                            .map(|target| (target, AutoSwitchKind::Dictionary))
+                    })
+            });
+        if target.is_some() || !is_first_space || !self.pending.is_dictionary() {
+            self.pending.update_auto(index, target);
         }
     }
 
@@ -1146,9 +1193,11 @@ patterns = ['^\.тф']
         let (mut input, sender) = channel_input();
         sender.send(InputEventMessage::FocusChanged);
 
-        let InputRequest::Switch(request) = input.next_request().unwrap() else {
-            panic!("expected a switch request");
-        };
+        assert!(matches!(
+            input.next_request().unwrap(),
+            InputRequest::Switch
+        ));
+        let request = input.switch_request().unwrap();
         assert_eq!(request.mode, crate::switcher::SwitchMode::Manual);
         assert!(request.target.is_none());
 
@@ -1164,13 +1213,19 @@ patterns = ['^\.тф']
         let (mut input, _) = channel_input();
         press(&mut input, KeyCode::KEY_A);
         let expected_word = input.latest_word().cloned();
-        input.pending.update_auto(0, Some(layout("ru")));
+        input
+            .pending
+            .update_auto(0, Some((layout("ru"), AutoSwitchKind::Regex)));
 
-        let InputRequest::Switch(request) = input.next_request().unwrap() else {
-            panic!("expected an automatic switch request");
-        };
+        assert!(matches!(
+            input.next_request().unwrap(),
+            InputRequest::Switch
+        ));
+        let request = input.switch_request().unwrap();
         input.reset_history();
-        input.pending.update_auto(0, Some(layout("us")));
+        input
+            .pending
+            .update_auto(0, Some((layout("us"), AutoSwitchKind::Regex)));
 
         assert_eq!(request.mode, crate::switcher::SwitchMode::Auto);
         assert_eq!(request.word, expected_word);
@@ -1197,7 +1252,9 @@ patterns = ['^\.тф']
         let (mut input, sender) = channel_input();
         input.pending.cancel();
         press(&mut input, KeyCode::KEY_A);
-        input.pending.update_auto(0, Some(layout("us")));
+        input
+            .pending
+            .update_auto(0, Some((layout("us"), AutoSwitchKind::Regex)));
         sender.send(InputEventMessage::PointerPressed);
         input.process_available_events(None).unwrap();
         assert!(input.latest_word().is_none());
@@ -1266,7 +1323,7 @@ patterns = ['^\.тф']
 
         assert!(matches!(
             input.next_request().unwrap(),
-            InputRequest::Switch(_)
+            InputRequest::Switch
         ));
 
         assert_eq!(input.pending.source(), Some(0));
@@ -2015,6 +2072,182 @@ patterns = ['^\.тф']
             press(&mut input, key);
         }
         assert!(input.automatic_target().is_none());
+    }
+
+    #[test]
+    fn first_space_refreshes_word_and_target_before_capture() {
+        for (is_captured, pattern, expected) in [
+            (true, "^A $", "gb"),
+            (true, "^b $", "us"),
+            (false, "^A $", "gb"),
+            (false, "^b $", "us"),
+        ] {
+            let (mut input, sender) = channel_input();
+            input.pending.cancel();
+            input.accept_layout(Some(layout("ru")), false);
+            let settings = crate::config::from_contents(&format!(
+                "switch_key = 'KEY_PAUSE'\nauto_switch = true\n[[switch_rules]]\ntarget = 'gb'\npatterns = ['{pattern}']",
+            )).unwrap();
+            input.auto_switch =
+                crate::switch_rules::AutoSwitchRules::compile(&settings, |name| Ok(layout(name)))
+                    .unwrap();
+            // A distinct synthetic regex target makes a replaced request observable.
+            input.auto_switch.dictionaries =
+                crate::dictionary::test_dictionaries(&[("us", "", "apple 1", 0.0, 0.0)]);
+            press(&mut input, KeyCode::KEY_LEFTSHIFT);
+            press(&mut input, KeyCode::KEY_A);
+            assert!(matches!(
+                input.next_request().unwrap(),
+                InputRequest::Switch
+            ));
+            assert!(input.pending.is_dictionary());
+            for (key, value) in [
+                (KeyCode::KEY_LEFTSHIFT, 0),
+                (KeyCode::KEY_A, 0),
+                (KeyCode::KEY_SPACE, 1),
+                (KeyCode::KEY_SPACE, 0),
+            ] {
+                sender.send(InputEventMessage::Keyboard(
+                    0,
+                    InputEvent::new(EventType::KEY.0, key.0, value),
+                ));
+            }
+            let mut interception: Box<dyn CorrectionInterceptor> = if is_captured {
+                Box::new(Interceptor::enter(&mut input).unwrap().unwrap())
+            } else {
+                enter_interceptor(&mut input).unwrap().unwrap()
+            };
+            let request = interception.take_request().unwrap();
+            assert_eq!(request.target.unwrap().name(), expected);
+            let word = request.word.unwrap();
+            assert_eq!(word.trailing_spaces, 1);
+            assert!(word.entries[0].stroke.shift);
+            interception.finish().unwrap();
+        }
+    }
+
+    #[test]
+    fn dictionary_backspace_restores_missing_prefix_and_previous_word() {
+        use crate::dictionary::Prefix;
+
+        let mut input = auto_input_with_patterns("");
+        input.auto_switch.dictionaries =
+            crate::dictionary::test_dictionaries(&[("us", "", "cats 7", 0.0, 0.0)]);
+        let keypress = |input: &mut Input, key| {
+            press(input, key);
+            statistics_event(input, key, 0);
+        };
+        for key in [KeyCode::KEY_C, KeyCode::KEY_A, KeyCode::KEY_T] {
+            keypress(&mut input, key);
+            assert!(input.pending.is_dictionary());
+        }
+        let existing = input.latest_word().unwrap().dictionary_prefixes[0].clone();
+        for key in [
+            KeyCode::KEY_DOT,
+            KeyCode::KEY_1,
+            KeyCode::KEY_SPACE,
+            KeyCode::KEY_Z,
+        ] {
+            keypress(&mut input, key);
+        }
+        keypress(&mut input, KeyCode::KEY_BACKSPACE);
+        assert_eq!(
+            &input.latest_word().unwrap().dictionary_prefixes[0][3..],
+            &[Prefix::Missing, Prefix::Missing],
+        );
+        keypress(&mut input, KeyCode::KEY_BACKSPACE); // Space
+        keypress(&mut input, KeyCode::KEY_BACKSPACE); // Digit
+        assert_eq!(
+            input.latest_word().unwrap().dictionary_prefixes[0][3],
+            Prefix::Missing
+        );
+        keypress(&mut input, KeyCode::KEY_BACKSPACE); // Punctuation
+        assert_eq!(
+            input.latest_word().unwrap().dictionary_prefixes[0],
+            existing
+        );
+        assert!(input.pending.is_none());
+        keypress(&mut input, KeyCode::KEY_S);
+        assert_eq!(input.automatic_target().unwrap().name(), "us");
+    }
+
+    #[test]
+    fn dictionary_and_regex_share_priority_and_correction_block() {
+        let mut input = auto_input_with_patterns("'^a$'");
+        input.auto_switch.dictionaries = crate::dictionary::test_dictionaries(&[
+            ("us", "", "ab 2", 0.0, 0.0),
+            ("ru", "", "я 2", 0.5, 0.0),
+        ]);
+        press(&mut input, KeyCode::KEY_A);
+        assert_eq!(input.automatic_target().unwrap().name(), "us");
+        assert!(!input.pending.is_dictionary());
+        input.begin_correction(Some(layout("us")));
+        press(&mut input, KeyCode::KEY_B);
+        assert!(input.pending.is_none());
+
+        input.reset_history();
+        input.auto_switch.dictionaries =
+            crate::dictionary::test_dictionaries(&[("ru", "", "с 1", 0.0, 0.0)]);
+        press(&mut input, KeyCode::KEY_C);
+        assert!(input.pending.is_dictionary());
+        input.begin_correction(Some(layout("ru")));
+        input.auto_switch = auto_input_with_patterns("'^ca$'").auto_switch;
+        press(&mut input, KeyCode::KEY_A);
+        assert!(input.pending.is_none());
+    }
+
+    #[test]
+    fn source_dead_key_cancels_auto_and_prevents_manual_even_after_backspace() {
+        let (mut input, sender) = channel_input();
+        input.pending.cancel();
+        input.accept_layout(
+            Some(Arc::new(crate::layout::Layout::new("us", "intl", "", ""))),
+            false,
+        );
+        input.auto_switch.dictionaries =
+            crate::dictionary::test_dictionaries(&[("ru", "", "фа 1\nфэ 1", 0.0, 0.0)]);
+        press(&mut input, KeyCode::KEY_A);
+        assert!(input.pending.is_dictionary());
+        sender.send(InputEventMessage::Keyboard(
+            0,
+            InputEvent::new(EventType::KEY.0, KeyCode::KEY_APOSTROPHE.0, 1),
+        ));
+        assert!(Interceptor::enter(&mut input).unwrap().is_none());
+        assert!(input.pending.is_none());
+        press(&mut input, KeyCode::KEY_BACKSPACE);
+        press(&mut input, KeyCode::KEY_PAUSE);
+        assert!(input.switch_request().is_none());
+        assert!(input.pending.is_none());
+        press(&mut input, KeyCode::KEY_SPACE);
+        press(&mut input, KeyCode::KEY_B);
+        assert!(!input.latest_word().unwrap().has_dead_key);
+    }
+
+    #[test]
+    fn dictionary_conversion_failure_survives_until_the_stroke_is_removed() {
+        use crate::dictionary::Prefix;
+
+        let mut input = auto_input_with_patterns("");
+        input.auto_switch.dictionaries =
+            crate::dictionary::test_dictionaries(&[("us", "intl", "apple 1", 0.0, 0.0)]);
+        press(&mut input, KeyCode::KEY_A);
+        assert!(input.pending.is_dictionary());
+        press(&mut input, KeyCode::KEY_APOSTROPHE);
+        press(&mut input, KeyCode::KEY_P);
+        let word = input.latest_word().unwrap();
+        assert!(!word.has_dead_key);
+        assert_eq!(
+            &word.dictionary_prefixes[0][1..],
+            &[Prefix::ConversionFailed; 2]
+        );
+        assert!(input.pending.is_none());
+        for _ in 0..2 {
+            press(&mut input, KeyCode::KEY_BACKSPACE);
+            statistics_event(&mut input, KeyCode::KEY_BACKSPACE, 0);
+        }
+        assert!(input.pending.is_none());
+        press(&mut input, KeyCode::KEY_P);
+        assert!(input.pending.is_dictionary());
     }
 
     #[test]

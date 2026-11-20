@@ -4,7 +4,7 @@ Keyboard layout switcher.
  - manual: Press Pause/Break to retype the last word using a different keyboard layout
  - automatic: 
    - small number of custom rules in config
-   - in future: autoswitch using dictionaries  
+   - dictionary prefix matching
 
 ## Why Another Switcher?
 
@@ -84,13 +84,13 @@ After installation, the installer starts True Switcher and enables it to start a
 
 Edit `~/.config/true-switcher/config.toml`, then select `Reload` in the KDE Plasma tray menu to apply changes. Select `Quit` to stop True Switcher.
 
-Complete configuration example, with default values for optional settings and one example rule:
+Configuration example with default values for optional settings and one example rule:
 
 ```toml
 switch_key = "KEY_PAUSE"     # Required Linux key name; e.g. KEY_PAUSE, KEY_F12, ...
 log_level = "info"           # off, error, warn, info, debug, trace; trace logs typed words
 manual_switch_sound = false  # Play a sound after a successful manual switch
-auto_switch = false          # Use `switch_rules` below to perform automatic switch 
+auto_switch = false          # Enable automatic switching using regex rules and dictionaries
 auto_switch_sound = true     # Play a sound after a successful automatic switch
 
 [[switch_rules]]             # Optional; repeat this block to add more rules
@@ -108,13 +108,27 @@ Rules are validated even when `auto_switch = false`; see [Automatic switching](#
 
 Automatic switching is disabled by default. Set `auto_switch = true` in the configuration example above and select `Reload` to enable its rule.
 
-After each typed character, the current word is converted to each rule's `target` layout and matched against its `patterns`. The first matching rule corrects the word and selects that layout, without waiting for a separator. For example, `.т` typed in Russian becomes `/n` with this rule. The word can switch again when later characters match another target. Rules for the current layout are skipped; Backspace does not trigger matching.
+After each typed character and on the first trailing space, the current word is converted to each rule's `target` layout and matched against its `patterns`. The first matching rule corrects the word and selects that layout. For example, `.т` typed in Russian becomes `/n` with this rule. After any correction, automatic switching is blocked for the rest of that word. Rules for the current layout are skipped. Backspace cancels a pending automatic switch.
 
 Patterns use the Rust `regex` syntax. Matching can occur anywhere in the converted word; use `^` to anchor the beginning. `target` must be a single XKB layout identifier, such as `us`, `gb`, or `ru`. Language codes such as `en` are invalid. If KDE has multiple entries with the same identifier, the first entry and its configured variant are used. A separate `variant` field is not supported.
 
 Invalid patterns, invalid layout identifiers, and targets absent from KDE cause startup to fail with a logged error, including when `auto_switch = false`. `switch_rules` defaults to an empty list. `auto_switch_sound` defaults to `true` and controls the existing switch sound independently of `manual_switch_sound`.
 
 Manual layout changes reset typing history. Punctuation remains part of a word; Space ends a word, while Tab and Enter end the word and reset history.
+
+### Dictionary matching
+
+With `auto_switch = true`, add one or two `[[dict]]` entries. This feature supports up to two KDE layouts. Each file path is relative to `config.toml`. Put one word and its integer frequency on each line, for example `apple 10`. The loader skips entries whose words contain an uppercase letter.
+
+```toml
+[[dict]]
+target = "us"
+file = "dictionaries/en_full.txt"
+slip = 0.000001
+grip = 0.001
+```
+
+The dictionary check runs on each typed character when no regex matches. It divides the combined frequency of words starting with the typed prefix by the sum of frequencies left after filtering. With two dictionaries, the current layout's score must be below its `slip` and the alternative's score must be above its `grip`. With one dictionary, only the alternative's `grip` applies. Choose thresholds from 0 to 1 inclusive. The example values are illustrative.
 
 ## Switching statistics
 

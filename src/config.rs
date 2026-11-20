@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use evdev::KeyCode;
@@ -25,6 +25,8 @@ pub struct Configuration {
     pub auto_switch_sound: bool,
     #[serde(default)]
     pub switch_rules: Vec<SwitchRule>,
+    #[serde(default)]
+    pub dict: Vec<DictionarySettings>,
 }
 
 #[derive(Deserialize)]
@@ -32,6 +34,15 @@ pub struct Configuration {
 pub struct SwitchRule {
     pub target: String,
     pub patterns: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DictionarySettings {
+    pub target: String,
+    pub file: PathBuf,
+    pub slip: f64,
+    pub grip: f64,
 }
 
 fn enabled() -> bool {
@@ -68,9 +79,28 @@ fn deserialize_switch_key<'de, D: Deserializer<'de>>(deserializer: D) -> Result<
 pub fn load() -> Result<Configuration, String> {
     let path =
         config_path().ok_or_else(|| "Cannot find user configuration: HOME is unset".to_owned())?;
-    let contents = fs::read_to_string(&path)
+    load_from(&path)
+}
+
+fn load_from(path: &Path) -> Result<Configuration, String> {
+    let contents = fs::read_to_string(path)
         .map_err(|error| format!("Cannot read {}: {error}", path.display()))?;
-    from_contents(&contents).map_err(|error| format!("{}: {error}", path.display()))
+    let mut config =
+        from_contents(&contents).map_err(|error| format!("{}: {error}", path.display()))?;
+    let directory = path
+        .parent()
+        .expect("configuration path includes a directory");
+    for dictionary in &mut config.dict {
+        if !dictionary.file.is_relative() {
+            return Err(format!(
+                "{}: dict.file must be relative to the configuration directory: {}",
+                path.display(),
+                dictionary.file.display(),
+            ));
+        }
+        dictionary.file = directory.join(&dictionary.file);
+    }
+    Ok(config)
 }
 
 pub(crate) fn from_contents(contents: &str) -> Result<Configuration, String> {
@@ -84,6 +114,29 @@ fn config_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolves_dictionary_path_from_config_location() {
+        let directory =
+            std::env::temp_dir().join(format!("true-switcher-config-{}", std::process::id()));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join(CONFIG_FILE);
+        let contents = |file: &str| {
+            format!(
+                "switch_key = 'KEY_PAUSE'\n[[dict]]\ntarget = 'us'\nfile = '{file}'\nslip = 0\ngrip = 1\n"
+            )
+        };
+        fs::write(&path, contents("dictionaries/words.txt")).unwrap();
+        let config = load_from(&path).unwrap();
+        assert_eq!(
+            config.dict[0].file,
+            directory.join("dictionaries/words.txt")
+        );
+        fs::write(&path, contents("/dictionaries/words.txt")).unwrap();
+        assert!(load_from(&path).is_err());
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
 
     #[test]
     fn validates_switch_key_and_sound() {

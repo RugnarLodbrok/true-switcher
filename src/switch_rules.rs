@@ -13,11 +13,18 @@ struct CompiledRule {
 #[derive(Default)]
 pub struct AutoSwitchRules {
     rules: Vec<CompiledRule>,
+    pub(crate) dictionaries: crate::dictionary::DictionaryAutoSwitch,
 }
 
 impl AutoSwitchRules {
     pub fn new(settings: &Configuration) -> io::Result<Self> {
-        Self::compile(settings, crate::kde::target_layout)
+        let mut rules = Self::compile(settings, crate::kde::target_layout)?;
+        rules.dictionaries = crate::dictionary::DictionaryAutoSwitch::load(
+            settings,
+            crate::kde::target_layout,
+            crate::kde::layout_count,
+        )?;
+        Ok(rules)
     }
 
     pub(crate) fn compile(
@@ -37,7 +44,10 @@ impl AutoSwitchRules {
                 rules.push(CompiledRule { target, patterns });
             }
         }
-        Ok(Self { rules })
+        Ok(Self {
+            rules,
+            ..Self::default()
+        })
     }
 
     pub fn target(&self, word: &Word, current: &Layout) -> Option<Arc<Layout>> {
@@ -121,6 +131,7 @@ mod tests {
                 patterns: RegexSet::new([pattern]).unwrap(),
             })
             .collect(),
+            ..Default::default()
         };
         let word = word(&[KeyCode::KEY_A]);
         let current = resolve("ru").unwrap();

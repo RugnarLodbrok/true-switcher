@@ -1,4 +1,4 @@
-use super::{EntryRecording, Input, is_repair_key};
+use super::{EntryRecording, Input, SwitchRequest, is_repair_key};
 use crate::lifecycle::ProcessingResult;
 use evdev::KeyCode;
 use std::collections::BTreeSet;
@@ -27,6 +27,7 @@ pub struct Interceptor<'a> {
     is_cleanup_needed: bool,
     is_release_wait_complete: bool,
     is_lock_release_complete: bool,
+    request: Option<SwitchRequest>,
 }
 
 impl<'a> Interceptor<'a> {
@@ -38,6 +39,7 @@ impl<'a> Interceptor<'a> {
             is_cleanup_needed: false,
             is_release_wait_complete: false,
             is_lock_release_complete: false,
+            request: None,
         };
         let mut is_switch_key_reset = false;
         let mut attempt = 0_u64;
@@ -52,13 +54,15 @@ impl<'a> Interceptor<'a> {
             interception.begin_entry(&mut is_switch_key_reset)?;
             let presses = interception.state.recording.take().unwrap().presses;
             log::trace!("ENTRY attempt={attempt} recorded {presses:?}");
-            if interception.input.pending.is_none() {
+            if !interception.input.has_valid_pending_request() {
+                interception.input.pending.cancel();
                 interception.state.repair = presses;
                 interception.rollback()?;
                 interception.phase = Phase::Finished;
                 return Ok(None);
             }
             if presses.is_empty() {
+                interception.request = interception.input.switch_request();
                 interception.state.is_captured = true;
                 interception.phase = Phase::Captured;
                 interception.input.correction.activate();
@@ -273,6 +277,7 @@ impl Drop for Interceptor<'_> {
 const IS_CAPTURE_ENABLED: bool = false;
 
 pub trait CorrectionInterceptor {
+    fn take_request(&mut self) -> Option<SwitchRequest>;
     fn input(&mut self) -> &mut Input;
     fn read_available(&mut self) -> ProcessingResult<bool>;
     fn wait_for_correction(&mut self) -> ProcessingResult<Option<io::Result<()>>>;
@@ -286,11 +291,21 @@ pub fn enter_interceptor(
         Ok(Interceptor::enter(input)?
             .map(|interceptor| Box::new(interceptor) as Box<dyn CorrectionInterceptor>))
     } else {
-        Ok(Some(Box::new(UncapturedInterceptor::enter(input)?)))
+        input.process_available_events(None)?;
+        if input.has_valid_pending_request() {
+            Ok(Some(Box::new(UncapturedInterceptor::enter(input)?)))
+        } else {
+            input.pending.cancel();
+            Ok(None)
+        }
     }
 }
 
 impl CorrectionInterceptor for Interceptor<'_> {
+    fn take_request(&mut self) -> Option<SwitchRequest> {
+        self.request.take()
+    }
+
     fn input(&mut self) -> &mut Input {
         self.input
     }
@@ -310,13 +325,15 @@ impl CorrectionInterceptor for Interceptor<'_> {
 
 pub(super) struct UncapturedInterceptor<'a> {
     input: &'a mut Input,
+    request: Option<SwitchRequest>,
 }
 
 impl<'a> UncapturedInterceptor<'a> {
     pub(super) fn enter(input: &'a mut Input) -> ProcessingResult<Self> {
+        let request = input.switch_request();
         input.correction.activate();
         input.pending.cancel();
-        let interceptor = Self { input };
+        let interceptor = Self { input, request };
         let mut error = None;
         let held = interceptor
             .input
@@ -333,6 +350,10 @@ impl<'a> UncapturedInterceptor<'a> {
 }
 
 impl CorrectionInterceptor for UncapturedInterceptor<'_> {
+    fn take_request(&mut self) -> Option<SwitchRequest> {
+        self.request.take()
+    }
+
     fn input(&mut self) -> &mut Input {
         self.input
     }

@@ -185,8 +185,14 @@ fn client_reads_current_and_target_layouts_without_caching() {
     let target = client.target_layout("ru", &read_config).unwrap();
     assert_eq!(target.variant(), "phonetic");
     assert_eq!(target.model(), "pc105");
+    assert_eq!(
+        client.next_layout(&read_config).unwrap(),
+        (1, target.as_ref().clone())
+    );
     index.store(1, Ordering::SeqCst);
     assert_eq!(*client.current_layout(&read_config).unwrap(), *target);
+    let (next_index, next_layout) = client.next_layout(&read_config).unwrap();
+    assert_eq!((next_index, next_layout.name()), (0, "us"));
 }
 
 #[test]

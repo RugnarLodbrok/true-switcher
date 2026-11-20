@@ -208,6 +208,14 @@ pub fn target_layout(name: &str) -> io::Result<Arc<Layout>> {
     KdeClient::connect()?.target_layout(name, &read_configuration)
 }
 
+pub(crate) fn layout_count() -> io::Result<usize> {
+    Ok(KdeClient::connect()?.layouts()?.len())
+}
+
+pub(crate) fn next_layout() -> io::Result<(usize, Layout)> {
+    KdeClient::connect()?.next_layout(&read_configuration)
+}
+
 struct KdeClient {
     proxy: Proxy<'static>,
 }
@@ -253,17 +261,37 @@ impl KdeClient {
     ) -> io::Result<Arc<Layout>> {
         let names = self.layouts()?;
         let contents = read_config()?;
+        let index = self.current_layout_index()?;
+        let name = &names
+            .get(index)
+            .ok_or_else(|| io::Error::other("unknown KDE layout index"))?
+            .0;
+        configured_layout(&contents, index, name)
+            .map(Arc::new)
+            .ok_or_else(|| io::Error::other("cannot match KDE layout to kxkbrc"))
+    }
+
+    fn current_layout_index(&self) -> io::Result<usize> {
         let index: u32 = self
             .proxy
             .call("getLayout", &())
             .map_err(io::Error::other)?;
-        let name = &names
-            .get(index as usize)
-            .ok_or_else(|| io::Error::other("unknown KDE layout index"))?
-            .0;
-        configured_layout(&contents, index as usize, name)
-            .map(Arc::new)
-            .ok_or_else(|| io::Error::other("cannot match KDE layout to kxkbrc"))
+        Ok(index as usize)
+    }
+
+    fn next_layout(
+        &self,
+        read_config: &impl Fn() -> io::Result<String>,
+    ) -> io::Result<(usize, Layout)> {
+        let names = self.layouts()?;
+        let current = self.current_layout_index()?;
+        if current >= names.len() {
+            return Err(io::Error::other("unknown KDE layout index"));
+        }
+        let index = (current + 1) % names.len();
+        let layout = configured_layout(&read_config()?, index, &names[index].0)
+            .ok_or_else(|| io::Error::other("cannot match next KDE layout to kxkbrc"))?;
+        Ok((index, layout))
     }
 }
 
@@ -342,8 +370,11 @@ impl KdePlasma {
     }
 
     pub fn switch_to_layout(&self, name: &str) -> io::Result<()> {
-        let index = KdeClient::connect()?.layout_index(name)?.to_string();
-        self.call_layout_method("org.kde.KeyboardLayouts.setLayout", &[&index])
+        self.switch_to_layout_index(KdeClient::connect()?.layout_index(name)?)
+    }
+
+    pub(crate) fn switch_to_layout_index(&self, index: usize) -> io::Result<()> {
+        self.call_layout_method("org.kde.KeyboardLayouts.setLayout", &[&index.to_string()])
     }
 
     fn call_layout_method(&self, method: &str, arguments: &[&str]) -> io::Result<()> {

@@ -397,6 +397,7 @@ mod tests {
         Word {
             entries,
             trailing_spaces: 2,
+            ..Default::default()
         }
     }
 

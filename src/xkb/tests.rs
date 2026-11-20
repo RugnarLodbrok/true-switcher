@@ -148,7 +148,7 @@ fn dead_key_aborts_conversion_instead_of_losing_part_of_the_word() {
             stroke(KeyCode::KEY_APOSTROPHE),
             stroke(KeyCode::KEY_E)
         ]),
-        Err(ConversionError::NoTextForKey {
+        Err(ConversionError::DeadKey {
             key: KeyCode::KEY_APOSTROPHE
         })
     );
