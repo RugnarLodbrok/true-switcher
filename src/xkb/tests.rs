@@ -165,36 +165,11 @@ fn requires_a_valid_shift_mask_only_for_shifted_strokes() {
     );
 }
 
-struct TestLogger;
-
-thread_local! {
-    static MESSAGES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-impl log::Log for TestLogger {
-    fn enabled(&self, _: &log::Metadata<'_>) -> bool {
-        true
-    }
-
-    fn log(&self, record: &log::Record<'_>) {
-        MESSAGES.with(|messages| messages.borrow_mut().push(record.args().to_string()));
-    }
-
-    fn flush(&self) {}
-}
-
 fn logged_error(
     convert: impl FnOnce() -> Result<String, ConversionError>,
 ) -> (ConversionError, String) {
-    static LOGGER: TestLogger = TestLogger;
-    static INIT: std::sync::Once = std::sync::Once::new();
-    INIT.call_once(|| {
-        log::set_logger(&LOGGER).unwrap();
-        log::set_max_level(log::LevelFilter::Trace);
-    });
-    MESSAGES.with(|messages| messages.borrow_mut().clear());
-    let error = convert().unwrap_err();
-    let messages = MESSAGES.with(|messages| messages.take());
+    let (result, messages) = crate::test_logging::capture(convert);
+    let error = result.unwrap_err();
     assert_eq!(
         messages.len(),
         1,

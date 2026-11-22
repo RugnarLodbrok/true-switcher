@@ -40,9 +40,7 @@ impl AutoSwitchRules {
                 ))
             })?;
             let target = resolve(&rule.target)?;
-            if settings.auto_switch {
-                rules.push(CompiledRule { target, patterns });
-            }
+            rules.push(CompiledRule { target, patterns });
         }
         Ok(Self {
             rules,
@@ -144,7 +142,7 @@ mod tests {
 
     #[test]
     fn conversion_failure_continues_rules_without_using_partial_text() {
-        let settings = parse_config("auto_switch = true\n[[switch_rules]]\ntarget = 'us'\npatterns = ['^a']\n[[switch_rules]]\ntarget = 'gb'\npatterns = ['^a']\n[[switch_rules]]\ntarget = 'ru'\npatterns = ['^ф']").unwrap();
+        let settings = parse_config("pattern_switch = true\n[[switch_rules]]\ntarget = 'us'\npatterns = ['^a']\n[[switch_rules]]\ntarget = 'gb'\npatterns = ['^a']\n[[switch_rules]]\ntarget = 'ru'\npatterns = ['^ф']").unwrap();
         let switch = AutoSwitchRules::compile(&settings, |name| {
             Ok(Arc::new(Layout::new(
                 name,
@@ -161,7 +159,7 @@ mod tests {
 
     #[test]
     fn matches_converted_prefix_and_respects_rule_order_and_current_layout() {
-        let settings = parse_config("auto_switch = true\n[[switch_rules]]\ntarget = 'us'\npatterns = ['^/[a-z]']\n[[switch_rules]]\ntarget = 'gb'\npatterns = ['n']").unwrap();
+        let settings = parse_config("pattern_switch = true\n[[switch_rules]]\ntarget = 'us'\npatterns = ['^/[a-z]']\n[[switch_rules]]\ntarget = 'gb'\npatterns = ['n']").unwrap();
         let switch = AutoSwitchRules::compile(&settings, resolve).unwrap();
         let ru = resolve("ru").unwrap();
         let prefix = word(&[KeyCode::KEY_SLASH, KeyCode::KEY_N]);
@@ -181,7 +179,7 @@ mod tests {
     #[test]
     fn matches_one_trailing_space_only_after_successful_conversion() {
         let settings = parse_config(
-            "auto_switch = true\n[[switch_rules]]\ntarget = 'us'\npatterns = ['^foo $', '^foo  $']",
+            "pattern_switch = true\n[[switch_rules]]\ntarget = 'us'\npatterns = ['^foo $', '^foo  $']",
         )
         .unwrap();
         let rules = AutoSwitchRules::compile(&settings, resolve).unwrap();

@@ -13,6 +13,8 @@ mod sound;
 mod statistics;
 mod switch_rules;
 mod switcher;
+#[cfg(test)]
+mod test_logging;
 mod tray;
 mod word;
 mod xkb;
@@ -28,7 +30,7 @@ const KEYBOARD_DISCOVERY_DELAY: Duration = Duration::from_millis(500);
 fn run() -> io::Result<ShutdownReason> {
     let (sender, events) = input_events::InputEvents::new();
     lifecycle::start_signals(sender.clone())?;
-    let (config, auto_switch) = match prepare_configuration() {
+    let (config, config_file, auto_switch) = match prepare_configuration() {
         Ok(prepared) => prepared,
         Err(error) => {
             log::error!("true-switcher: {error}");
@@ -37,23 +39,17 @@ fn run() -> io::Result<ShutdownReason> {
     };
 
     log::set_max_level(config.log_level);
-    let _tray = tray::Tray::start(sender.clone())?;
+    let _tray = tray::Tray::start(sender.clone(), (&config).into(), config_file)?;
 
     let desktop = kde::KdePlasma::new()?;
     let keyboard = output::KeyboardOutput::new()?;
     let statistics = statistics::Statistics::start();
-    let sound = sound::Sound::start(config.manual_switch_sound || config.auto_switch_sound);
+    let sound = sound::Sound::default();
 
     let _focus_service = focus::FocusService::start(sender.clone())?;
     let layouts = kde::LayoutTracker::start(sender.clone());
 
-    let mut input = input::Input::open(
-        events,
-        sender,
-        config.switch_key,
-        statistics.clone(),
-        auto_switch,
-    )?;
+    let mut input = input::Input::open(events, sender, &config, statistics.clone(), auto_switch)?;
 
     let mut switcher = Switcher {
         desktop,
@@ -69,14 +65,20 @@ fn run() -> io::Result<ShutdownReason> {
         Err(lifecycle::ProcessingError::Io(error)) => return Err(error),
     }
 
-    switcher.process_requests(&mut input, &config)
+    switcher.process_requests(&mut input)
 }
 
-fn prepare_configuration() -> Result<(config::Configuration, switch_rules::AutoSwitchRules), String>
-{
-    config::load().and_then(|config| {
+fn prepare_configuration() -> Result<
+    (
+        config::Configuration,
+        config::ConfigurationFile,
+        switch_rules::AutoSwitchRules,
+    ),
+    String,
+> {
+    config::load().and_then(|(config, file)| {
         switch_rules::AutoSwitchRules::new(&config)
-            .map(|auto_switch| (config, auto_switch))
+            .map(|auto_switch| (config, file, auto_switch))
             .map_err(|error| format!("Configuration: {error}"))
     })
 }

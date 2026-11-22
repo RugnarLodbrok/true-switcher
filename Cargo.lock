@@ -1109,6 +1109,7 @@ dependencies = [
  "indexmap",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 
@@ -1171,7 +1172,9 @@ dependencies = [
  "regex",
  "rusqlite",
  "serde",
+ "tempfile",
  "toml",
+ "toml_edit",
  "xkbcommon",
  "zbus",
 ]

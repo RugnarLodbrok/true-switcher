@@ -84,13 +84,16 @@ After installation, the installer starts True Switcher and enables it to start a
 
 Edit `~/.config/true-switcher/config.toml`, then select `Reload` in the KDE Plasma tray menu to apply changes. Select `Quit` to stop True Switcher.
 
+The tray can toggle dictionary matching, pattern matching, and the two switch sounds immediately. Select `Save to config` to keep these settings after a restart. This replaces the file with the copy loaded by True Switcher, preserving its comments and formatting. To keep manual edits made on disk, use `Reload` before saving from the tray.
+
 Configuration example with default values for optional settings and one example rule:
 
 ```toml
 switch_key = "KEY_PAUSE"     # Required Linux key name; e.g. KEY_PAUSE, KEY_F12, ...
 log_level = "info"           # off, error, warn, info, debug, trace; trace logs typed words
 manual_switch_sound = false  # Play a sound after a successful manual switch
-auto_switch = false          # Enable automatic switching using regex rules and dictionaries
+pattern_switch = false      # Enable automatic switching using regex rules
+auto_switch = false          # Enable automatic switching using dictionaries
 auto_switch_sound = true     # Play a sound after a successful automatic switch
 
 [[switch_rules]]             # Optional; repeat this block to add more rules
@@ -100,35 +103,41 @@ patterns = [                 # Rust regex patterns matched against the converted
 ] 
 ```
 
-Rules are validated even when `auto_switch = false`; see [Automatic switching](#automatic-switching) for matching behavior and layout requirements.
+Add the two required dictionaries described in [Dictionary matching](#dictionary-matching) to complete this configuration or the starter config created by the installer. Rules and dictionaries are validated even when both flags are disabled.
 
 `RUST_LOG` does not override `log_level`. Sound playback requires a PulseAudio-compatible server such as `pipewire-pulse`; playback errors are logged without interrupting switching.
 
 ## Automatic switching
 
-Automatic switching is disabled by default. Set `auto_switch = true` in the configuration example above and select `Reload` to enable its rule.
+Both flags default to `false`. Set `pattern_switch = true` to enable regex rules and `auto_switch = true` to enable dictionary matching. Select `Reload` to apply changes. If you previously used `auto_switch = true` for regex rules, use `pattern_switch = true` for them now.
 
 After each typed character and on the first trailing space, the current word is converted to each rule's `target` layout and matched against its `patterns`. The first matching rule corrects the word and selects that layout. For example, `.т` typed in Russian becomes `/n` with this rule. After any correction, automatic switching is blocked for the rest of that word. Rules for the current layout are skipped. Backspace cancels a pending automatic switch.
 
 Patterns use the Rust `regex` syntax. Matching can occur anywhere in the converted word; use `^` to anchor the beginning. `target` must be a single XKB layout identifier, such as `us`, `gb`, or `ru`. Language codes such as `en` are invalid. If KDE has multiple entries with the same identifier, the first entry and its configured variant are used. A separate `variant` field is not supported.
 
-Invalid patterns, invalid layout identifiers, and targets absent from KDE cause startup to fail with a logged error, including when `auto_switch = false`. `switch_rules` defaults to an empty list. `auto_switch_sound` defaults to `true` and controls the existing switch sound independently of `manual_switch_sound`.
+Invalid patterns, invalid layout identifiers, and targets absent from KDE cause startup to fail with a logged error, including when `pattern_switch = false`. `switch_rules` defaults to an empty list. `auto_switch_sound` defaults to `true` and controls the existing switch sound independently of `manual_switch_sound`.
 
 Manual layout changes reset typing history. Punctuation remains part of a word; Space ends a word, while Tab and Enter end the word and reset history.
 
 ### Dictionary matching
 
-With `auto_switch = true`, add one or two `[[dict]]` entries. This feature supports up to two KDE layouts. Each file path is relative to `config.toml`. Put one word and its integer frequency on each line, for example `apple 10`. The loader skips entries whose words contain an uppercase letter.
+Configure exactly two `[[dict]]` entries with distinct targets. Set `auto_switch = true` to enable matching. This feature supports up to two KDE layouts. Each file path is relative to `config.toml`. Put one word and its integer frequency on each line, for example `apple 10`. The loader skips entries whose words contain an uppercase letter.
 
 ```toml
 [[dict]]
 target = "us"
 file = "dictionaries/en_full.txt"
-slip = 0.000001
-grip = 0.001
+threshold = 5.0
+
+[[dict]]
+target = "ru"
+file = "dictionaries/ru_full.txt"
+threshold = 7.0
 ```
 
-The dictionary check runs on each typed character when no regex matches. It divides the combined frequency of words starting with the typed prefix by the sum of frequencies left after filtering. With two dictionaries, the current layout's score must be below its `slip` and the alternative's score must be above its `grip`. With one dictionary, only the alternative's `grip` applies. Choose thresholds from 0 to 1 inclusive. The example values are illustrative.
+The dictionary check runs on each typed character when regex rules are disabled or no rule matches. For each layout, the prefix probability is the combined frequency of words with that prefix divided by the total frequency of accepted entries. The score is `log₂(P(alternative prefix) / P(current prefix))`. A correction is requested when the score strictly exceeds the destination dictionary's `threshold`. A prefix found only in the alternative dictionary always passes. A prefix absent from the alternative dictionary never triggers a correction.
+
+Choose finite positive thresholds in bits. The example values require a likelihood ratio above 32 for switching to `us` and above 128 for switching to `ru`. With `log_level = "trace"`, each typed character logs the score as `dict switch score: +3.43`.
 
 ## Switching statistics
 

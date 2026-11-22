@@ -13,40 +13,43 @@ const FADE_OUT_MS: u32 = 25;
 const VOLUME: f64 = 0.2;
 const MILLISECONDS_PER_SECOND: u32 = 1000;
 
+#[derive(Default)]
 pub struct Sound {
     sender: Option<Sender<()>>,
 }
 
 impl Sound {
-    pub fn start(is_enabled: bool) -> Self {
-        if !is_enabled {
-            return Self { sender: None };
-        }
-        let (sender, receiver) = mpsc::channel();
-        let result = thread::Builder::new().name("sound".into()).spawn(move || {
-            let samples = synthesize();
-            while receiver.recv().is_ok() {
-                if let Err(error) = play(&samples) {
-                    log::warn!("true-switcher: sound: {error}");
+    pub fn play(&mut self) {
+        if self.sender.is_none() {
+            match start_worker() {
+                Ok(sender) => self.sender = Some(sender),
+                Err(error) => {
+                    log::warn!("true-switcher: cannot start sound worker: {error}");
+                    return;
                 }
             }
-        });
-        if let Err(error) = result {
-            log::warn!("true-switcher: cannot start sound worker: {error}");
-            return Self { sender: None };
         }
-        Self {
-            sender: Some(sender),
-        }
-    }
 
-    pub fn play(&self) {
         if let Some(sender) = &self.sender
             && let Err(error) = sender.send(())
         {
             log::warn!("true-switcher: sound worker unavailable: {error}");
+            self.sender = None;
         }
     }
+}
+
+fn start_worker() -> std::io::Result<Sender<()>> {
+    let (sender, receiver) = mpsc::channel();
+    thread::Builder::new().name("sound".into()).spawn(move || {
+        let samples = synthesize();
+        while receiver.recv().is_ok() {
+            if let Err(error) = play(&samples) {
+                log::warn!("true-switcher: sound: {error}");
+            }
+        }
+    })?;
+    Ok(sender)
 }
 
 fn synthesize() -> Vec<u8> {

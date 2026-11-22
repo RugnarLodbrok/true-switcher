@@ -1,5 +1,6 @@
+use crate::config::RuntimeSettings;
 use crate::lifecycle::{ProcessingError, ProcessingResult, ShutdownReason};
-use crate::{config, input, kde, layout, output, sound, statistics, word};
+use crate::{input, kde, layout, output, sound, statistics, word};
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,15 +23,15 @@ struct Correction {
 }
 
 impl Correction {
-    fn from_request(request: input::SwitchRequest, config: &config::Configuration) -> Self {
+    fn from_request(request: input::SwitchRequest, settings: RuntimeSettings) -> Self {
         Self {
             previous: request.previous,
             word: request.word,
             target: request.target,
             mode: request.mode,
             is_sound_enabled: match request.mode {
-                SwitchMode::Auto => config.auto_switch_sound,
-                SwitchMode::Manual => config.manual_switch_sound,
+                SwitchMode::Auto => settings.is_auto_switch_sound,
+                SwitchMode::Manual => settings.is_manual_switch_sound,
             },
         }
     }
@@ -65,27 +66,19 @@ pub struct Switcher {
 }
 
 impl Switcher {
-    pub fn process_requests(
-        &mut self,
-        input: &mut input::Input,
-        config: &config::Configuration,
-    ) -> io::Result<ShutdownReason> {
+    pub fn process_requests(&mut self, input: &mut input::Input) -> io::Result<ShutdownReason> {
         loop {
             match input.next_request()? {
                 input::InputRequest::Switch => {
-                    self.process_request(input, config)?;
+                    self.process_request(input)?;
                 }
                 input::InputRequest::Shutdown(reason) => return Ok(reason),
             }
         }
     }
 
-    fn process_request(
-        &mut self,
-        input: &mut input::Input,
-        config: &config::Configuration,
-    ) -> io::Result<CorrectionOutcome> {
-        match self.execute_correction(input, config) {
+    fn process_request(&mut self, input: &mut input::Input) -> io::Result<CorrectionOutcome> {
+        match self.execute_correction(input) {
             Ok(outcome) => Ok(outcome),
             Err(ProcessingError::Interrupted) => Ok(CorrectionOutcome::Interrupted),
             Err(ProcessingError::Io(error)) => Err(error),
@@ -95,7 +88,6 @@ impl Switcher {
     fn execute_correction(
         &mut self,
         input: &mut input::Input,
-        config: &config::Configuration,
     ) -> ProcessingResult<CorrectionOutcome> {
         let Some(mut interception) = input::enter_interceptor(input)? else {
             return Ok(CorrectionOutcome::Cancelled);
@@ -103,7 +95,7 @@ impl Switcher {
         let request = interception
             .take_request()
             .expect("interception accepted a switch request");
-        let correction = Correction::from_request(request, config);
+        let correction = Correction::from_request(request, interception.input().runtime_settings());
 
         let outcome = if interception.read_available()? {
             CorrectionOutcome::Cancelled
@@ -292,7 +284,34 @@ pub(crate) fn switch_and_correct<T, R, E: From<io::Error>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RuntimeSetting;
     use std::cell::RefCell;
+
+    #[test]
+    fn correction_uses_each_runtime_sound_setting_independently() {
+        let mut settings = RuntimeSettings::default();
+        let is_enabled = |mode, settings| {
+            Correction::from_request(
+                input::SwitchRequest {
+                    previous: None,
+                    word: None,
+                    target: None,
+                    mode,
+                },
+                settings,
+            )
+            .is_sound_enabled
+        };
+        assert!(!is_enabled(SwitchMode::Manual, settings));
+        assert!(!is_enabled(SwitchMode::Auto, settings));
+        settings.toggle(RuntimeSetting::ManualSwitchSound);
+        assert!(is_enabled(SwitchMode::Manual, settings));
+        assert!(!is_enabled(SwitchMode::Auto, settings));
+        settings.toggle(RuntimeSetting::ManualSwitchSound);
+        settings.toggle(RuntimeSetting::AutoSwitchSound);
+        assert!(!is_enabled(SwitchMode::Manual, settings));
+        assert!(is_enabled(SwitchMode::Auto, settings));
+    }
 
     #[test]
     fn checks_manual_replay_for_dead_keys_in_the_next_layout() {

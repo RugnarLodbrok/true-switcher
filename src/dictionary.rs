@@ -7,7 +7,7 @@ use crate::config::Configuration;
 use crate::layout::Layout;
 use crate::word::{Stroke, Word};
 
-const MAX_LAYOUTS: usize = 2;
+pub(crate) const DICTIONARY_COUNT: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Prefix {
@@ -122,7 +122,7 @@ impl DictionaryTrie {
         Prefix::Node(node)
     }
 
-    fn score(&self, prefix: Prefix) -> Option<f64> {
+    fn probability(&self, prefix: Prefix) -> Option<f64> {
         match prefix {
             Prefix::Node(index) => {
                 Some(self.nodes[index].frequency as f64 / self.nodes[0].frequency as f64)
@@ -150,8 +150,7 @@ fn invalid(message: impl Into<String>) -> io::Error {
 struct Dictionary {
     target: Arc<Layout>,
     trie: DictionaryTrie,
-    slip: f64,
-    grip: f64,
+    threshold: f64,
 }
 
 #[derive(Default)]
@@ -165,10 +164,10 @@ impl DictionaryAutoSwitch {
         resolve: impl Fn(&str) -> io::Result<Arc<Layout>>,
         layout_count: impl FnOnce() -> io::Result<usize>,
     ) -> io::Result<Self> {
-        if settings.dict.len() > MAX_LAYOUTS {
-            return Err(invalid("At most two dictionaries may be configured"));
+        if settings.dict.len() != DICTIONARY_COUNT {
+            return Err(invalid("Exactly two dictionaries must be configured"));
         }
-        if settings.auto_switch && !settings.dict.is_empty() && layout_count()? > MAX_LAYOUTS {
+        if settings.auto_switch && layout_count()? > DICTIONARY_COUNT {
             return Err(invalid(
                 "Dictionary auto-switch supports at most two KDE layouts",
             ));
@@ -182,26 +181,21 @@ impl DictionaryAutoSwitch {
                     setting.target
                 )));
             }
-            for (name, value) in [("slip", setting.slip), ("grip", setting.grip)] {
-                if !(0.0..=1.0).contains(&value) {
-                    return Err(invalid(format!(
-                        "dict {:?}: {name} must be between 0 and 1",
-                        setting.target
-                    )));
-                }
+            if !setting.threshold.is_finite() || setting.threshold <= 0.0 {
+                return Err(invalid(format!(
+                    "dict {:?}: threshold must be finite and positive",
+                    setting.target
+                )));
             }
             let target = resolve(&setting.target)?;
             let trie = std::fs::File::open(&setting.file)
                 .and_then(|file| DictionaryTrie::read(BufReader::new(file)))
                 .map_err(|error| invalid(format!("{}: {error}", setting.file.display())))?;
-            if settings.auto_switch {
-                dictionaries.push(Dictionary {
-                    target,
-                    trie,
-                    slip: setting.slip,
-                    grip: setting.grip,
-                });
-            }
+            dictionaries.push(Dictionary {
+                target,
+                trie,
+                threshold: setting.threshold,
+            });
         }
         Ok(Self { dictionaries })
     }
@@ -223,78 +217,53 @@ impl DictionaryAutoSwitch {
         }
     }
 
-    fn score(&self, word: &Word, index: usize) -> Option<f64> {
+    fn probability(&self, word: &Word, index: usize) -> Option<f64> {
         let prefix = *word.dictionary_prefixes.get(index)?.last()?;
-        self.dictionaries[index].trie.score(prefix)
+        self.dictionaries[index].trie.probability(prefix)
     }
 
-    pub(crate) fn target(&self, word: &Word, current: &Layout) -> Option<Arc<Layout>> {
+    fn comparison(&self, word: &Word, current: &Layout) -> Option<(&Dictionary, f64)> {
         let current_index = self
             .dictionaries
             .iter()
-            .position(|dictionary| dictionary.target.name() == current.name());
-        if self.dictionaries.len() == MAX_LAYOUTS && current_index.is_none() {
+            .position(|dictionary| dictionary.target.name() == current.name())?;
+        let alternative_index = 1 - current_index;
+        let current = self.probability(word, current_index)?;
+        let alternative = self.probability(word, alternative_index)?;
+        if current == 0.0 && alternative == 0.0 {
             return None;
         }
-        let (index, alternative) = self
-            .dictionaries
-            .iter()
-            .enumerate()
-            .find(|(index, _)| Some(*index) != current_index)?;
-        if let Some(current) = current_index
-            && self.score(word, current)? >= self.dictionaries[current].slip
-        {
-            return None;
-        }
-        (self.score(word, index)? > alternative.grip).then(|| alternative.target.clone())
+        let score = (alternative / current).log2();
+        Some((&self.dictionaries[alternative_index], score))
     }
 
-    pub(crate) fn trace_scores(
-        &self,
-        word: &Word,
-        current: Option<&Layout>,
-        target: Option<&Layout>,
-    ) {
+    pub(crate) fn target(&self, word: &Word, current: &Layout) -> Option<Arc<Layout>> {
+        let (alternative, score) = self.comparison(word, current)?;
+        (score > alternative.threshold).then(|| alternative.target.clone())
+    }
+
+    pub(crate) fn trace_score(&self, word: &Word, current: Option<&Layout>) {
         if self.dictionaries.is_empty() || !log::log_enabled!(log::Level::Trace) {
             return;
         }
-        let scores = self
-            .dictionaries
-            .iter()
-            .enumerate()
-            .map(|(index, dictionary)| {
-                let score = self
-                    .score(word, index)
-                    .map_or_else(|| "unavailable".to_owned(), |score| format!("{score:e}"));
-                format!(
-                    "{} score={} slip={:e} grip={:e}",
-                    dictionary.target.name(),
-                    score,
-                    dictionary.slip,
-                    dictionary.grip,
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        log::trace!(
-            "Dictionary prefix scores: current={} [{}] switch_target={}",
-            current.map_or("unknown", Layout::name),
-            scores,
-            target.map_or("none", Layout::name),
-        );
+        match current.and_then(|layout| self.comparison(word, layout)) {
+            Some((_, score)) => log::trace!("dict switch score: {score:+.2}"),
+            None => log::trace!("dict switch score: unavailable"),
+        }
     }
 }
 
 #[cfg(test)]
-pub(crate) fn test_dictionaries(entries: &[(&str, &str, &str, f64, f64)]) -> DictionaryAutoSwitch {
+pub(crate) fn test_dictionaries(
+    entries: [(&str, &str, &str, f64); DICTIONARY_COUNT],
+) -> DictionaryAutoSwitch {
     DictionaryAutoSwitch {
         dictionaries: entries
             .iter()
-            .map(|&(name, variant, records, slip, grip)| Dictionary {
+            .map(|&(name, variant, records, threshold)| Dictionary {
                 target: Arc::new(Layout::new(name, variant, "", "")),
                 trie: DictionaryTrie::read(records.as_bytes()).unwrap(),
-                slip,
-                grip,
+                threshold,
             })
             .collect(),
     }
@@ -317,11 +286,11 @@ mod tests {
         ] {
             let trie = trie(records);
             let root = Prefix::Node(0);
-            assert_eq!(trie.score(trie.advance(root, "КО")), Some(0.5));
-            assert_eq!(trie.score(trie.advance(root, "кот")), Some(0.5));
-            assert_eq!(trie.score(trie.advance(root, "коты")), Some(0.375));
-            assert_eq!(trie.score(trie.advance(root, "AL")), Some(0.25));
-            assert_eq!(trie.score(trie.advance(root, "кот#")), Some(0.0));
+            assert_eq!(trie.probability(trie.advance(root, "КО")), Some(0.5));
+            assert_eq!(trie.probability(trie.advance(root, "кот")), Some(0.5));
+            assert_eq!(trie.probability(trie.advance(root, "коты")), Some(0.375));
+            assert_eq!(trie.probability(trie.advance(root, "AL")), Some(0.25));
+            assert_eq!(trie.probability(trie.advance(root, "кот#")), Some(0.0));
             for node in &trie.nodes {
                 assert!(
                     trie.transitions[node.transitions.clone()]
@@ -337,8 +306,8 @@ mod tests {
         let trie = trie("cat 2\nCat 18446744073709551615\ncoDe 4\nКОТ 3\nмир 6\n");
         let root = Prefix::Node(0);
         assert_eq!(trie.nodes[0].frequency, 8);
-        assert_eq!(trie.score(trie.advance(root, "CAT")), Some(0.25));
-        assert_eq!(trie.score(trie.advance(root, "мир")), Some(0.75));
+        assert_eq!(trie.probability(trie.advance(root, "CAT")), Some(0.25));
+        assert_eq!(trie.probability(trie.advance(root, "мир")), Some(0.75));
         assert_eq!(trie.advance(root, "code"), Prefix::Missing);
         assert_eq!(trie.advance(root, "кот"), Prefix::Missing);
     }
@@ -364,25 +333,76 @@ mod tests {
     }
 
     #[test]
-    fn two_dictionaries_use_strict_thresholds_in_both_directions() {
-        let score = |current, key, slip, grip| {
-            let dictionaries = test_dictionaries(&[
-                ("us", "", "a 1\nb 3", slip, grip),
-                ("ru", "", "ф 1\nи 3", slip, grip),
-            ]);
-            let mut word = Word::default();
-            dictionaries.push(&mut word, &Stroke { key, shift: true });
-            dictionaries
-                .target(&word, &Layout::new(current, "", "", ""))
-                .map(|target| target.name().to_owned())
-        };
-        for (current, alternative) in [("us", "ru"), ("ru", "us")] {
+    fn score_grows_as_both_prefix_frequencies_fall() {
+        let dictionaries = test_dictionaries([
+            ("us", "", "a 128\nap 128", 5.0),
+            ("ru", "", "ф 31\nфз 1\nя 96", 7.0),
+        ]);
+        let current = Layout::new("ru", "", "", "");
+        let mut word = Word::default();
+        for (key, expected_score, expected_target) in [
+            (KeyCode::KEY_A, 2.0, None),
+            (KeyCode::KEY_P, 6.0, Some("us")),
+        ] {
+            dictionaries.push(&mut word, &Stroke { key, shift: false });
             assert_eq!(
-                score(current, KeyCode::KEY_A, 0.3, 0.2).as_deref(),
-                Some(alternative)
+                dictionaries.comparison(&word, &current).unwrap().1,
+                expected_score
             );
-            assert_eq!(score(current, KeyCode::KEY_A, 0.25, 0.2), None);
-            assert_eq!(score(current, KeyCode::KEY_A, 0.3, 0.25), None);
+            let target = dictionaries.target(&word, &current);
+            assert_eq!(target.as_deref().map(Layout::name), expected_target);
+        }
+    }
+
+    #[test]
+    fn two_dictionaries_use_strict_destination_thresholds_in_both_directions() {
+        for (source, destination, key) in
+            [("ru", "us", KeyCode::KEY_A), ("us", "ru", KeyCode::KEY_B)]
+        {
+            for (source_threshold, destination_threshold, expected) in [
+                (4.0, 2.0, Some(destination)),
+                (2.0, 3.0, None),
+                (2.0, 4.0, None),
+            ] {
+                let thresholds = |name| {
+                    if name == source {
+                        source_threshold
+                    } else {
+                        destination_threshold
+                    }
+                };
+                let dictionaries = test_dictionaries([
+                    ("us", "", "a 8\nb 1", thresholds("us")),
+                    ("ru", "", "ф 1\nи 8", thresholds("ru")),
+                ]);
+                let mut word = Word::default();
+                dictionaries.push(&mut word, &Stroke { key, shift: true });
+                let target = dictionaries.target(&word, &Layout::new(source, "", "", ""));
+                assert_eq!(target.as_deref().map(Layout::name), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn zero_frequencies_only_switch_to_a_present_prefix() {
+        let dictionaries =
+            test_dictionaries([("us", "", "a 1\nc 1000", 5.0), ("ru", "", "и 1", 7.0)]);
+        let current = Layout::new("ru", "", "", "");
+        for (key, expected_score, expected_target) in [
+            (KeyCode::KEY_A, Some(f64::INFINITY), Some("us")),
+            (KeyCode::KEY_B, Some(f64::NEG_INFINITY), None),
+            (KeyCode::KEY_X, None, None),
+        ] {
+            let mut word = Word::default();
+            dictionaries.push(&mut word, &Stroke { key, shift: false });
+            assert_eq!(
+                dictionaries
+                    .comparison(&word, &current)
+                    .map(|(_, score)| score),
+                expected_score
+            );
+            let target = dictionaries.target(&word, &current);
+            assert_eq!(target.as_deref().map(Layout::name), expected_target);
         }
     }
 
@@ -396,9 +416,9 @@ mod tests {
             NEXT_ID.fetch_add(1, Ordering::Relaxed),
         ));
         std::fs::write(&path, "a 1\n").unwrap();
-        let dictionary = |target, file: &std::path::Path, slip, grip| {
+        let dictionary = |target, file: &std::path::Path, threshold| {
             format!(
-                "[[dict]]\ntarget = '{target}'\nfile = {:?}\nslip = {slip}\ngrip = {grip}\n",
+                "[[dict]]\ntarget = '{target}'\nfile = {:?}\nthreshold = {threshold}\n",
                 file
             )
         };
@@ -416,17 +436,28 @@ mod tests {
                 || Ok(count),
             )
         };
-        let valid = dictionary("us", &path, "0", "1");
-        assert_eq!(compile(&valid, 2, true).unwrap().dictionaries.len(), 1);
+        let us = dictionary("us", &path, "5.0");
+        let ru = dictionary("ru", &path, "7.0");
+        let valid = format!("{us}{ru}");
+        assert_eq!(compile(&valid, 2, true).unwrap().dictionaries.len(), 2);
         assert!(compile(&valid, 3, true).is_err());
-        assert!(compile(&valid, 3, false).unwrap().dictionaries.is_empty());
-        assert!(compile(&format!("{valid}{valid}"), 2, true).is_err());
-        assert!(compile(&format!("{valid}{valid}{valid}"), 2, true).is_err());
-        for threshold in ["-0.01", "1.01", "nan", "inf", "-inf"] {
-            assert!(compile(&dictionary("us", &path, threshold, "0.5"), 2, true).is_err());
-            assert!(compile(&dictionary("us", &path, "0.5", threshold), 2, true).is_err());
+        assert_eq!(compile(&valid, 3, false).unwrap().dictionaries.len(), 2);
+        for invalid_config in [
+            String::new(),
+            us.clone(),
+            format!("{us}{us}"),
+            format!("{valid}{us}"),
+        ] {
+            for is_enabled in [true, false] {
+                assert!(compile(&invalid_config, 2, is_enabled).is_err());
+            }
         }
-        assert!(compile(&dictionary("invalid", &path, "0", "1"), 2, true).is_err());
+        for threshold in ["0", "-0.01", "nan", "inf", "-inf"] {
+            let invalid_config = format!("{}{}", dictionary("us", &path, threshold), ru);
+            assert!(compile(&invalid_config, 2, true).is_err());
+        }
+        let invalid_target = format!("{}{}", dictionary("invalid", &path, "5.0"), ru);
+        assert!(compile(&invalid_target, 2, true).is_err());
         std::fs::remove_file(&path).unwrap();
         assert!(compile(&valid, 2, true).is_err());
     }

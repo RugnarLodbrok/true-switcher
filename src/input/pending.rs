@@ -79,6 +79,12 @@ impl PendingSwitch {
         }
     }
 
+    pub(super) fn cancel_auto_kind(&mut self, kind: AutoSwitchKind) {
+        if matches!(self, Self::Auto { kind: pending, .. } if *pending == kind) {
+            self.cancel();
+        }
+    }
+
     pub(super) fn update_auto(
         &mut self,
         source: usize,

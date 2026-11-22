@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use evdev::InputEvent;
 
+use crate::config::{RuntimeSetting, RuntimeSettings};
 use crate::layout::Layout;
 use crate::lifecycle::ShutdownReason;
 
@@ -17,6 +18,7 @@ pub enum InputEventMessage {
     PointerPressed,
     PointerEventsLost,
     LayoutChanged(Option<Arc<Layout>>),
+    ToggleSetting(RuntimeSetting, mpsc::Sender<RuntimeSettings>),
     CorrectionFinished {
         result: io::Result<()>,
         layout: Option<Arc<Layout>>,

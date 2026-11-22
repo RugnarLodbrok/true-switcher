@@ -3,9 +3,11 @@ mod menu;
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::config::{ConfigurationFile, RuntimeSettings};
 use crate::input_events::{InputEventMessage, InputEventSender, InputEvents};
 use crate::lifecycle::ShutdownReason;
 use zbus::blocking::{Connection, Proxy, fdo::DBusProxy};
@@ -32,10 +34,22 @@ type Pixmaps = Vec<(i32, i32, Vec<u8>)>;
 pub struct Tray;
 
 impl Tray {
-    pub fn start(sender: InputEventSender) -> io::Result<Self> {
+    pub fn start(
+        sender: InputEventSender,
+        settings: RuntimeSettings,
+        config_file: ConfigurationFile,
+    ) -> io::Result<Self> {
+        let runtime = menu::RuntimeMenu::new(
+            sender.clone(),
+            settings,
+            config_file,
+            crate::kde::layout_count,
+        );
+        let mut menu = menu::Menu::new(sender);
+        menu.runtime = Some(Arc::new(runtime));
         thread::Builder::new()
             .name("system-tray".into())
-            .spawn(move || maintain(sender))?;
+            .spawn(move || maintain(menu))?;
         Ok(Self)
     }
 
@@ -90,10 +104,10 @@ fn wait_for_shutdown(
     Ok(None)
 }
 
-fn maintain(sender: InputEventSender) {
+fn maintain(menu: menu::Menu) {
     let mut delay = RETRY_DELAY;
     loop {
-        match maintain_connection(&mut delay, &sender) {
+        match maintain_connection(&mut delay, &menu) {
             Ok(()) => delay = RETRY_DELAY,
             Err(error) => {
                 log::warn!("true-switcher: tray registration: {error}");
@@ -104,9 +118,10 @@ fn maintain(sender: InputEventSender) {
     }
 }
 
-fn maintain_connection(delay: &mut Duration, sender: &InputEventSender) -> zbus::Result<()> {
+fn maintain_connection(delay: &mut Duration, menu: &menu::Menu) -> zbus::Result<()> {
     let connection = Connection::session()?;
-    export(&connection, menu::Menu::new(sender.clone()), None)?;
+    menu.refresh();
+    export(&connection, menu.clone(), None)?;
     let mut owner = None;
     loop {
         register(&connection, &mut owner)?;

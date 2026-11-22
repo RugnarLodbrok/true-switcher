@@ -25,6 +25,7 @@ use keyboard::KeyboardInput;
 #[cfg(test)]
 use keyboard::Source;
 
+use crate::config::{Configuration, RuntimeSetting, RuntimeSettings};
 use crate::history::History;
 use crate::input_events::{InputEventMessage, InputEventSender, InputEvents};
 use crate::lifecycle::{Lifecycle, ProcessingError, ProcessingResult, ShutdownReason};
@@ -106,6 +107,7 @@ pub struct Input {
     history: History,
     statistics: Option<crate::statistics::Statistics>,
     auto_switch: crate::switch_rules::AutoSwitchRules,
+    settings: RuntimeSettings,
     layout: Option<Arc<crate::layout::Layout>>,
     observed_layout: Option<Arc<crate::layout::Layout>>,
     events: InputEvents,
@@ -119,7 +121,7 @@ impl Input {
     pub fn open(
         events: InputEvents,
         sender: InputEventSender,
-        switch_key: KeyCode,
+        config: &Configuration,
         statistics: crate::statistics::Statistics,
         auto_switch: crate::switch_rules::AutoSwitchRules,
     ) -> io::Result<Self> {
@@ -129,11 +131,12 @@ impl Input {
             history: History::default(),
             statistics: Some(statistics),
             auto_switch,
+            settings: config.into(),
             layout: None,
             observed_layout: None,
             events,
             correction: CorrectionState::default(),
-            switch_key,
+            switch_key: config.switch_key,
             pending: PendingSwitch::default(),
             is_backing_off: false,
         };
@@ -245,6 +248,10 @@ impl Input {
     pub fn automatic_target(&self) -> Option<Arc<crate::layout::Layout>> {
         self.history.latest_word()?;
         self.pending.target()
+    }
+
+    pub(crate) fn runtime_settings(&self) -> RuntimeSettings {
+        self.settings
     }
 
     pub fn previous_word(&self) -> Option<&crate::word::Word> {
@@ -384,6 +391,10 @@ impl Input {
                     self.pending.cancel_auto();
                 }
             }
+            InputEventMessage::ToggleSetting(setting, reply) => {
+                self.toggle_setting(setting);
+                let _ = reply.send(self.settings);
+            }
             InputEventMessage::CorrectionFinished { result, layout } => {
                 self.accept_layout(layout.clone(), true);
                 if result.is_err() || self.correction.is_cancelled() {
@@ -394,6 +405,18 @@ impl Input {
             }
         }
         Ok(())
+    }
+
+    fn toggle_setting(&mut self, setting: RuntimeSetting) {
+        if self.settings.toggle(setting) {
+            return;
+        }
+        let kind = match setting {
+            RuntimeSetting::AutoSwitch => AutoSwitchKind::Dictionary,
+            RuntimeSetting::PatternSwitch => AutoSwitchKind::Regex,
+            RuntimeSetting::ManualSwitchSound | RuntimeSetting::AutoSwitchSound => return,
+        };
+        self.pending.cancel_auto_kind(kind);
     }
 
     pub fn devices_changed(&mut self, at: Instant) {
@@ -573,6 +596,11 @@ impl Input {
         if is_text {
             let stroke = word.entries.last().unwrap().stroke;
             self.auto_switch.dictionaries.push(word, &stroke);
+            if self.settings.is_auto_switch {
+                self.auto_switch
+                    .dictionaries
+                    .trace_score(word, self.layout.as_deref());
+            }
         }
         let is_first_space = key == KeyCode::KEY_SPACE && word.trailing_spaces == 1;
         if word.has_dead_key {
@@ -587,18 +615,6 @@ impl Input {
         {
             self.update_auto_switch(index, is_first_space);
         }
-        if is_text && let Some(word) = self.latest_word() {
-            let target = if self.pending.is_dictionary() {
-                self.pending.target()
-            } else {
-                None
-            };
-            self.auto_switch.dictionaries.trace_scores(
-                word,
-                self.layout.as_deref(),
-                target.as_deref(),
-            );
-        }
     }
 
     fn update_auto_switch(&mut self, index: usize, is_first_space: bool) {
@@ -606,11 +622,13 @@ impl Input {
             .latest_word()
             .zip(self.layout.as_ref())
             .and_then(|(word, layout)| {
-                self.auto_switch
-                    .target(word, layout)
+                self.settings
+                    .is_pattern_switch
+                    .then(|| self.auto_switch.target(word, layout))
+                    .flatten()
                     .map(|target| (target, AutoSwitchKind::Regex))
                     .or_else(|| {
-                        if is_first_space {
+                        if is_first_space || !self.settings.is_auto_switch {
                             return None;
                         }
                         self.auto_switch
@@ -1028,6 +1046,11 @@ pub(crate) mod tests {
             history: History::default(),
             statistics: None,
             auto_switch: Default::default(),
+            settings: RuntimeSettings {
+                is_auto_switch: true,
+                is_pattern_switch: true,
+                ..RuntimeSettings::default()
+            },
             layout: None,
             observed_layout: None,
             events,
@@ -1065,7 +1088,7 @@ pub(crate) mod tests {
         let settings = crate::config::from_contents(
             r#"
 switch_key = 'KEY_PAUSE'
-auto_switch = true
+pattern_switch = true
 [[switch_rules]]
 target = 'us'
 patterns = ['^/[a-z]']
@@ -1090,7 +1113,7 @@ patterns = ['^\.тф']
     fn auto_input_with_patterns(patterns: &str) -> Input {
         let mut input = auto_input();
         let settings = crate::config::from_contents(&format!(
-            "switch_key = 'KEY_PAUSE'\nauto_switch = true\n[[switch_rules]]\ntarget = 'us'\npatterns = [{patterns}]"
+            "switch_key = 'KEY_PAUSE'\npattern_switch = true\n[[switch_rules]]\ntarget = 'us'\npatterns = [{patterns}]"
         ))
         .unwrap();
         input.auto_switch =
@@ -2086,14 +2109,16 @@ patterns = ['^\.тф']
             input.pending.cancel();
             input.accept_layout(Some(layout("ru")), false);
             let settings = crate::config::from_contents(&format!(
-                "switch_key = 'KEY_PAUSE'\nauto_switch = true\n[[switch_rules]]\ntarget = 'gb'\npatterns = ['{pattern}']",
+                "switch_key = 'KEY_PAUSE'\npattern_switch = true\n[[switch_rules]]\ntarget = 'gb'\npatterns = ['{pattern}']",
             )).unwrap();
             input.auto_switch =
                 crate::switch_rules::AutoSwitchRules::compile(&settings, |name| Ok(layout(name)))
                     .unwrap();
             // A distinct synthetic regex target makes a replaced request observable.
-            input.auto_switch.dictionaries =
-                crate::dictionary::test_dictionaries(&[("us", "", "apple 1", 0.0, 0.0)]);
+            input.auto_switch.dictionaries = crate::dictionary::test_dictionaries([
+                ("us", "", "apple 1", 5.0),
+                ("ru", "", "я 1", 5.0),
+            ]);
             press(&mut input, KeyCode::KEY_LEFTSHIFT);
             press(&mut input, KeyCode::KEY_A);
             assert!(matches!(
@@ -2127,12 +2152,147 @@ patterns = ['^\.тф']
     }
 
     #[test]
+    fn pattern_and_dictionary_switch_flags_are_independent() {
+        let path = std::env::temp_dir().join(format!(
+            "true-switcher-switch-flags-{}.txt",
+            std::process::id(),
+        ));
+        std::fs::write(&path, "a 1\nb 1\nя 1\n").unwrap();
+        for (is_pattern_switch, is_auto_switch) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let settings = crate::config::from_contents(&format!(
+                r#"
+switch_key = "KEY_PAUSE"
+pattern_switch = {is_pattern_switch}
+auto_switch = {is_auto_switch}
+
+[[switch_rules]]
+target = "us"
+patterns = ['^[ac]$']
+
+[[dict]]
+target = "us"
+file = {path:?}
+threshold = 5.0
+
+[[dict]]
+target = "ru"
+file = {path:?}
+threshold = 7.0
+"#,
+            ))
+            .unwrap();
+            let mut input = auto_input();
+            let resolve = |name: &str| Ok(layout(name));
+            input.settings = (&settings).into();
+            input.auto_switch =
+                crate::switch_rules::AutoSwitchRules::compile(&settings, resolve).unwrap();
+            input.auto_switch.dictionaries =
+                crate::dictionary::DictionaryAutoSwitch::load(&settings, resolve, || Ok(2))
+                    .unwrap();
+
+            for (key, has_pattern_match, has_dictionary_match) in [
+                (KeyCode::KEY_A, true, true),
+                (KeyCode::KEY_B, false, true),
+                (KeyCode::KEY_C, true, false),
+            ] {
+                let expects_pattern = is_pattern_switch && has_pattern_match;
+                let expects_dictionary = is_auto_switch && has_dictionary_match && !expects_pattern;
+                let (_, messages) = crate::test_logging::capture(|| press(&mut input, key));
+                assert_eq!(
+                    input
+                        .automatic_target()
+                        .as_deref()
+                        .map(crate::layout::Layout::name),
+                    (expects_pattern || expects_dictionary).then_some("us"),
+                    "pattern_switch={is_pattern_switch}, auto_switch={is_auto_switch}, key={key:?}",
+                );
+                assert_eq!(input.pending.is_dictionary(), expects_dictionary);
+                assert_eq!(
+                    messages
+                        .iter()
+                        .filter(|message| message.starts_with("dict switch score: "))
+                        .count(),
+                    usize::from(is_auto_switch),
+                );
+                press(&mut input, KeyCode::KEY_BACKSPACE);
+                statistics_event(&mut input, KeyCode::KEY_BACKSPACE, 0);
+            }
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn toggles_cancel_only_the_pending_switch_of_the_disabled_kind() {
+        let mut input = auto_input_with_patterns("'^c$'");
+        input.auto_switch.dictionaries =
+            crate::dictionary::test_dictionaries([("us", "", "b 1", 1.0), ("ru", "", "я 1", 1.0)]);
+        let toggle = |input: &mut Input, setting| {
+            let (reply, result) = std::sync::mpsc::channel();
+            input
+                .process_message(InputEventMessage::ToggleSetting(setting, reply), None)
+                .unwrap();
+            result.try_recv().unwrap()
+        };
+
+        press(&mut input, KeyCode::KEY_B);
+        assert!(input.pending.is_dictionary());
+        assert!(!toggle(&mut input, RuntimeSetting::PatternSwitch).is_pattern_switch);
+        assert!(input.pending.is_dictionary());
+        assert!(!toggle(&mut input, RuntimeSetting::AutoSwitch).is_auto_switch);
+        assert!(input.pending.is_none());
+
+        assert!(toggle(&mut input, RuntimeSetting::PatternSwitch).is_pattern_switch);
+        press(&mut input, KeyCode::KEY_BACKSPACE);
+        statistics_event(&mut input, KeyCode::KEY_BACKSPACE, 0);
+        press(&mut input, KeyCode::KEY_C);
+        assert!(input.pending.is_auto());
+        assert!(!input.pending.is_dictionary());
+        assert!(toggle(&mut input, RuntimeSetting::AutoSwitch).is_auto_switch);
+        assert!(input.pending.is_auto());
+        assert!(!toggle(&mut input, RuntimeSetting::PatternSwitch).is_pattern_switch);
+        assert!(input.pending.is_none());
+    }
+
+    #[test]
+    fn logs_dictionary_score_for_each_added_stroke() {
+        let mut input = auto_input_with_patterns("");
+        input.auto_switch.dictionaries = crate::dictionary::test_dictionaries([
+            ("us", "", "a 53\nap 1\nc 1\nd 45", 5.0),
+            ("ru", "", "ф 4\nфз 1\nи 1\nя 94", 7.0),
+        ]);
+
+        for (key, expected) in [
+            (KeyCode::KEY_A, Some("+3.43")),
+            (KeyCode::KEY_P, Some("+0.00")),
+            (KeyCode::KEY_SPACE, None),
+            (KeyCode::KEY_BACKSPACE, None),
+            (KeyCode::KEY_SPACE, None),
+            (KeyCode::KEY_B, Some("-inf")),
+            (KeyCode::KEY_SPACE, None),
+            (KeyCode::KEY_C, Some("+inf")),
+            (KeyCode::KEY_SPACE, None),
+            (KeyCode::KEY_X, Some("unavailable")),
+        ] {
+            let (_, messages) = crate::test_logging::capture(|| press(&mut input, key));
+            let scores: Vec<_> = messages
+                .iter()
+                .filter_map(|message| message.strip_prefix("dict switch score: "))
+                .collect();
+            assert_eq!(scores, expected.as_slice(), "{key:?}");
+        }
+    }
+
+    #[test]
     fn dictionary_backspace_restores_missing_prefix_and_previous_word() {
         use crate::dictionary::Prefix;
 
         let mut input = auto_input_with_patterns("");
-        input.auto_switch.dictionaries =
-            crate::dictionary::test_dictionaries(&[("us", "", "cats 7", 0.0, 0.0)]);
+        input.auto_switch.dictionaries = crate::dictionary::test_dictionaries([
+            ("us", "", "cats 7", 5.0),
+            ("ru", "", "я 1", 5.0),
+        ]);
         let keypress = |input: &mut Input, key| {
             press(input, key);
             statistics_event(input, key, 0);
@@ -2174,10 +2334,8 @@ patterns = ['^\.тф']
     #[test]
     fn dictionary_and_regex_share_priority_and_correction_block() {
         let mut input = auto_input_with_patterns("'^a$'");
-        input.auto_switch.dictionaries = crate::dictionary::test_dictionaries(&[
-            ("us", "", "ab 2", 0.0, 0.0),
-            ("ru", "", "я 2", 0.5, 0.0),
-        ]);
+        input.auto_switch.dictionaries =
+            crate::dictionary::test_dictionaries([("us", "", "ab 2", 5.0), ("ru", "", "я 2", 5.0)]);
         press(&mut input, KeyCode::KEY_A);
         assert_eq!(input.automatic_target().unwrap().name(), "us");
         assert!(!input.pending.is_dictionary());
@@ -2187,7 +2345,7 @@ patterns = ['^\.тф']
 
         input.reset_history();
         input.auto_switch.dictionaries =
-            crate::dictionary::test_dictionaries(&[("ru", "", "с 1", 0.0, 0.0)]);
+            crate::dictionary::test_dictionaries([("ru", "", "с 1", 5.0), ("us", "", "a 1", 5.0)]);
         press(&mut input, KeyCode::KEY_C);
         assert!(input.pending.is_dictionary());
         input.begin_correction(Some(layout("ru")));
@@ -2204,8 +2362,10 @@ patterns = ['^\.тф']
             Some(Arc::new(crate::layout::Layout::new("us", "intl", "", ""))),
             false,
         );
-        input.auto_switch.dictionaries =
-            crate::dictionary::test_dictionaries(&[("ru", "", "фа 1\nфэ 1", 0.0, 0.0)]);
+        input.auto_switch.dictionaries = crate::dictionary::test_dictionaries([
+            ("ru", "", "фа 1\nфэ 1", 5.0),
+            ("us", "intl", "b 1", 5.0),
+        ]);
         press(&mut input, KeyCode::KEY_A);
         assert!(input.pending.is_dictionary());
         sender.send(InputEventMessage::Keyboard(
@@ -2228,8 +2388,10 @@ patterns = ['^\.тф']
         use crate::dictionary::Prefix;
 
         let mut input = auto_input_with_patterns("");
-        input.auto_switch.dictionaries =
-            crate::dictionary::test_dictionaries(&[("us", "intl", "apple 1", 0.0, 0.0)]);
+        input.auto_switch.dictionaries = crate::dictionary::test_dictionaries([
+            ("us", "intl", "apple 1", 5.0),
+            ("ru", "", "я 1", 5.0),
+        ]);
         press(&mut input, KeyCode::KEY_A);
         assert!(input.pending.is_dictionary());
         press(&mut input, KeyCode::KEY_APOSTROPHE);
