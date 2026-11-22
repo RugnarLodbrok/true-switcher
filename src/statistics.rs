@@ -356,13 +356,15 @@ mod tests {
     }
 
     #[test]
-    fn migrates_old_switches_as_manual_and_stores_auto_mode() {
+    fn migrates_old_switches_as_manual_and_stores_all_modes() {
         let connection = Connection::open_in_memory().unwrap();
         connection.execute_batch("CREATE TABLE switches (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER NOT NULL, prev TEXT NOT NULL, a TEXT NOT NULL, b TEXT NOT NULL); INSERT INTO switches (timestamp, prev, a, b) VALUES (1, '', 'old', 'old');").unwrap();
         prepare_schema(&connection).unwrap();
         let mut record = make_record(None, None, &layout("us"), UNIX_EPOCH).unwrap();
-        record.mode = SwitchMode::Auto;
-        insert(&connection, &Record::Switch(record)).unwrap();
+        for mode in [SwitchMode::Pattern, SwitchMode::Auto, SwitchMode::Manual] {
+            record.mode = mode;
+            insert(&connection, &Record::Switch(record.clone())).unwrap();
+        }
         let modes: Vec<i64> = connection
             .prepare("SELECT mode FROM switches ORDER BY id")
             .unwrap()
@@ -370,16 +372,19 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(modes, [0, 1]);
-        let record = make_record(None, None, &layout("us"), UNIX_EPOCH).unwrap();
-        insert(&connection, &Record::Switch(record)).unwrap();
-        assert_eq!(
-            connection
-                .query_row("SELECT mode FROM switches WHERE id = 3", [], |row| row
-                    .get::<_, i64>(0))
-                .unwrap(),
-            0
-        );
+        assert_eq!(modes, [0, 1, 2, 0]);
+    }
+
+    #[test]
+    fn preserves_existing_auto_mode() {
+        let connection = Connection::open_in_memory().unwrap();
+        prepare_schema(&connection).unwrap();
+        connection.execute("INSERT INTO switches (timestamp, prev, a, b, mode) VALUES (1, '', 'old', 'old', 1)", []).unwrap();
+        prepare_schema(&connection).unwrap();
+        let mode: i64 = connection
+            .query_row("SELECT mode FROM switches", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, 1);
     }
 
     fn layout(name: &str) -> Arc<Layout> {

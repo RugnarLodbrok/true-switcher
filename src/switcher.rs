@@ -11,7 +11,8 @@ use std::time::SystemTime;
 #[repr(i64)]
 pub enum SwitchMode {
     Manual = 0,
-    Auto = 1,
+    Pattern = 1,
+    Auto = 2,
 }
 
 struct Correction {
@@ -30,7 +31,7 @@ impl Correction {
             target: request.target,
             mode: request.mode,
             is_sound_enabled: match request.mode {
-                SwitchMode::Auto => settings.is_auto_switch_sound,
+                SwitchMode::Pattern | SwitchMode::Auto => settings.is_auto_switch_sound,
                 SwitchMode::Manual => settings.is_manual_switch_sound,
             },
         }
@@ -303,13 +304,16 @@ mod tests {
             .is_sound_enabled
         };
         assert!(!is_enabled(SwitchMode::Manual, settings));
+        assert!(!is_enabled(SwitchMode::Pattern, settings));
         assert!(!is_enabled(SwitchMode::Auto, settings));
         settings.toggle(RuntimeSetting::ManualSwitchSound);
         assert!(is_enabled(SwitchMode::Manual, settings));
+        assert!(!is_enabled(SwitchMode::Pattern, settings));
         assert!(!is_enabled(SwitchMode::Auto, settings));
         settings.toggle(RuntimeSetting::ManualSwitchSound);
         settings.toggle(RuntimeSetting::AutoSwitchSound);
         assert!(!is_enabled(SwitchMode::Manual, settings));
+        assert!(is_enabled(SwitchMode::Pattern, settings));
         assert!(is_enabled(SwitchMode::Auto, settings));
     }
 

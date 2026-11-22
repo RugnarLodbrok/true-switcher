@@ -205,10 +205,16 @@ impl Input {
         if !self.has_valid_pending_request() {
             return None;
         }
-        let (mode, target) = if self.pending.is_auto() {
-            (SwitchMode::Auto, Some(self.automatic_target()?))
-        } else {
-            (SwitchMode::Manual, None)
+        let (mode, target) = match &self.pending {
+            PendingSwitch::Auto { kind, .. } => {
+                let mode = match kind {
+                    AutoSwitchKind::Regex => SwitchMode::Pattern,
+                    AutoSwitchKind::Dictionary => SwitchMode::Auto,
+                };
+                (mode, Some(self.automatic_target()?))
+            }
+            PendingSwitch::Manual { .. } => (SwitchMode::Manual, None),
+            PendingSwitch::Idle => return None,
         };
         Some(SwitchRequest {
             previous: self.previous_word().cloned(),
@@ -1250,7 +1256,7 @@ patterns = ['^\.тф']
             .pending
             .update_auto(0, Some((layout("us"), AutoSwitchKind::Regex)));
 
-        assert_eq!(request.mode, crate::switcher::SwitchMode::Auto);
+        assert_eq!(request.mode, crate::switcher::SwitchMode::Pattern);
         assert_eq!(request.word, expected_word);
         assert_eq!(request.target.unwrap().name(), "ru");
     }
@@ -2209,6 +2215,17 @@ threshold = 7.0
                     "pattern_switch={is_pattern_switch}, auto_switch={is_auto_switch}, key={key:?}",
                 );
                 assert_eq!(input.pending.is_dictionary(), expects_dictionary);
+                let expected_mode = if expects_pattern {
+                    Some(crate::switcher::SwitchMode::Pattern)
+                } else if expects_dictionary {
+                    Some(crate::switcher::SwitchMode::Auto)
+                } else {
+                    None
+                };
+                assert_eq!(
+                    input.switch_request().map(|request| request.mode),
+                    expected_mode
+                );
                 assert_eq!(
                     messages
                         .iter()
@@ -2450,7 +2467,7 @@ threshold = 7.0
         assert!(input.switch_request().is_none());
         press(&mut input, KeyCode::KEY_N);
         let request = input.switch_request().unwrap();
-        assert_eq!(request.mode, crate::switcher::SwitchMode::Auto);
+        assert_eq!(request.mode, crate::switcher::SwitchMode::Pattern);
         assert_eq!(request.target.unwrap().name(), "us");
     }
 
