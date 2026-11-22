@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::config::{ConfigurationFile, RuntimeSettings};
+use crate::config::{Configuration, ConfigurationFile};
 use crate::input_events::{InputEventMessage, InputEventSender, InputEvents};
 use crate::lifecycle::ShutdownReason;
 use zbus::blocking::{Connection, Proxy, fdo::DBusProxy};
@@ -36,12 +36,12 @@ pub struct Tray;
 impl Tray {
     pub fn start(
         sender: InputEventSender,
-        settings: RuntimeSettings,
+        config: &Configuration,
         config_file: ConfigurationFile,
     ) -> io::Result<Self> {
         let runtime = menu::RuntimeMenu::new(
             sender.clone(),
-            settings,
+            config,
             config_file,
             crate::kde::layout_count,
         );

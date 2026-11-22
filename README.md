@@ -84,7 +84,7 @@ After installation, the installer starts True Switcher and enables it to start a
 
 Edit `~/.config/true-switcher/config.toml`, then select `Reload` in the KDE Plasma tray menu to apply changes. Select `Quit` to stop True Switcher.
 
-The tray can toggle dictionary matching, pattern matching, and the two switch sounds immediately. Select `Save to config` to keep these settings after a restart. This replaces the file with the copy loaded by True Switcher, preserving its comments and formatting. To keep manual edits made on disk, use `Reload` before saving from the tray.
+The tray can toggle dictionary matching, pattern matching, and the two switch sounds immediately. The `Log level` submenu marks the current level and applies your selection immediately. Select `Save to config` to keep these settings after a restart. This replaces the file with the copy loaded by True Switcher, preserving its comments and formatting. To keep manual edits made on disk, use `Reload` before saving from the tray.
 
 Configuration example with default values for optional settings and one example rule:
 
@@ -121,9 +121,13 @@ Manual layout changes reset typing history. Punctuation remains part of a word; 
 
 ### Dictionary matching
 
-Configure exactly two `[[dict]]` entries with distinct targets. Set `auto_switch = true` to enable matching. This feature supports up to two KDE layouts. Each file path is relative to `config.toml`. Put one word and its integer frequency on each line, for example `apple 10`. The loader skips entries whose words contain an uppercase letter.
+Configure exactly two `[[dict]]` entries with distinct targets. Set `auto_switch = true` to enable matching. This feature supports up to two KDE layouts. Each file path is relative to `config.toml`. Put one word and its integer frequency on each line, for example `apple 10`.
+
+The optional top-level `dict_skip_pattern` applies to both dictionaries at load time. It skips an entry when the regex matches the entire word field. For example, `'cat'` skips `cat` and keeps `bobcat`. Leave the setting out or set it to `''` to load words of any case. The example below skips words containing an uppercase Unicode letter.
 
 ```toml
+dict_skip_pattern = '.*\p{Lu}.*'
+
 [[dict]]
 target = "us"
 file = "dictionaries/en_full.txt"
@@ -144,7 +148,7 @@ Choose finite positive thresholds in bits. The example values require a likeliho
 Each successful layout switch is recorded in SQLite, even if replaying the word is later cancelled or fails.
 The database is stored at `$XDG_STATE_HOME/true-switcher/statistics.sqlite3`, or `~/.local/state/true-switcher/statistics.sqlite3` when `XDG_STATE_HOME` is unset or empty.
 
-The `switches` table contains `id`, `timestamp` (Unix seconds), `prev` (the previous word as typed), `a` (the corrected word before switching), `b` (the word in the new layout), and `mode` (`0` for manual corrections, `1` for automatic corrections). Existing databases gain `mode` automatically; old records receive `0`.
+The `switches` table contains `id`, `timestamp` (Unix seconds), `prev` (the previous word as typed), `a` (the corrected word before switching), `b` (the word in the new layout), and `mode` (`0` for manual corrections, `1` for pattern switches, `2` for dictionary auto-switches). Existing databases without `mode` gain it automatically; those old records receive `0`. Earlier versions recorded both automatic types as `1`; those records are unchanged and cannot be distinguished by type.
 Missing words are stored as empty strings. Records are skipped when the layout or text cannot be determined. Database errors are logged and do not stop the switcher.
 
 The same database stores typing frequencies in `typing_words`, with `word` (`TEXT PRIMARY KEY`) and `count` (`INTEGER NOT NULL`).

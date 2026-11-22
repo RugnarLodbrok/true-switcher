@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::RuntimeSettings;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
@@ -223,6 +224,80 @@ where
     T::try_from(value).unwrap()
 }
 
+#[test]
+fn runtime_menu_exports_log_levels_in_a_submenu() {
+    let bus = TestBus::start();
+    let tray = bus.connect();
+    let client = bus.connect();
+    let (sender, _events) = InputEvents::new();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    fs::write(&path, format!("{RUNTIME_CONFIG}log_level = 'debug'\n")).unwrap();
+    export_runtime_menu(&tray, sender, &path, || Ok(2));
+    let menu = Proxy::new(
+        &client,
+        tray.unique_name().unwrap().as_str(),
+        MENU_PATH,
+        MENU_INTERFACE,
+    )
+    .unwrap();
+
+    let find_submenu = |depth: i32| {
+        let (_, layout): (u32, menu::Layout) = menu
+            .call("GetLayout", &(0_i32, depth, Vec::<String>::new()))
+            .unwrap();
+        layout
+            .2
+            .into_iter()
+            .map(|child| menu::Layout::try_from(child).unwrap())
+            .find(|(_, properties, _)| {
+                <&str>::try_from(&properties["label"]).unwrap() == "Log level"
+            })
+            .unwrap()
+    };
+    let (submenu_id, properties, children) = find_submenu(1);
+    assert_eq!(
+        <&str>::try_from(&properties["children-display"]).unwrap(),
+        "submenu"
+    );
+    assert!(children.is_empty());
+    assert_eq!(find_submenu(-1).2.len(), 6);
+
+    let (_, submenu): (u32, menu::Layout) = menu
+        .call("GetLayout", &(submenu_id, 1_i32, Vec::<String>::new()))
+        .unwrap();
+    let levels: Vec<_> = submenu
+        .2
+        .into_iter()
+        .map(|child| {
+            let (_, mut properties, children) = menu::Layout::try_from(child).unwrap();
+            assert!(children.is_empty());
+            assert_eq!(
+                <&str>::try_from(&properties["toggle-type"]).unwrap(),
+                "radio"
+            );
+            (
+                String::try_from(properties.remove("label").unwrap()).unwrap(),
+                i32::try_from(&properties["toggle-state"]).unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        levels
+            .iter()
+            .map(|(name, state)| (name.as_str(), *state))
+            .collect::<Vec<_>>(),
+        [
+            ("off", 0),
+            ("error", 0),
+            ("warn", 0),
+            ("info", 0),
+            ("debug", 1),
+            ("trace", 0)
+        ]
+    );
+}
+
 const RUNTIME_CONFIG: &str = "switch_key = 'KEY_PAUSE'\nauto_switch_sound = false\n";
 
 fn export_runtime_menu(
@@ -233,7 +308,7 @@ fn export_runtime_menu(
 ) -> RuntimeSettings {
     let (config, file) = crate::config::load_from(path).unwrap();
     let settings = RuntimeSettings::from(&config);
-    let runtime = menu::RuntimeMenu::new(sender.clone(), settings, file, layout_count);
+    let runtime = menu::RuntimeMenu::new(sender.clone(), &config, file, layout_count);
     let mut exported_menu = menu::Menu::new(sender);
     exported_menu.runtime = Some(Arc::new(runtime));
     exported_menu.refresh();

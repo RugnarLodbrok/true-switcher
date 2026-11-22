@@ -3,6 +3,8 @@ use std::io::{self, BufRead, BufReader};
 use std::ops::Range;
 use std::sync::Arc;
 
+use regex::Regex;
+
 use crate::config::Configuration;
 use crate::layout::Layout;
 use crate::word::{Stroke, Word};
@@ -32,7 +34,7 @@ struct DictionaryTrie {
 }
 
 impl DictionaryTrie {
-    fn read(input: impl BufRead) -> io::Result<Self> {
+    fn read(input: impl BufRead, skip_pattern: Option<&Regex>) -> io::Result<Self> {
         let mut records = Vec::new();
         let mut total = 0_u64;
         for (index, line) in input.lines().enumerate() {
@@ -40,10 +42,7 @@ impl DictionaryTrie {
             let (word, frequency) = parse_record(&line).ok_or_else(|| {
                 invalid(format!("Invalid dictionary record on line {}", index + 1))
             })?;
-            if word
-                .chars()
-                .any(|character| !character.to_lowercase().eq([character]))
-            {
+            if skip_pattern.is_some_and(|pattern| pattern.is_match(word)) {
                 continue;
             }
             total = total
@@ -147,6 +146,18 @@ fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
+fn compile_skip_pattern(pattern: &str) -> io::Result<Option<Regex>> {
+    if pattern.is_empty() {
+        return Ok(None);
+    }
+    let invalid_pattern = |error| invalid(format!("Invalid dict_skip_pattern: {error}"));
+    Regex::new(pattern).map_err(invalid_pattern)?; // Reject unmatched groups before wrapping.
+    // The newline terminates a trailing verbose-mode comment and is ignored otherwise.
+    Regex::new(&format!("\\A(?:{pattern}(?x)\n)\\z"))
+        .map(Some)
+        .map_err(invalid_pattern)
+}
+
 struct Dictionary {
     target: Arc<Layout>,
     trie: DictionaryTrie,
@@ -172,6 +183,7 @@ impl DictionaryAutoSwitch {
                 "Dictionary auto-switch supports at most two KDE layouts",
             ));
         }
+        let skip_pattern = compile_skip_pattern(&settings.dict_skip_pattern)?;
         let mut targets = HashSet::new();
         let mut dictionaries = Vec::new();
         for setting in &settings.dict {
@@ -189,7 +201,7 @@ impl DictionaryAutoSwitch {
             }
             let target = resolve(&setting.target)?;
             let trie = std::fs::File::open(&setting.file)
-                .and_then(|file| DictionaryTrie::read(BufReader::new(file)))
+                .and_then(|file| DictionaryTrie::read(BufReader::new(file), skip_pattern.as_ref()))
                 .map_err(|error| invalid(format!("{}: {error}", setting.file.display())))?;
             dictionaries.push(Dictionary {
                 target,
@@ -262,7 +274,7 @@ pub(crate) fn test_dictionaries(
             .iter()
             .map(|&(name, variant, records, threshold)| Dictionary {
                 target: Arc::new(Layout::new(name, variant, "", "")),
-                trie: DictionaryTrie::read(records.as_bytes()).unwrap(),
+                trie: DictionaryTrie::read(records.as_bytes(), None).unwrap(),
                 threshold,
             })
             .collect(),
@@ -275,7 +287,7 @@ mod tests {
     use evdev::KeyCode;
 
     fn trie(records: &str) -> DictionaryTrie {
-        DictionaryTrie::read(records.as_bytes()).unwrap()
+        DictionaryTrie::read(records.as_bytes(), None).unwrap()
     }
 
     #[test]
@@ -302,8 +314,17 @@ mod tests {
     }
 
     #[test]
-    fn skips_capitalized_words_before_calculating_the_total() {
-        let trie = trie("cat 2\nCat 18446744073709551615\ncoDe 4\nКОТ 3\nмир 6\n");
+    fn loads_capitalized_words_without_a_skip_pattern() {
+        let trie = trie("abc1 5\nApple 10\n");
+        assert_eq!(trie.nodes[0].frequency, 15);
+        assert_eq!(trie.transitions[0].character, 'A');
+    }
+
+    #[test]
+    fn skips_matching_uppercase_words_before_calculating_the_total() {
+        let pattern = compile_skip_pattern(r".*\p{Lu}.*").unwrap();
+        let records = "cat 2\nCat 18446744073709551615\ncoDe 4\nКОТ 3\nмир 6\n";
+        let trie = DictionaryTrie::read(records.as_bytes(), pattern.as_ref()).unwrap();
         let root = Prefix::Node(0);
         assert_eq!(trie.nodes[0].frequency, 8);
         assert_eq!(trie.probability(trie.advance(root, "CAT")), Some(0.25));
@@ -320,16 +341,95 @@ mod tests {
             "a -1",
             "bad",
             "a 1 2",
-            "A 1",
             "a 1\na 2",
             "a 18446744073709551615\nb 1",
         ] {
             assert!(
-                DictionaryTrie::read(records.as_bytes()).is_err(),
+                DictionaryTrie::read(records.as_bytes(), None).is_err(),
                 "{records:?}"
             );
         }
-        assert!(DictionaryTrie::read(&b"a 1\n\xff 1"[..]).is_err());
+        assert!(DictionaryTrie::read(&b"a 1\n\xff 1"[..], None).is_err());
+    }
+
+    #[test]
+    fn matches_the_whole_word_field() {
+        for (pattern, records, total) in [
+            ("cat", "cat 10\nbobcat 5\ncatfish 1\n", 6),
+            ("cat|cats", "cat 10\ncats 1\nbobcat 5\n", 5),
+            ("(?x)cat # comment", "cat 10\nbobcat 5\n", 5),
+            ("^10$", "10 2\napple 10\n", 10),
+        ] {
+            let skip_pattern = compile_skip_pattern(pattern).unwrap();
+            let trie = DictionaryTrie::read(records.as_bytes(), skip_pattern.as_ref()).unwrap();
+            assert_eq!(trie.nodes[0].frequency, total, "{pattern:?}");
+        }
+    }
+
+    fn load_dictionaries_with_filter(
+        pattern: &str,
+        us_records: &str,
+        ru_records: &str,
+    ) -> io::Result<DictionaryAutoSwitch> {
+        let directory = tempfile::tempdir().unwrap();
+        let us = directory.path().join("us.txt");
+        let ru = directory.path().join("ru.txt");
+        std::fs::write(&us, us_records).unwrap();
+        std::fs::write(&ru, ru_records).unwrap();
+        let config = crate::config::from_contents(&format!(
+            "switch_key = 'KEY_PAUSE'\nauto_switch = false\ndict_skip_pattern = '{pattern}'\n\
+             [[dict]]\ntarget = 'us'\nfile = {us:?}\nthreshold = 5.0\n\
+             [[dict]]\ntarget = 'ru'\nfile = {ru:?}\nthreshold = 7.0\n"
+        ))
+        .unwrap();
+        DictionaryAutoSwitch::load(
+            &config,
+            |name| Ok(Arc::new(Layout::new(name, "", "", ""))),
+            || Ok(2),
+        )
+    }
+
+    #[test]
+    fn filters_both_dictionaries_when_loading_configuration() {
+        let dictionaries = load_dictionaries_with_filter(
+            ".*[0-9].*",
+            "abc1 100\napple 10\n",
+            "абв2 200\nабрикос 20\n",
+        )
+        .unwrap();
+        for (dictionary, skipped, total) in [
+            (&dictionaries.dictionaries[0], "abc1", 10),
+            (&dictionaries.dictionaries[1], "абв2", 20),
+        ] {
+            assert_eq!(dictionary.trie.nodes[0].frequency, total);
+            assert_eq!(
+                dictionary.trie.advance(Prefix::Node(0), skipped),
+                Prefix::Missing
+            );
+        }
+    }
+
+    #[test]
+    fn reports_dictionary_filter_configuration_errors() {
+        for (pattern, records, expected) in [
+            ("[", "кот 1", "Invalid dict_skip_pattern"),
+            (")(?:", "кот 1", "Invalid dict_skip_pattern"),
+            (
+                "кот",
+                "кот 1",
+                "ru.txt: Dictionary frequency sum must be positive",
+            ),
+            (
+                "^bad$",
+                "bad -1",
+                "ru.txt: Invalid dictionary record on line 1",
+            ),
+        ] {
+            let error = load_dictionaries_with_filter(pattern, "cat 1", records)
+                .err()
+                .expect("dictionary configuration should fail");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
     }
 
     #[test]

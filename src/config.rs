@@ -10,6 +10,16 @@ use toml_edit::DocumentMut;
 
 const CONFIG_DIRECTORY: &str = ".config/true-switcher";
 const CONFIG_FILE: &str = "config.toml";
+const LOG_LEVEL_KEY: &str = "log_level";
+pub(crate) const LOG_LEVELS: [(&str, log::LevelFilter); 6] = [
+    ("off", log::LevelFilter::Off),
+    ("error", log::LevelFilter::Error),
+    ("warn", log::LevelFilter::Warn),
+    ("info", log::LevelFilter::Info),
+    ("debug", log::LevelFilter::Debug),
+    ("trace", log::LevelFilter::Trace),
+];
+
 #[derive(Deserialize)]
 pub struct Configuration {
     #[serde(
@@ -29,6 +39,8 @@ pub struct Configuration {
     pub auto_switch_sound: bool,
     #[serde(default)]
     pub switch_rules: Vec<SwitchRule>,
+    #[serde(default)]
+    pub dict_skip_pattern: String,
     #[serde(default)]
     pub dict: Vec<DictionarySettings>,
 }
@@ -100,15 +112,11 @@ fn deserialize_log_level<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<log::LevelFilter, D::Error> {
     let value = String::deserialize(deserializer)?;
-    match value.as_str() {
-        "off" => Ok(log::LevelFilter::Off),
-        "error" => Ok(log::LevelFilter::Error),
-        "warn" => Ok(log::LevelFilter::Warn),
-        "info" => Ok(log::LevelFilter::Info),
-        "debug" => Ok(log::LevelFilter::Debug),
-        "trace" => Ok(log::LevelFilter::Trace),
-        _ => Err(de::Error::custom(format!("Invalid log_level: {value:?}"))),
-    }
+    LOG_LEVELS
+        .iter()
+        .find(|(name, _)| *name == value)
+        .map(|(_, level)| *level)
+        .ok_or_else(|| de::Error::custom(format!("Invalid log_level: {value:?}")))
 }
 
 fn deserialize_switch_key<'de, D: Deserializer<'de>>(deserializer: D) -> Result<KeyCode, D::Error> {
@@ -125,15 +133,28 @@ pub(crate) struct ConfigurationFile {
 }
 
 impl ConfigurationFile {
-    pub(crate) fn save(&self, settings: RuntimeSettings) -> io::Result<()> {
+    pub(crate) fn save(
+        &self,
+        settings: RuntimeSettings,
+        log_level: log::LevelFilter,
+    ) -> io::Result<()> {
         let mut document = self.document.clone();
-        for (key, is_enabled) in [
-            ("auto_switch", settings.is_auto_switch),
-            ("pattern_switch", settings.is_pattern_switch),
-            ("manual_switch_sound", settings.is_manual_switch_sound),
-            ("auto_switch_sound", settings.is_auto_switch_sound),
+        for (key, mut value) in [
+            (
+                "auto_switch",
+                toml_edit::Value::from(settings.is_auto_switch),
+            ),
+            ("pattern_switch", settings.is_pattern_switch.into()),
+            (
+                "manual_switch_sound",
+                settings.is_manual_switch_sound.into(),
+            ),
+            ("auto_switch_sound", settings.is_auto_switch_sound.into()),
+            (
+                LOG_LEVEL_KEY,
+                log_level.as_str().to_ascii_lowercase().into(),
+            ),
         ] {
-            let mut value = toml_edit::Value::from(is_enabled);
             if let Some(old) = document.get(key).and_then(toml_edit::Item::as_value) {
                 *value.decor_mut() = old.decor().clone();
             }
@@ -245,20 +266,42 @@ threshold = 5.0
         settings.toggle(RuntimeSetting::AutoSwitch);
         settings.toggle(RuntimeSetting::ManualSwitchSound);
         fs::write(&path, "invalid TOML").unwrap();
-        file.save(settings).unwrap();
+        file.save(settings, log::LevelFilter::Debug).unwrap();
         let saved = fs::read_to_string(&path).unwrap();
         assert_eq!(
             saved,
             original.replace("'auto_switch'  =  false", "'auto_switch'  =  true").replace(
                 "\n[[dict]]",
-                "pattern_switch = false\nmanual_switch_sound = true\nauto_switch_sound = true\n\n[[dict]]",
+                "pattern_switch = false\nmanual_switch_sound = true\nauto_switch_sound = true\nlog_level = \"debug\"\n\n[[dict]]",
             )
         );
-        assert!(load_from(&path).unwrap().0.manual_switch_sound);
+        let (saved_config, _) = load_from(&path).unwrap();
+        assert!(saved_config.manual_switch_sound);
+        assert_eq!(saved_config.log_level, log::LevelFilter::Debug);
 
         fs::remove_file(&path).unwrap();
-        file.save(settings).unwrap();
+        file.save(settings, log::LevelFilter::Debug).unwrap();
         assert_eq!(fs::read_to_string(path).unwrap(), saved);
+    }
+
+    #[test]
+    fn save_preserves_log_level_comment() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(CONFIG_FILE);
+        fs::write(
+            &path,
+            "switch_key = 'KEY_PAUSE'\nlog_level  =  'info'   # Logging\n",
+        )
+        .unwrap();
+        let (config, file) = load_from(&path).unwrap();
+        file.save(RuntimeSettings::from(&config), log::LevelFilter::Trace)
+            .unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("log_level  =  \"trace\"   # Logging\n"));
+        assert_eq!(
+            load_from(&path).unwrap().0.log_level,
+            log::LevelFilter::Trace
+        );
     }
 
     #[test]
@@ -290,6 +333,22 @@ threshold = 5.0
         ] {
             assert!(from_contents(text).is_err(), "{text}");
         }
+    }
+
+    #[test]
+    fn reads_dictionary_skip_pattern() {
+        for (setting, expected) in [
+            ("", ""),
+            ("dict_skip_pattern = ''", ""),
+            (r"dict_skip_pattern = '.*\p{Lu}.*'", r".*\p{Lu}.*"),
+        ] {
+            let contents = format!("switch_key = 'KEY_F12'\n{setting}");
+            assert_eq!(
+                from_contents(&contents).unwrap().dict_skip_pattern,
+                expected
+            );
+        }
+        assert!(from_contents("switch_key = 'KEY_F12'\ndict_skip_pattern = true").is_err());
     }
 
     #[test]

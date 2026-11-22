@@ -3,7 +3,9 @@ use std::io;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
-use crate::config::{ConfigurationFile, RuntimeSetting, RuntimeSettings};
+use crate::config::{
+    Configuration, ConfigurationFile, LOG_LEVELS, RuntimeSetting, RuntimeSettings,
+};
 use crate::dictionary::DICTIONARY_COUNT;
 use crate::input_events::{InputEventMessage, InputEventSender};
 use crate::lifecycle::ShutdownReason;
@@ -18,6 +20,8 @@ const PATTERN_SWITCH_ID: i32 = 4;
 const MANUAL_SOUND_ID: i32 = 5;
 const AUTO_SOUND_ID: i32 = 6;
 const SAVE_ID: i32 = 7;
+const LOG_LEVEL_MENU_ID: i32 = 8;
+const LOG_LEVEL_IDS: [i32; LOG_LEVELS.len()] = [9, 10, 11, 12, 13, 14];
 const SETTING_IDS: [i32; 4] = [
     AUTO_SWITCH_ID,
     PATTERN_SWITCH_ID,
@@ -50,6 +54,7 @@ enum AutoSwitchAvailability {
 struct MenuState {
     settings: RuntimeSettings,
     availability: AutoSwitchAvailability,
+    log_level: log::LevelFilter,
 }
 
 pub(super) struct RuntimeMenu {
@@ -62,15 +67,16 @@ pub(super) struct RuntimeMenu {
 impl RuntimeMenu {
     pub(super) fn new(
         sender: InputEventSender,
-        settings: RuntimeSettings,
+        config: &Configuration,
         config_file: ConfigurationFile,
         layout_count: impl Fn() -> io::Result<usize> + Send + Sync + 'static,
     ) -> Self {
         Self {
             sender,
             state: Mutex::new(MenuState {
-                settings,
+                settings: config.into(),
                 availability: AutoSwitchAvailability::UnknownLayoutCount,
+                log_level: config.log_level,
             }),
             config_file,
             layout_count: Box::new(layout_count),
@@ -117,9 +123,32 @@ impl RuntimeMenu {
 
     fn save(&self) {
         let state = self.state.lock().unwrap();
-        if let Err(error) = self.config_file.save(state.settings) {
+        if let Err(error) = self.config_file.save(state.settings, state.log_level) {
             log::warn!("true-switcher: cannot save configuration: {error}");
         }
+    }
+
+    fn select_log_level(&self, id: i32, level: log::LevelFilter) -> Vec<(i32, Properties)> {
+        let mut state = self.state.lock().unwrap();
+        if state.log_level == level {
+            return Vec::new();
+        }
+        let previous_id = LOG_LEVEL_IDS
+            .into_iter()
+            .zip(LOG_LEVELS)
+            .find_map(|(id, (_, level))| (level == state.log_level).then_some(id))
+            .expect("all log levels have menu items");
+        state.log_level = level;
+        log::set_max_level(level);
+        vec![(previous_id, toggle_state(false)), (id, toggle_state(true))]
+    }
+
+    fn log_level_properties(&self, label: &str, level: log::LevelFilter) -> Properties {
+        let mut properties = item_properties(label, true);
+        properties.insert("toggle-type".into(), Str::from("radio").into());
+        let is_checked = self.state.lock().unwrap().log_level == level;
+        properties.insert("toggle-state".into(), i32::from(is_checked).into());
+        properties
     }
 
     fn properties(&self, setting: RuntimeSetting) -> Properties {
@@ -165,12 +194,23 @@ fn setting(id: i32) -> Option<RuntimeSetting> {
     }
 }
 
+fn log_level(id: i32) -> Option<(&'static str, log::LevelFilter)> {
+    LOG_LEVEL_IDS
+        .into_iter()
+        .zip(LOG_LEVELS)
+        .find_map(|(item_id, level)| (item_id == id).then_some(level))
+}
+
 fn item_properties(label: &str, is_enabled: bool) -> Properties {
     HashMap::from([
         ("label".into(), Str::from(label).into()),
         ("enabled".into(), is_enabled.into()),
         ("visible".into(), true.into()),
     ])
+}
+
+fn toggle_state(is_checked: bool) -> Properties {
+    HashMap::from([("toggle-state".into(), i32::from(is_checked).into())])
 }
 
 impl Menu {
@@ -189,14 +229,41 @@ impl Menu {
             .is_some_and(|runtime| runtime.refresh_availability(&mut runtime.state.lock().unwrap()))
     }
 
-    fn ids(&self) -> Vec<i32> {
+    fn root_children(&self) -> Vec<i32> {
         let mut ids = Vec::new();
         if self.runtime.is_some() {
             ids.extend(SETTING_IDS);
-            ids.push(SAVE_ID);
+            ids.extend([LOG_LEVEL_MENU_ID, SAVE_ID]);
         }
         ids.extend([RELOAD_ID, QUIT_ID]);
         ids
+    }
+
+    fn ids(&self) -> Vec<i32> {
+        let mut ids = self.root_children();
+        if self.runtime.is_some() {
+            ids.extend(LOG_LEVEL_IDS);
+        }
+        ids
+    }
+
+    fn layout(&self, id: i32, depth: i32, names: &[String]) -> zbus::fdo::Result<Layout> {
+        let properties = self.properties(id, names)?;
+        let child_ids = match (id, depth) {
+            (_, 0) => Vec::new(),
+            (ROOT_ID, _) => self.root_children(),
+            (LOG_LEVEL_MENU_ID, _) => LOG_LEVEL_IDS.to_vec(),
+            _ => Vec::new(),
+        };
+        let child_depth = if depth < 0 { depth } else { depth - 1 };
+        let mut children = Vec::with_capacity(child_ids.len());
+        for child_id in child_ids {
+            let child = self.layout(child_id, child_depth, names)?;
+            children.push(Value::from(child).try_into().map_err(
+                |error: zbus::zvariant::Error| zbus::fdo::Error::Failed(error.to_string()),
+            )?);
+        }
+        Ok((id, properties, children))
     }
 
     async fn dispatch(
@@ -212,6 +279,18 @@ impl Menu {
             return Ok(());
         }
         if let Some(runtime) = &self.runtime {
+            if let Some((_, level)) = log_level(id) {
+                let updates = runtime.select_log_level(id, level);
+                if updates.is_empty() {
+                    return Ok(());
+                }
+                return Self::items_properties_updated(emitter, updates, Vec::new())
+                    .await
+                    .map_err(|error| zbus::fdo::Error::Failed(error.to_string()));
+            }
+            if id == LOG_LEVEL_MENU_ID {
+                return Ok(());
+            }
             if let Some(setting) = setting(id) {
                 runtime.toggle(setting)?;
                 return Self::items_properties_updated(
@@ -256,8 +335,16 @@ impl Menu {
             RELOAD_ID => item_properties("Reload", true),
             QUIT_ID => item_properties("Quit", true),
             SAVE_ID if self.runtime.is_some() => item_properties("Save to config", true),
-            _ => match (&self.runtime, setting(id)) {
-                (Some(runtime), Some(setting)) => runtime.properties(setting),
+            LOG_LEVEL_MENU_ID if self.runtime.is_some() => {
+                let mut properties = item_properties("Log level", true);
+                properties.insert("children-display".into(), Str::from("submenu").into());
+                properties
+            }
+            _ => match (&self.runtime, setting(id), log_level(id)) {
+                (Some(runtime), Some(setting), _) => runtime.properties(setting),
+                (Some(runtime), _, Some((label, level))) => {
+                    runtime.log_level_properties(label, level)
+                }
                 _ => return Err(zbus::fdo::Error::InvalidArgs("Unknown menu item".into())),
             },
         };
@@ -304,22 +391,9 @@ impl Menu {
         recursion_depth: i32,
         property_names: Vec<String>,
     ) -> zbus::fdo::Result<(u32, Layout)> {
-        let mut children = Vec::new();
-        if parent_id == ROOT_ID && recursion_depth != 0 {
-            for id in self.ids() {
-                let child: Layout = (id, self.properties(id, &property_names)?, Vec::new());
-                children.push(Value::from(child).try_into().map_err(
-                    |error: zbus::zvariant::Error| zbus::fdo::Error::Failed(error.to_string()),
-                )?);
-            }
-        }
         Ok((
             REVISION,
-            (
-                parent_id,
-                self.properties(parent_id, &property_names)?,
-                children,
-            ),
+            self.layout(parent_id, recursion_depth, &property_names)?,
         ))
     }
 
