@@ -599,16 +599,16 @@ impl Input {
         let Some(word) = self.history.latest_word_mut() else {
             return;
         };
+        let is_first_space = key == KeyCode::KEY_SPACE && word.trailing_spaces == 1;
         if is_text {
             let stroke = word.entries.last().unwrap().stroke;
             self.auto_switch.dictionaries.push(word, &stroke);
-            if self.settings.is_auto_switch {
-                self.auto_switch
-                    .dictionaries
-                    .trace_score(word, self.layout.as_deref());
-            }
         }
-        let is_first_space = key == KeyCode::KEY_SPACE && word.trailing_spaces == 1;
+        if (is_text || is_first_space) && self.settings.is_auto_switch {
+            self.auto_switch
+                .dictionaries
+                .trace_score(word, self.layout.as_deref(), is_first_space);
+        }
         if word.has_dead_key {
             self.pending.cancel_auto();
             if self.correction.is_active() {
@@ -634,18 +634,16 @@ impl Input {
                     .flatten()
                     .map(|target| (target, AutoSwitchKind::Regex))
                     .or_else(|| {
-                        if is_first_space || !self.settings.is_auto_switch {
+                        if !self.settings.is_auto_switch {
                             return None;
                         }
                         self.auto_switch
                             .dictionaries
-                            .target(word, layout)
+                            .target(word, layout, is_first_space)
                             .map(|target| (target, AutoSwitchKind::Dictionary))
                     })
             });
-        if target.is_some() || !is_first_space || !self.pending.is_dictionary() {
-            self.pending.update_auto(index, target);
-        }
+        self.pending.update_auto(index, target);
     }
 
     fn should_reset_for_key(&self, key: KeyCode, value: i32) -> bool {
@@ -2104,6 +2102,69 @@ patterns = ['^\.тф']
     }
 
     #[test]
+    fn dictionary_first_space_switches_a_complete_word_and_keeps_the_space() {
+        let mut input = auto_input_with_patterns("");
+        input.accept_layout(Some(layout("us")), false);
+        input.auto_switch.dictionaries = crate::dictionary::test_dictionaries([
+            ("us", "", "bkbfoo 1", 5.0),
+            ("ru", "", "или 1", 7.0),
+        ]);
+        for key in [KeyCode::KEY_B, KeyCode::KEY_K, KeyCode::KEY_B] {
+            press(&mut input, key);
+            statistics_event(&mut input, key, 0);
+            assert!(input.switch_request().is_none());
+        }
+
+        press(&mut input, KeyCode::KEY_SPACE);
+        statistics_event(&mut input, KeyCode::KEY_SPACE, 0);
+        let request = input.switch_request().unwrap();
+        assert_eq!(request.mode, crate::switcher::SwitchMode::Auto);
+        assert_eq!(request.target.unwrap().name(), "ru");
+        let word = request.word.unwrap();
+        assert_eq!(word.text().as_deref(), Ok("bkb"));
+        assert_eq!(word.trailing_spaces, 1);
+
+        input.pending.cancel_auto();
+        press(&mut input, KeyCode::KEY_SPACE);
+        assert!(input.switch_request().is_none());
+        assert_eq!(input.latest_word().unwrap().trailing_spaces, 2);
+    }
+
+    #[test]
+    fn dictionary_first_space_cancels_a_prefix_only_request() {
+        let mut input = auto_input_with_patterns("");
+        input.auto_switch.dictionaries = crate::dictionary::test_dictionaries([
+            ("us", "", "apple 1", 5.0),
+            ("ru", "", "я 1", 5.0),
+        ]);
+        press(&mut input, KeyCode::KEY_A);
+        assert!(input.pending.is_dictionary());
+
+        press(&mut input, KeyCode::KEY_SPACE);
+        assert!(input.switch_request().is_none());
+    }
+
+    #[test]
+    fn dictionary_backspace_after_first_space_restores_prefix_search() {
+        let mut input = auto_input_with_patterns("");
+        input.auto_switch.dictionaries = crate::dictionary::test_dictionaries([
+            ("us", "", "apple 1", 5.0),
+            ("ru", "", "я 1", 5.0),
+        ]);
+        for key in [KeyCode::KEY_A, KeyCode::KEY_SPACE, KeyCode::KEY_BACKSPACE] {
+            press(&mut input, key);
+            statistics_event(&mut input, key, 0);
+        }
+        assert!(input.switch_request().is_none());
+
+        press(&mut input, KeyCode::KEY_P);
+        assert!(input.pending.is_dictionary());
+        let word = input.latest_word().unwrap();
+        assert_eq!(word.trailing_spaces, 0);
+        assert_eq!(word.dictionary_prefixes[0].len(), 2);
+    }
+
+    #[test]
     fn first_space_refreshes_word_and_target_before_capture() {
         for (is_captured, pattern, expected) in [
             (true, "^A $", "gb"),
@@ -2122,7 +2183,7 @@ patterns = ['^\.тф']
                     .unwrap();
             // A distinct synthetic regex target makes a replaced request observable.
             input.auto_switch.dictionaries = crate::dictionary::test_dictionaries([
-                ("us", "", "apple 1", 5.0),
+                ("us", "", "a 1\napple 1", 5.0),
                 ("ru", "", "я 1", 5.0),
             ]);
             press(&mut input, KeyCode::KEY_LEFTSHIFT);
@@ -2150,6 +2211,12 @@ patterns = ['^\.тф']
             };
             let request = interception.take_request().unwrap();
             assert_eq!(request.target.unwrap().name(), expected);
+            let expected_mode = if expected == "gb" {
+                crate::switcher::SwitchMode::Pattern
+            } else {
+                crate::switcher::SwitchMode::Auto
+            };
+            assert_eq!(request.mode, expected_mode);
             let word = request.word.unwrap();
             assert_eq!(word.trailing_spaces, 1);
             assert!(word.entries[0].stroke.shift);
@@ -2273,7 +2340,7 @@ threshold = 7.0
     }
 
     #[test]
-    fn logs_dictionary_score_for_each_added_stroke() {
+    fn logs_dictionary_score_for_text_and_first_space() {
         let mut input = auto_input_with_patterns("");
         input.auto_switch.dictionaries = crate::dictionary::test_dictionaries([
             ("us", "", "a 53\nap 1\nc 1\nd 45", 5.0),
@@ -2282,14 +2349,18 @@ threshold = 7.0
 
         for (key, expected) in [
             (KeyCode::KEY_A, Some("+3.43")),
-            (KeyCode::KEY_P, Some("+0.00")),
+            (KeyCode::KEY_SPACE, Some("+3.73")),
             (KeyCode::KEY_SPACE, None),
             (KeyCode::KEY_BACKSPACE, None),
-            (KeyCode::KEY_SPACE, None),
+            (KeyCode::KEY_BACKSPACE, None),
+            (KeyCode::KEY_P, Some("+0.00")),
+            (KeyCode::KEY_SPACE, Some("+0.00")),
+            (KeyCode::KEY_BACKSPACE, None),
+            (KeyCode::KEY_SPACE, Some("+0.00")),
             (KeyCode::KEY_B, Some("-inf")),
-            (KeyCode::KEY_SPACE, None),
+            (KeyCode::KEY_SPACE, Some("-inf")),
             (KeyCode::KEY_C, Some("+inf")),
-            (KeyCode::KEY_SPACE, None),
+            (KeyCode::KEY_SPACE, Some("+inf")),
             (KeyCode::KEY_X, Some("unavailable")),
         ] {
             let (_, messages) = crate::test_logging::capture(|| press(&mut input, key));

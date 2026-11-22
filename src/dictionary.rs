@@ -10,6 +10,7 @@ use crate::layout::Layout;
 use crate::word::{Stroke, Word};
 
 pub(crate) const DICTIONARY_COUNT: usize = 2;
+const WORD_END: &str = " ";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Prefix {
@@ -78,7 +79,7 @@ impl DictionaryTrie {
                 .take_while(|(a, b)| a == b)
                 .count();
             path.truncate(shared + 1);
-            for (index, character) in word.chars().enumerate() {
+            for (index, character) in word.chars().chain(WORD_END.chars()).enumerate() {
                 if index >= shared {
                     let parent = *path.last().unwrap();
                     let child = nodes.len();
@@ -229,19 +230,30 @@ impl DictionaryAutoSwitch {
         }
     }
 
-    fn probability(&self, word: &Word, index: usize) -> Option<f64> {
+    fn probability(&self, word: &Word, index: usize, is_first_space: bool) -> Option<f64> {
         let prefix = *word.dictionary_prefixes.get(index)?.last()?;
-        self.dictionaries[index].trie.probability(prefix)
+        let trie = &self.dictionaries[index].trie;
+        let prefix = if is_first_space {
+            trie.advance(prefix, WORD_END)
+        } else {
+            prefix
+        };
+        trie.probability(prefix)
     }
 
-    fn comparison(&self, word: &Word, current: &Layout) -> Option<(&Dictionary, f64)> {
+    fn comparison(
+        &self,
+        word: &Word,
+        current: &Layout,
+        is_first_space: bool,
+    ) -> Option<(&Dictionary, f64)> {
         let current_index = self
             .dictionaries
             .iter()
             .position(|dictionary| dictionary.target.name() == current.name())?;
         let alternative_index = 1 - current_index;
-        let current = self.probability(word, current_index)?;
-        let alternative = self.probability(word, alternative_index)?;
+        let current = self.probability(word, current_index, is_first_space)?;
+        let alternative = self.probability(word, alternative_index, is_first_space)?;
         if current == 0.0 && alternative == 0.0 {
             return None;
         }
@@ -249,16 +261,21 @@ impl DictionaryAutoSwitch {
         Some((&self.dictionaries[alternative_index], score))
     }
 
-    pub(crate) fn target(&self, word: &Word, current: &Layout) -> Option<Arc<Layout>> {
-        let (alternative, score) = self.comparison(word, current)?;
+    pub(crate) fn target(
+        &self,
+        word: &Word,
+        current: &Layout,
+        is_first_space: bool,
+    ) -> Option<Arc<Layout>> {
+        let (alternative, score) = self.comparison(word, current, is_first_space)?;
         (score > alternative.threshold).then(|| alternative.target.clone())
     }
 
-    pub(crate) fn trace_score(&self, word: &Word, current: Option<&Layout>) {
+    pub(crate) fn trace_score(&self, word: &Word, current: Option<&Layout>, is_first_space: bool) {
         if self.dictionaries.is_empty() || !log::log_enabled!(log::Level::Trace) {
             return;
         }
-        match current.and_then(|layout| self.comparison(word, layout)) {
+        match current.and_then(|layout| self.comparison(word, layout, is_first_space)) {
             Some((_, score)) => log::trace!("dict switch score: {score:+.2}"),
             None => log::trace!("dict switch score: unavailable"),
         }
@@ -433,6 +450,17 @@ mod tests {
     }
 
     #[test]
+    fn terminal_space_matches_only_the_complete_word() {
+        let trie = trie("cat 2\ncats 6\ndog 8");
+        let prefix = trie.advance(Prefix::Node(0), "cat");
+        assert_eq!(trie.probability(prefix), Some(0.5));
+        assert_eq!(
+            trie.probability(trie.advance(prefix, WORD_END)),
+            Some(0.125)
+        );
+    }
+
+    #[test]
     fn score_grows_as_both_prefix_frequencies_fall() {
         let dictionaries = test_dictionaries([
             ("us", "", "a 128\nap 128", 5.0),
@@ -446,10 +474,10 @@ mod tests {
         ] {
             dictionaries.push(&mut word, &Stroke { key, shift: false });
             assert_eq!(
-                dictionaries.comparison(&word, &current).unwrap().1,
+                dictionaries.comparison(&word, &current, false).unwrap().1,
                 expected_score
             );
-            let target = dictionaries.target(&word, &current);
+            let target = dictionaries.target(&word, &current, false);
             assert_eq!(target.as_deref().map(Layout::name), expected_target);
         }
     }
@@ -477,7 +505,7 @@ mod tests {
                 ]);
                 let mut word = Word::default();
                 dictionaries.push(&mut word, &Stroke { key, shift: true });
-                let target = dictionaries.target(&word, &Layout::new(source, "", "", ""));
+                let target = dictionaries.target(&word, &Layout::new(source, "", "", ""), false);
                 assert_eq!(target.as_deref().map(Layout::name), expected);
             }
         }
@@ -497,12 +525,39 @@ mod tests {
             dictionaries.push(&mut word, &Stroke { key, shift: false });
             assert_eq!(
                 dictionaries
-                    .comparison(&word, &current)
+                    .comparison(&word, &current, false)
                     .map(|(_, score)| score),
                 expected_score
             );
-            let target = dictionaries.target(&word, &current);
+            let target = dictionaries.target(&word, &current, false);
             assert_eq!(target.as_deref().map(Layout::name), expected_target);
+        }
+    }
+
+    #[test]
+    fn first_space_scores_complete_words_without_changing_cached_prefixes() {
+        let dictionaries = test_dictionaries([
+            ("us", "", "a 8\nap 1\nbp 2\nc 8\nd 13", 3.0),
+            ("ru", "", "ф 1\nфз 8\nиз 2\nсз 8\nя 13", 3.0),
+        ]);
+        let current = Layout::new("ru", "", "", "");
+        for (key, expected_score, expected_target) in [
+            (KeyCode::KEY_A, Some(3.0), None),
+            (KeyCode::KEY_B, None, None),
+            (KeyCode::KEY_C, Some(f64::INFINITY), Some("us")),
+        ] {
+            let mut word = Word::default();
+            dictionaries.push(&mut word, &Stroke { key, shift: false });
+            let prefixes = word.dictionary_prefixes.clone();
+            let prefix_score = dictionaries.comparison(&word, &current, false).unwrap().1;
+            assert_eq!(prefix_score, 0.0);
+            let score = dictionaries
+                .comparison(&word, &current, true)
+                .map(|(_, score)| score);
+            assert_eq!(score, expected_score);
+            let target = dictionaries.target(&word, &current, true);
+            assert_eq!(target.as_deref().map(Layout::name), expected_target);
+            assert_eq!(word.dictionary_prefixes, prefixes);
         }
     }
 

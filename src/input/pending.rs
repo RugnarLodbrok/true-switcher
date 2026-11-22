@@ -47,6 +47,7 @@ impl PendingSwitch {
     pub(super) fn is_auto(&self) -> bool {
         matches!(self, Self::Auto { .. })
     }
+    #[cfg(test)]
     pub(super) fn is_dictionary(&self) -> bool {
         matches!(
             self,
