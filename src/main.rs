@@ -7,6 +7,7 @@ mod input;
 mod input_events;
 mod kde;
 mod layout;
+mod learned_rules;
 mod lifecycle;
 pub mod output;
 mod sound;
@@ -77,7 +78,9 @@ fn prepare_configuration() -> Result<
     String,
 > {
     config::load().and_then(|(config, file)| {
-        switch_rules::AutoSwitchRules::new(&config)
+        let learned = learned_rules::LearnedRules::load(file.learned_rules_path())
+            .map_err(|error| format!("Configuration: {error}"))?;
+        switch_rules::AutoSwitchRules::new(&config, learned)
             .map(|auto_switch| (config, file, auto_switch))
             .map_err(|error| format!("Configuration: {error}"))
     })

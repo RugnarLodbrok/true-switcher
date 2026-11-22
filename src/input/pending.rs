@@ -15,6 +15,7 @@ pub(super) enum PendingSwitch {
     Manual {
         source: usize,
         is_original_key_held: bool,
+        is_learning: bool,
     },
     Auto {
         source: usize,
@@ -24,10 +25,11 @@ pub(super) enum PendingSwitch {
 }
 
 impl PendingSwitch {
-    pub(super) fn manual(source: usize) -> Self {
+    pub(super) fn manual(source: usize, is_learning: bool) -> Self {
         Self::Manual {
             source,
             is_original_key_held: true,
+            is_learning,
         }
     }
 

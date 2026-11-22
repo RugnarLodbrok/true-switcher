@@ -1,26 +1,19 @@
 use std::collections::HashSet;
 use std::io::{self, BufRead, BufReader};
 use std::ops::Range;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use regex::Regex;
 
 use crate::config::Configuration;
 use crate::layout::Layout;
-use crate::word::{Stroke, Word};
+use crate::word::{Stroke, WORD_END, Word};
 
 pub(crate) const DICTIONARY_COUNT: usize = 2;
-const WORD_END: &str = " ";
-static PUNCTUATION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\A[\p{P}\x{0060}]\z").unwrap());
 
-fn is_repeated_punctuation(word: &Word, current: &Layout) -> bool {
-    let mut strokes = word.strokes();
-    let Some(first) = strokes.next() else {
-        return false;
-    };
-    strokes.all(|stroke| stroke == first)
-        && crate::xkb::stroke_text(current, first).is_ok_and(|text| PUNCTUATION.is_match(&text))
-}
+// Give learned-only matches the weight of a rare token (about 1 in 262,000).
+// A fixed log2 probability keeps this weight independent of dictionary frequency units.
+const LEARNED_BASE_SCORE: f64 = -18.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Prefix {
@@ -29,8 +22,8 @@ pub(crate) enum Prefix {
     ConversionFailed,
 }
 
-struct Node {
-    frequency: u64,
+struct Node<T> {
+    value: T,
     transitions: Range<usize>,
 }
 
@@ -40,7 +33,7 @@ struct Transition {
 }
 
 struct DictionaryTrie {
-    nodes: Vec<Node>,
+    nodes: Vec<Node<f64>>,
     transitions: Vec<Transition>,
 }
 
@@ -76,7 +69,7 @@ impl DictionaryTrie {
 
     fn build(records: Vec<(String, u64)>, total: u64) -> Self {
         let mut nodes = vec![Node {
-            frequency: total,
+            value: total,
             transitions: 0..0,
         }];
         let mut edges = Vec::new();
@@ -94,13 +87,13 @@ impl DictionaryTrie {
                     let parent = *path.last().unwrap();
                     let child = nodes.len();
                     nodes.push(Node {
-                        frequency: 0,
+                        value: 0,
                         transitions: 0..0,
                     });
                     edges.push((parent, character, child));
                     path.push(child);
                 }
-                nodes[path[index + 1]].frequency += frequency;
+                nodes[path[index + 1]].value += frequency;
             }
             previous = word;
         }
@@ -114,6 +107,13 @@ impl DictionaryTrie {
             transitions.push(Transition { character, child });
             range.end = transitions.len();
         }
+        let nodes = nodes
+            .into_iter()
+            .map(|node| Node {
+                value: (node.value as f64 / total as f64).log2(),
+                transitions: node.transitions,
+            })
+            .collect();
         Self { nodes, transitions }
     }
 
@@ -132,12 +132,10 @@ impl DictionaryTrie {
         Prefix::Node(node)
     }
 
-    fn probability(&self, prefix: Prefix) -> Option<f64> {
+    fn score(&self, prefix: Prefix) -> Option<f64> {
         match prefix {
-            Prefix::Node(index) => {
-                Some(self.nodes[index].frequency as f64 / self.nodes[0].frequency as f64)
-            }
-            Prefix::Missing => Some(0.0),
+            Prefix::Node(index) => Some(self.nodes[index].value),
+            Prefix::Missing => Some(f64::NEG_INFINITY),
             Prefix::ConversionFailed => None,
         }
     }
@@ -157,11 +155,11 @@ fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
-fn compile_skip_pattern(pattern: &str) -> io::Result<Option<Regex>> {
+fn compile_full_match_pattern(pattern: &str, setting: &str) -> io::Result<Option<Regex>> {
     if pattern.is_empty() {
         return Ok(None);
     }
-    let invalid_pattern = |error| invalid(format!("Invalid dict_skip_pattern: {error}"));
+    let invalid_pattern = |error| invalid(format!("Invalid {setting}: {error}"));
     Regex::new(pattern).map_err(invalid_pattern)?; // Reject unmatched groups before wrapping.
     // The newline terminates a trailing verbose-mode comment and is ignored otherwise.
     Regex::new(&format!("\\A(?:{pattern}(?x)\n)\\z"))
@@ -178,6 +176,8 @@ struct Dictionary {
 #[derive(Default)]
 pub(crate) struct DictionaryAutoSwitch {
     dictionaries: Vec<Dictionary>,
+    block_pattern: Option<Regex>,
+    pub(crate) learned: crate::learned_rules::LearnedRules,
 }
 
 impl DictionaryAutoSwitch {
@@ -194,7 +194,10 @@ impl DictionaryAutoSwitch {
                 "Dictionary auto-switch supports at most two KDE layouts",
             ));
         }
-        let skip_pattern = compile_skip_pattern(&settings.dict_skip_pattern)?;
+        let skip_pattern =
+            compile_full_match_pattern(&settings.dict_skip_pattern, "dict_skip_pattern")?;
+        let block_pattern =
+            compile_full_match_pattern(&settings.dict_block_pattern, "dict_block_pattern")?;
         let mut targets = HashSet::new();
         let mut dictionaries = Vec::new();
         for setting in &settings.dict {
@@ -220,7 +223,11 @@ impl DictionaryAutoSwitch {
                 threshold: setting.threshold,
             });
         }
-        Ok(Self { dictionaries })
+        Ok(Self {
+            dictionaries,
+            block_pattern,
+            ..Self::default()
+        })
     }
 
     pub(crate) fn push(&self, word: &mut Word, stroke: &Stroke) {
@@ -240,15 +247,23 @@ impl DictionaryAutoSwitch {
         }
     }
 
-    fn probability(&self, word: &Word, index: usize, is_first_space: bool) -> Option<f64> {
+    fn layout_score(&self, word: &Word, index: usize, is_first_space: bool) -> Option<(f64, u128)> {
+        let dictionary = &self.dictionaries[index];
         let prefix = *word.dictionary_prefixes.get(index)?.last()?;
-        let trie = &self.dictionaries[index].trie;
+        let trie = &dictionary.trie;
         let prefix = if is_first_space {
             trie.advance(prefix, WORD_END)
         } else {
             prefix
         };
-        trie.probability(prefix)
+        let score = trie.score(prefix)?;
+        let learned = self.learned.count(&dictionary.target, word, is_first_space);
+        let score = if score == f64::NEG_INFINITY && learned > 0 {
+            LEARNED_BASE_SCORE
+        } else {
+            score
+        };
+        Some((score, learned))
     }
 
     fn comparison(
@@ -262,12 +277,19 @@ impl DictionaryAutoSwitch {
             .iter()
             .position(|dictionary| dictionary.target.name() == current.name())?;
         let alternative_index = 1 - current_index;
-        let current = self.probability(word, current_index, is_first_space)?;
-        let alternative = self.probability(word, alternative_index, is_first_space)?;
-        if current == 0.0 && alternative == 0.0 {
-            return None;
-        }
-        let score = (alternative / current).log2();
+        let (current, learned_current) = self.layout_score(word, current_index, is_first_space)?;
+        let (alternative, learned_alternative) =
+            self.layout_score(word, alternative_index, is_first_space)?;
+        let score = if current == f64::NEG_INFINITY && alternative == f64::NEG_INFINITY {
+            0.0
+        } else {
+            let learned_delta = if learned_alternative >= learned_current {
+                (learned_alternative - learned_current) as f64
+            } else {
+                -((learned_current - learned_alternative) as f64)
+            };
+            alternative - current + learned_delta
+        };
         Some((&self.dictionaries[alternative_index], score))
     }
 
@@ -278,8 +300,13 @@ impl DictionaryAutoSwitch {
         is_first_space: bool,
     ) -> Option<Arc<Layout>> {
         let (alternative, score) = self.comparison(word, current, is_first_space)?;
-        (score > alternative.threshold && !is_repeated_punctuation(word, current))
-            .then(|| alternative.target.clone())
+        let target = (score > alternative.threshold).then_some(&alternative.target)?;
+        let is_blocked = self.block_pattern.as_ref().is_some_and(|pattern| {
+            current
+                .to_text(word.strokes())
+                .is_ok_and(|text| pattern.is_match(&text))
+        });
+        (!is_blocked).then(|| target.clone())
     }
 
     pub(crate) fn trace_score(&self, word: &Word, current: Option<&Layout>, is_first_space: bool) {
@@ -306,6 +333,12 @@ pub(crate) fn test_dictionaries(
                 threshold,
             })
             .collect(),
+        block_pattern: compile_full_match_pattern(
+            crate::config::DEFAULT_DICT_BLOCK_PATTERN,
+            "dict_block_pattern",
+        )
+        .unwrap(),
+        ..Default::default()
     }
 }
 
@@ -326,11 +359,17 @@ mod tests {
         ] {
             let trie = trie(records);
             let root = Prefix::Node(0);
-            assert_eq!(trie.probability(trie.advance(root, "КО")), Some(0.5));
-            assert_eq!(trie.probability(trie.advance(root, "кот")), Some(0.5));
-            assert_eq!(trie.probability(trie.advance(root, "коты")), Some(0.375));
-            assert_eq!(trie.probability(trie.advance(root, "AL")), Some(0.25));
-            assert_eq!(trie.probability(trie.advance(root, "кот#")), Some(0.0));
+            assert_eq!(trie.score(trie.advance(root, "КО")), Some(-1.0));
+            assert_eq!(trie.score(trie.advance(root, "кот")), Some(-1.0));
+            assert_eq!(
+                trie.score(trie.advance(root, "коты")),
+                Some(0.375_f64.log2())
+            );
+            assert_eq!(trie.score(trie.advance(root, "AL")), Some(-2.0));
+            assert_eq!(
+                trie.score(trie.advance(root, "кот#")),
+                Some(f64::NEG_INFINITY)
+            );
             for node in &trie.nodes {
                 assert!(
                     trie.transitions[node.transitions.clone()]
@@ -344,19 +383,21 @@ mod tests {
     #[test]
     fn loads_capitalized_words_without_a_skip_pattern() {
         let trie = trie("abc1 5\nApple 10\n");
-        assert_eq!(trie.nodes[0].frequency, 15);
+        assert_eq!(
+            trie.score(trie.advance(Prefix::Node(0), "abc1 ")),
+            Some((5.0_f64 / 15.0).log2())
+        );
         assert_eq!(trie.transitions[0].character, 'A');
     }
 
     #[test]
     fn skips_matching_uppercase_words_before_calculating_the_total() {
-        let pattern = compile_skip_pattern(r".*\p{Lu}.*").unwrap();
+        let pattern = compile_full_match_pattern(r".*\p{Lu}.*", "dict_skip_pattern").unwrap();
         let records = "cat 2\nCat 18446744073709551615\ncoDe 4\nКОТ 3\nмир 6\n";
         let trie = DictionaryTrie::read(records.as_bytes(), pattern.as_ref()).unwrap();
         let root = Prefix::Node(0);
-        assert_eq!(trie.nodes[0].frequency, 8);
-        assert_eq!(trie.probability(trie.advance(root, "CAT")), Some(0.25));
-        assert_eq!(trie.probability(trie.advance(root, "мир")), Some(0.75));
+        assert_eq!(trie.score(trie.advance(root, "CAT")), Some(-2.0));
+        assert_eq!(trie.score(trie.advance(root, "мир")), Some(0.75_f64.log2()));
         assert_eq!(trie.advance(root, "code"), Prefix::Missing);
         assert_eq!(trie.advance(root, "кот"), Prefix::Missing);
     }
@@ -382,20 +423,44 @@ mod tests {
 
     #[test]
     fn matches_the_whole_word_field() {
-        for (pattern, records, total) in [
-            ("cat", "cat 10\nbobcat 5\ncatfish 1\n", 6),
-            ("cat|cats", "cat 10\ncats 1\nbobcat 5\n", 5),
-            ("(?x)cat # comment", "cat 10\nbobcat 5\n", 5),
-            ("^10$", "10 2\napple 10\n", 10),
+        for (pattern, records, retained, probability, skipped) in [
+            (
+                "cat",
+                "cat 10\nbobcat 5\ncatfish 1\n",
+                "bobcat ",
+                5.0 / 6.0,
+                "cat ",
+            ),
+            (
+                "cat|cats",
+                "cat 10\ncats 1\nbobcat 5\n",
+                "bobcat ",
+                1.0,
+                "cats ",
+            ),
+            (
+                "(?x)cat # comment",
+                "cat 10\nbobcat 5\n",
+                "bobcat ",
+                1.0,
+                "cat ",
+            ),
+            ("^10$", "10 2\napple 10\n", "apple ", 1.0_f64, "10 "),
         ] {
-            let skip_pattern = compile_skip_pattern(pattern).unwrap();
+            let skip_pattern = compile_full_match_pattern(pattern, "dict_skip_pattern").unwrap();
             let trie = DictionaryTrie::read(records.as_bytes(), skip_pattern.as_ref()).unwrap();
-            assert_eq!(trie.nodes[0].frequency, total, "{pattern:?}");
+            let root = Prefix::Node(0);
+            assert_eq!(trie.advance(root, skipped), Prefix::Missing, "{pattern:?}");
+            assert_eq!(
+                trie.score(trie.advance(root, retained)),
+                Some(probability.log2()),
+                "{pattern:?}"
+            );
         }
     }
 
-    fn load_dictionaries_with_filter(
-        pattern: &str,
+    fn load_dictionaries_with_settings(
+        settings: &str,
         us_records: &str,
         ru_records: &str,
     ) -> io::Result<DictionaryAutoSwitch> {
@@ -405,7 +470,7 @@ mod tests {
         std::fs::write(&us, us_records).unwrap();
         std::fs::write(&ru, ru_records).unwrap();
         let config = crate::config::from_contents(&format!(
-            "switch_key = 'KEY_PAUSE'\nauto_switch = false\ndict_skip_pattern = '{pattern}'\n\
+            "switch_key = 'KEY_PAUSE'\nauto_switch = false\n{settings}\n\
              [[dict]]\ntarget = 'us'\nfile = {us:?}\nthreshold = 5.0\n\
              [[dict]]\ntarget = 'ru'\nfile = {ru:?}\nthreshold = 7.0\n"
         ))
@@ -419,20 +484,23 @@ mod tests {
 
     #[test]
     fn filters_both_dictionaries_when_loading_configuration() {
-        let dictionaries = load_dictionaries_with_filter(
-            ".*[0-9].*",
+        let dictionaries = load_dictionaries_with_settings(
+            "dict_skip_pattern = '.*[0-9].*'",
             "abc1 100\napple 10\n",
             "абв2 200\nабрикос 20\n",
         )
         .unwrap();
-        for (dictionary, skipped, total) in [
-            (&dictionaries.dictionaries[0], "abc1", 10),
-            (&dictionaries.dictionaries[1], "абв2", 20),
+        for (dictionary, skipped, retained) in [
+            (&dictionaries.dictionaries[0], "abc1", "apple "),
+            (&dictionaries.dictionaries[1], "абв2", "абрикос "),
         ] {
-            assert_eq!(dictionary.trie.nodes[0].frequency, total);
+            let root = Prefix::Node(0);
+            assert_eq!(dictionary.trie.advance(root, skipped), Prefix::Missing);
             assert_eq!(
-                dictionary.trie.advance(Prefix::Node(0), skipped),
-                Prefix::Missing
+                dictionary
+                    .trie
+                    .score(dictionary.trie.advance(root, retained)),
+                Some(0.0)
             );
         }
     }
@@ -453,10 +521,76 @@ mod tests {
                 "ru.txt: Invalid dictionary record on line 1",
             ),
         ] {
-            let error = load_dictionaries_with_filter(pattern, "cat 1", records)
-                .err()
-                .expect("dictionary configuration should fail");
+            let error = load_dictionaries_with_settings(
+                &format!("dict_skip_pattern = '{pattern}'"),
+                "cat 1",
+                records,
+            )
+            .err()
+            .expect("dictionary configuration should fail");
             assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn loads_dictionary_block_patterns_from_configuration() {
+        for (settings, expected) in [
+            ("", [true, true, false]),
+            (r"dict_block_pattern = '[./\\]+'", [true, false, false]),
+            ("dict_block_pattern = ''", [false, false, false]),
+        ] {
+            let dictionaries = load_dictionaries_with_settings(settings, "cat 1", "кот 1").unwrap();
+            for (token, matches) in ["../", "!?", "v1.2"].into_iter().zip(expected) {
+                assert_eq!(
+                    dictionaries
+                        .block_pattern
+                        .as_ref()
+                        .is_some_and(|regex| regex.is_match(token)),
+                    matches,
+                    "{settings}: {token:?}"
+                );
+            }
+        }
+        let error = load_dictionaries_with_settings("dict_block_pattern = '['", "cat 1", "кот 1")
+            .err()
+            .expect("invalid block pattern should fail to load");
+        assert!(
+            error.to_string().contains("Invalid dict_block_pattern"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn custom_or_empty_block_pattern_allows_mixed_punctuation_outside_the_pattern() {
+        use crate::word::WordStroke;
+
+        let current = Layout::new("us", "", "", "");
+        for (settings, should_switch) in [
+            ("", false),
+            (r"dict_block_pattern = '[./\\]+'", true),
+            ("dict_block_pattern = ''", true),
+        ] {
+            let dictionaries = load_dictionaries_with_settings(settings, "cat 1", "ёж 1").unwrap();
+            let mut word = Word::default();
+            for key in [KeyCode::KEY_GRAVE, KeyCode::KEY_SEMICOLON] {
+                let stroke = Stroke { key, shift: false };
+                word.entries.push(WordStroke {
+                    stroke,
+                    layout: None,
+                });
+                dictionaries.push(&mut word, &stroke);
+            }
+            for is_first_space in [false, true] {
+                word.trailing_spaces = usize::from(is_first_space);
+                assert_eq!(
+                    dictionaries
+                        .target(&word, &current, is_first_space)
+                        .as_deref()
+                        .map(Layout::name),
+                    should_switch.then_some("ru"),
+                    "{settings}, first space: {is_first_space}"
+                );
+            }
         }
     }
 
@@ -464,11 +598,8 @@ mod tests {
     fn terminal_space_matches_only_the_complete_word() {
         let trie = trie("cat 2\ncats 6\ndog 8");
         let prefix = trie.advance(Prefix::Node(0), "cat");
-        assert_eq!(trie.probability(prefix), Some(0.5));
-        assert_eq!(
-            trie.probability(trie.advance(prefix, WORD_END)),
-            Some(0.125)
-        );
+        assert_eq!(trie.score(prefix), Some(-1.0));
+        assert_eq!(trie.score(trie.advance(prefix, WORD_END)), Some(-3.0));
     }
 
     #[test]
@@ -530,7 +661,7 @@ mod tests {
         for (key, expected_score, expected_target) in [
             (KeyCode::KEY_A, Some(f64::INFINITY), Some("us")),
             (KeyCode::KEY_B, Some(f64::NEG_INFINITY), None),
-            (KeyCode::KEY_X, None, None),
+            (KeyCode::KEY_X, Some(0.0), None),
         ] {
             let mut word = Word::default();
             dictionaries.push(&mut word, &Stroke { key, shift: false });
@@ -554,7 +685,7 @@ mod tests {
         let current = Layout::new("ru", "", "", "");
         for (key, expected_score, expected_target) in [
             (KeyCode::KEY_A, Some(3.0), None),
-            (KeyCode::KEY_B, None, None),
+            (KeyCode::KEY_B, Some(0.0), None),
             (KeyCode::KEY_C, Some(f64::INFINITY), Some("us")),
         ] {
             let mut word = Word::default();
@@ -569,6 +700,65 @@ mod tests {
             let target = dictionaries.target(&word, &current, true);
             assert_eq!(target.as_deref().map(Layout::name), expected_target);
             assert_eq!(word.dictionary_prefixes, prefixes);
+        }
+    }
+
+    #[test]
+    fn learning_assigns_a_baseline_and_moves_the_same_word_in_both_directions() {
+        use crate::word::WordStroke;
+
+        let us = Layout::new("us", "", "", "");
+        let ru = Layout::new("ru", "", "", "");
+        let stroke = Stroke {
+            key: KeyCode::KEY_A,
+            shift: false,
+        };
+        let original_word = Word {
+            entries: vec![WordStroke {
+                stroke,
+                layout: None,
+            }],
+            ..Word::default()
+        };
+        for scale in [1, 10] {
+            let mut dictionaries = test_dictionaries([
+                ("us", "", &format!("a {scale}\nb {}", 65_535 * scale), 2.0),
+                ("ru", "", &format!("я {}\nф 0", 8 * scale), 2.0),
+            ]);
+            let mut word = original_word.clone();
+            dictionaries.push(&mut word, &stroke);
+            assert_eq!(
+                dictionaries.comparison(&word, &ru, false).unwrap().1,
+                f64::INFINITY
+            );
+
+            dictionaries.learned.increment("ru", "ф").unwrap();
+            for is_first_space in [false, true] {
+                assert_eq!(
+                    dictionaries.layout_score(&word, 1, is_first_space),
+                    Some((-18.0, 1))
+                );
+                assert_eq!(
+                    dictionaries
+                        .comparison(&word, &ru, is_first_space)
+                        .unwrap()
+                        .1,
+                    1.0
+                );
+                assert_eq!(
+                    dictionaries
+                        .comparison(&word, &us, is_first_space)
+                        .unwrap()
+                        .1,
+                    -1.0
+                );
+                assert!(dictionaries.target(&word, &ru, is_first_space).is_none());
+            }
+
+            dictionaries.learned.increment("us", "a").unwrap();
+            dictionaries.learned.increment("us", "a").unwrap();
+            assert_eq!(dictionaries.comparison(&word, &ru, true).unwrap().1, 3.0);
+            assert_eq!(dictionaries.target(&word, &ru, true).unwrap().name(), "us");
         }
     }
 

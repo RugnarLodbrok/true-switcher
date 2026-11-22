@@ -11,6 +11,7 @@ use toml_edit::DocumentMut;
 const CONFIG_DIRECTORY: &str = ".config/true-switcher";
 const CONFIG_FILE: &str = "config.toml";
 const LOG_LEVEL_KEY: &str = "log_level";
+pub(crate) const DEFAULT_DICT_BLOCK_PATTERN: &str = r"[\p{P}\x{0060}]+";
 pub(crate) const LOG_LEVELS: [(&str, log::LevelFilter); 6] = [
     ("off", log::LevelFilter::Off),
     ("error", log::LevelFilter::Error),
@@ -41,6 +42,8 @@ pub struct Configuration {
     pub switch_rules: Vec<SwitchRule>,
     #[serde(default)]
     pub dict_skip_pattern: String,
+    #[serde(default = "default_dict_block_pattern")]
+    pub dict_block_pattern: String,
     #[serde(default)]
     pub dict: Vec<DictionarySettings>,
 }
@@ -108,6 +111,10 @@ fn default_log_level() -> log::LevelFilter {
     log::LevelFilter::Info
 }
 
+fn default_dict_block_pattern() -> String {
+    DEFAULT_DICT_BLOCK_PATTERN.to_owned()
+}
+
 fn deserialize_log_level<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<log::LevelFilter, D::Error> {
@@ -133,6 +140,10 @@ pub(crate) struct ConfigurationFile {
 }
 
 impl ConfigurationFile {
+    pub(crate) fn learned_rules_path(&self) -> PathBuf {
+        self.path.with_file_name(crate::learned_rules::FILE_NAME)
+    }
+
     pub(crate) fn save(
         &self,
         settings: RuntimeSettings,

@@ -17,13 +17,17 @@ pub struct AutoSwitchRules {
 }
 
 impl AutoSwitchRules {
-    pub fn new(settings: &Configuration) -> io::Result<Self> {
+    pub fn new(
+        settings: &Configuration,
+        learned: crate::learned_rules::LearnedRules,
+    ) -> io::Result<Self> {
         let mut rules = Self::compile(settings, crate::kde::target_layout)?;
         rules.dictionaries = crate::dictionary::DictionaryAutoSwitch::load(
             settings,
             crate::kde::target_layout,
             crate::kde::layout_count,
         )?;
+        rules.dictionaries.learned = learned;
         Ok(rules)
     }
 
@@ -54,18 +58,33 @@ impl AutoSwitchRules {
             if rule.target.name() == current.name() {
                 return None;
             }
-            let text = conversions.entry(rule.target.as_ref()).or_insert_with(|| {
-                rule.target.to_text(word.strokes()).map(|mut text| {
-                    if word.trailing_spaces > 0 {
-                        text.push(' ');
-                    }
-                    text
-                })
-            });
+            let text = conversions
+                .entry(rule.target.as_ref())
+                .or_insert_with(|| Self::pattern_text(word, &rule.target));
             rule.patterns
                 .is_match(text.as_ref().ok()?)
                 .then(|| rule.target.clone())
         })
+    }
+
+    pub(crate) fn matches_current(&self, word: &Word, current: &Layout) -> bool {
+        let mut text = None;
+        self.rules
+            .iter()
+            .filter(|rule| rule.target.name() == current.name())
+            .any(|rule| {
+                text.get_or_insert_with(|| Self::pattern_text(word, current))
+                    .as_ref()
+                    .is_ok_and(|text| rule.patterns.is_match(text))
+            })
+    }
+
+    fn pattern_text(word: &Word, layout: &Layout) -> Result<String, crate::xkb::ConversionError> {
+        let mut text = layout.to_text(word.strokes())?;
+        if word.trailing_spaces > 0 {
+            text.push(' ');
+        }
+        Ok(text)
     }
 }
 
@@ -190,5 +209,25 @@ mod tests {
         assert_eq!(rules.target(&word, &current).unwrap().name(), "us");
         word.trailing_spaces = 3;
         assert_eq!(rules.target(&word, &current).unwrap().name(), "us");
+    }
+
+    #[test]
+    fn matches_current_layout_rules_with_the_same_trailing_space_as_forward_rules() {
+        let settings = parse_config(
+            "pattern_switch = true\n[[switch_rules]]\ntarget = 'gb'\npatterns = ['^a$']\n\
+             [[switch_rules]]\ntarget = 'us'\npatterns = ['^z $']\n\
+             [[switch_rules]]\ntarget = 'us'\npatterns = ['^a $']",
+        )
+        .unwrap();
+        let rules = AutoSwitchRules::compile(&settings, resolve).unwrap();
+        let current = resolve("us").unwrap();
+        let mut word = word(&[KeyCode::KEY_A]);
+        assert!(!rules.matches_current(&word, &current));
+        assert_eq!(rules.target(&word, &current).unwrap().name(), "gb");
+
+        word.trailing_spaces = 1;
+        assert!(rules.matches_current(&word, &current));
+        assert!(!rules.matches_current(&word, &resolve("gb").unwrap()));
+        assert!(rules.target(&word, &current).is_none());
     }
 }

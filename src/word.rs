@@ -2,6 +2,8 @@ use evdev::KeyCode;
 use std::fmt;
 use std::sync::Arc;
 
+pub(crate) const WORD_END: &str = " ";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Stroke {
     pub key: KeyCode,

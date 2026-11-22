@@ -21,6 +21,7 @@ struct Correction {
     target: Option<Arc<layout::Layout>>,
     mode: SwitchMode,
     is_sound_enabled: bool,
+    is_learning: bool,
 }
 
 impl Correction {
@@ -30,6 +31,7 @@ impl Correction {
             word: request.word,
             target: request.target,
             mode: request.mode,
+            is_learning: request.is_learning,
             is_sound_enabled: match request.mode {
                 SwitchMode::Pattern | SwitchMode::Auto => settings.is_auto_switch_sound,
                 SwitchMode::Manual => settings.is_manual_switch_sound,
@@ -48,6 +50,39 @@ impl Correction {
                 .chain((word.trailing_spaces > 0).then_some(&space));
             crate::xkb::has_dead_key(layout, strokes) == Ok(true)
         })
+    }
+
+    fn learned_word(
+        &self,
+        outcome: &CorrectionOutcome,
+        layout: &layout::Layout,
+    ) -> Result<Option<String>, crate::xkb::ConversionError> {
+        if !self.is_learning || *outcome != CorrectionOutcome::Completed {
+            return Ok(None);
+        }
+        let Some(word) = &self.word else {
+            return Ok(None);
+        };
+        let mut text = layout.to_text(word.strokes())?;
+        text.truncate(text.trim_end_matches(' ').len());
+        Ok((!text.is_empty()).then_some(text))
+    }
+
+    fn remember(
+        &self,
+        input: &mut input::Input,
+        outcome: &CorrectionOutcome,
+        target: &layout::Layout,
+    ) {
+        match self.learned_word(outcome, target) {
+            Ok(Some(text)) => {
+                if let Err(error) = input.remember_word(target.name(), &text) {
+                    log::warn!("Cannot save learned correction: {error}");
+                }
+            }
+            Ok(None) => {}
+            Err(error) => log::warn!("Cannot convert learned correction: {error}"),
+        }
     }
 }
 
@@ -112,7 +147,7 @@ impl Switcher {
         interception: &mut dyn input::CorrectionInterceptor,
         correction: &Correction,
     ) -> ProcessingResult<CorrectionOutcome> {
-        let next_index = match &correction.target {
+        let next_layout = match &correction.target {
             Some(target) if correction.has_dead_key_in(target) => {
                 return Ok(CorrectionOutcome::Cancelled);
             }
@@ -121,7 +156,7 @@ impl Switcher {
                 if correction.has_dead_key_in(&layout) || interception.read_available()? {
                     return Ok(CorrectionOutcome::Cancelled);
                 }
-                Some(index)
+                Some((index, layout))
             }
             _ => None,
         };
@@ -133,9 +168,9 @@ impl Switcher {
             layouts,
         } = self;
         switch_and_correct(
-            || match (&correction.target, next_index) {
+            || match (&correction.target, &next_layout) {
                 (Some(target), _) => desktop.switch_to_layout(target.name()),
-                (None, Some(index)) => desktop.switch_to_layout_index(index),
+                (None, Some((index, _))) => desktop.switch_to_layout_index(*index),
                 (None, None) => desktop.switch_to_next_layout(),
             },
             || {
@@ -152,8 +187,15 @@ impl Switcher {
                 )
             },
             |target| {
-                interception.input().begin_correction(target);
-                Self::correct(keyboard, layouts, interception, correction)
+                interception.input().begin_correction(target.clone());
+                let outcome = Self::correct(keyboard, layouts, interception, correction)?;
+                if let Some(target) = target
+                    .as_deref()
+                    .or_else(|| next_layout.as_ref().map(|(_, layout)| layout))
+                {
+                    correction.remember(interception.input(), &outcome, target);
+                }
+                Ok(outcome)
             },
         )
     }
@@ -298,6 +340,7 @@ mod tests {
                     word: None,
                     target: None,
                     mode,
+                    is_learning: false,
                 },
                 settings,
             )
@@ -334,9 +377,55 @@ mod tests {
                 ..Default::default()
             }),
             is_sound_enabled: false,
+            is_learning: false,
         };
         assert!(correction.has_dead_key_in(&layout::Layout::new("us", "intl", "", "")));
         assert!(!correction.has_dead_key_in(&layout::Layout::new("us", "", "", "")));
+    }
+
+    #[test]
+    fn learns_only_successful_replay_in_the_resulting_layout_without_spaces() {
+        let mut correction = Correction::from_request(
+            input::SwitchRequest {
+                previous: None,
+                word: Some(word::Word {
+                    entries: vec![word::WordStroke {
+                        stroke: word::Stroke {
+                            key: evdev::KeyCode::KEY_A,
+                            shift: false,
+                        },
+                        layout: Some(Arc::new(layout::Layout::new("us", "", "", ""))),
+                    }],
+                    trailing_spaces: 2,
+                    ..Default::default()
+                }),
+                target: None,
+                mode: SwitchMode::Manual,
+                is_learning: true,
+            },
+            RuntimeSettings::default(),
+        );
+        let target = layout::Layout::new("ru", "", "", "");
+        assert_eq!(
+            correction
+                .learned_word(&CorrectionOutcome::Completed, &target)
+                .unwrap()
+                .as_deref(),
+            Some("ф")
+        );
+        assert_eq!(
+            correction
+                .learned_word(&CorrectionOutcome::Cancelled, &target)
+                .unwrap(),
+            None
+        );
+        correction.word = None;
+        assert_eq!(
+            correction
+                .learned_word(&CorrectionOutcome::Completed, &target)
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
