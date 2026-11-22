@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::io::{self, BufRead, BufReader};
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use regex::Regex;
 
@@ -11,6 +11,16 @@ use crate::word::{Stroke, Word};
 
 pub(crate) const DICTIONARY_COUNT: usize = 2;
 const WORD_END: &str = " ";
+static PUNCTUATION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\A[\p{P}\x{0060}]\z").unwrap());
+
+fn is_repeated_punctuation(word: &Word, current: &Layout) -> bool {
+    let mut strokes = word.strokes();
+    let Some(first) = strokes.next() else {
+        return false;
+    };
+    strokes.all(|stroke| stroke == first)
+        && crate::xkb::stroke_text(current, first).is_ok_and(|text| PUNCTUATION.is_match(&text))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Prefix {
@@ -268,7 +278,8 @@ impl DictionaryAutoSwitch {
         is_first_space: bool,
     ) -> Option<Arc<Layout>> {
         let (alternative, score) = self.comparison(word, current, is_first_space)?;
-        (score > alternative.threshold).then(|| alternative.target.clone())
+        (score > alternative.threshold && !is_repeated_punctuation(word, current))
+            .then(|| alternative.target.clone())
     }
 
     pub(crate) fn trace_score(&self, word: &Word, current: Option<&Layout>, is_first_space: bool) {

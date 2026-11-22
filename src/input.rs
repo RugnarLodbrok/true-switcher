@@ -2131,6 +2131,89 @@ patterns = ['^\.тф']
     }
 
     #[test]
+    fn dictionary_preserves_repeated_punctuation_while_typing_and_at_first_space() {
+        for (key, is_shift, count) in [
+            (KeyCode::KEY_GRAVE, false, 1),
+            (KeyCode::KEY_GRAVE, false, 3),
+            (KeyCode::KEY_APOSTROPHE, false, 2),
+            (KeyCode::KEY_APOSTROPHE, true, 2),
+        ] {
+            let mut input = auto_input_with_patterns("");
+            input.accept_layout(Some(layout("us")), false);
+            input.auto_switch.dictionaries = crate::dictionary::test_dictionaries([
+                ("us", "", "apple 1", 5.0),
+                ("ru", "", "ё 1\nёё 1\nёёё 1\nэ 1\nээ 1", 5.0),
+            ]);
+            if is_shift {
+                press(&mut input, KeyCode::KEY_LEFTSHIFT);
+            }
+            for _ in 0..count {
+                press(&mut input, key);
+                statistics_event(&mut input, key, 0);
+                assert!(
+                    input.automatic_target().is_none(),
+                    "{key:?}, shift={is_shift}"
+                );
+            }
+            if is_shift {
+                statistics_event(&mut input, KeyCode::KEY_LEFTSHIFT, 0);
+            }
+            press(&mut input, KeyCode::KEY_SPACE);
+            assert!(
+                input.automatic_target().is_none(),
+                "{key:?}, shift={is_shift}"
+            );
+        }
+    }
+
+    #[test]
+    fn dictionary_scores_punctuation_when_the_key_or_shift_changes() {
+        for (first_key, second_key, is_shift) in [
+            (KeyCode::KEY_GRAVE, KeyCode::KEY_SEMICOLON, false),
+            (KeyCode::KEY_APOSTROPHE, KeyCode::KEY_APOSTROPHE, true),
+        ] {
+            let mut input = auto_input_with_patterns("");
+            input.accept_layout(Some(layout("us")), false);
+            input.auto_switch.dictionaries = crate::dictionary::test_dictionaries([
+                ("us", "", "apple 1", 5.0),
+                ("ru", "", "ёж 1\nээ 1", 5.0),
+            ]);
+            press(&mut input, first_key);
+            statistics_event(&mut input, first_key, 0);
+            assert!(input.automatic_target().is_none());
+            if is_shift {
+                press(&mut input, KeyCode::KEY_LEFTSHIFT);
+            }
+            press(&mut input, second_key);
+            assert_eq!(input.automatic_target().unwrap().name(), "ru");
+            assert!(input.pending.is_dictionary());
+        }
+    }
+
+    #[test]
+    fn dictionary_does_not_boost_repeated_punctuation_in_the_alternative_layout() {
+        let mut input = auto_input_with_patterns("");
+        input.auto_switch.dictionaries = crate::dictionary::test_dictionaries([
+            ("us", "", "apple 1", 1.0),
+            ("ru", "", "жжение 1\nмир 9", 1.0),
+        ]);
+        for key in [
+            KeyCode::KEY_SEMICOLON,
+            KeyCode::KEY_SEMICOLON,
+            KeyCode::KEY_T,
+            KeyCode::KEY_Y,
+            KeyCode::KEY_B,
+            KeyCode::KEY_T,
+            KeyCode::KEY_SPACE,
+        ] {
+            press(&mut input, key);
+            statistics_event(&mut input, key, 0);
+            assert!(input.automatic_target().is_none());
+        }
+        assert_eq!(input.latest_word().unwrap().text().as_deref(), Ok("жжение"));
+    }
+
+    #[test]
     fn dictionary_first_space_cancels_a_prefix_only_request() {
         let mut input = auto_input_with_patterns("");
         input.auto_switch.dictionaries = crate::dictionary::test_dictionaries([
