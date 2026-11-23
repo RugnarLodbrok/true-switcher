@@ -3,8 +3,8 @@
 Keyboard layout switcher.
  - manual: Press Pause/Break to retype the last word using a different keyboard layout
  - automatic: 
-   - small number of custom rules in config
-   - dictionary prefix matching
+   - Regex-based rules - for user-defined cases
+   - dictionary-based heuristics - for general words
 
 ## Why Another Switcher?
 
@@ -58,9 +58,6 @@ Install the library dependencies for your distribution.
 | Arch Linux | `sudo pacman -S libxkbcommon libpulse` |
 | openSUSE Leap and Tumbleweed | `sudo zypper install libxkbcommon-devel libpulse-devel` |
 
-After installing with `rpm-ostree`, reboot to activate the new deployment. See the [rpm-ostree package layering documentation](https://github.com/coreos/rpm-ostree/blob/main/docs/administrator-handbook.md#hybrid-imagepackaging-via-package-layering).
-Prebuilt binaries only need the runtime libraries and XKB layout data.
-
 ## Installation
 
 ### Prebuilt
@@ -77,7 +74,7 @@ make install
 
 #### what `make install` does
 
-- Creates `~/.config/true-switcher/config.toml`, no overwrite.  TODO: improve default config
+- Creates `~/.config/true-switcher/config.toml`, no overwrite
 - Installs the binary in `/usr/local/bin` and tray icons in `/usr/local/share/true-switcher/icons`.
 - Installs system and user `systemd` units and a `polkit` rule. Details on systemd units see below  
 - Restores the binary's SELinux label when applicable.
@@ -149,6 +146,7 @@ And there are also ways to adjust the behavior.
 
 - this repo doesn't supply dictionaries; you can find suitable dicts in https://github.com/hermitdave/FrequencyWords
   - default config will not have configured dictionaries
+  - dictionaries file paths should be relative to config location
 - expected dict format: `<word> <frequency>`; for example `apple 12345`
 - dict-based switching is supported only for scenario with 2 layouts and both dictionaries should be supplied 
 
