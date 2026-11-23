@@ -2156,6 +2156,36 @@ patterns = ['^\.тф']
     }
 
     #[test]
+    fn dictionary_switch_keeps_leading_punctuation_in_the_replayed_word() {
+        let mut input = auto_input_with_patterns("");
+        input.accept_layout(Some(layout("ru")), false);
+        input.auto_switch.dictionaries = crate::dictionary::test_dictionaries([
+            ("us", "", "git 1", 5.0),
+            ("ru", "", "юпше 1\nя 255", 5.0),
+        ]);
+        for key in [
+            KeyCode::KEY_DOT,
+            KeyCode::KEY_G,
+            KeyCode::KEY_I,
+            KeyCode::KEY_T,
+        ] {
+            press(&mut input, key);
+            statistics_event(&mut input, key, 0);
+        }
+        press(&mut input, KeyCode::KEY_SPACE);
+        statistics_event(&mut input, KeyCode::KEY_SPACE, 0);
+
+        let request = input.switch_request().unwrap();
+        assert_eq!(request.mode, crate::switcher::SwitchMode::Auto);
+        let target = request.target.unwrap();
+        assert_eq!(target.name(), "us");
+        let word = request.word.unwrap();
+        assert_eq!(word.text().as_deref(), Ok("юпше"));
+        assert_eq!(target.to_text(word.strokes()).as_deref(), Ok(".git"));
+        assert_eq!(word.trailing_spaces, 1);
+    }
+
+    #[test]
     fn dictionary_first_space_switches_a_complete_word_and_keeps_the_space() {
         let mut input = auto_input_with_patterns("");
         input.accept_layout(Some(layout("us")), false);
@@ -2276,7 +2306,7 @@ patterns = ['^\.тф']
     }
 
     #[test]
-    fn dictionary_block_pattern_leaves_forward_rules_and_tokens_with_letters() {
+    fn punctuation_block_leaves_forward_rules_and_tokens_with_letters() {
         use crate::switcher::SwitchMode;
 
         for (first_key, second_key, expected_mode) in [
@@ -2298,7 +2328,7 @@ patterns = ['^\.тф']
                 crate::switch_rules::AutoSwitchRules::compile(&settings, |name| Ok(layout(name)))
                     .unwrap();
             input.auto_switch.dictionaries = crate::dictionary::test_dictionaries([
-                ("us", "", "apple 1", 5.0),
+                ("us", "", "banana 1", 5.0),
                 ("ru", "", "ёж 1\nэф 1", 5.0),
             ]);
             press(&mut input, first_key);

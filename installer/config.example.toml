@@ -21,9 +21,10 @@ auto_switch = false
 # An empty string keeps entries of any case. Use '.*\p{Lu}.*' to skip words containing uppercase letters.
 dict_skip_pattern = ''
 
-# Block dictionary-based correction if the entire token matches this regex.
-# The default protects punctuation-only tokens and backticks. An empty string disables it.
-dict_block_pattern = '[\p{P}\x{0060}]+'
+# Disable dict-based autoswitch for punctuation-only words;
+# Also trim leading punctuation for alternative scoring. (scoring without trim remains)
+# An empty string disables both checks.
+punctuation = '[`~<>\p{P}]+'
 
 
 [[switch_rules]]       # Optional regex rule set

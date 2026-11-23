@@ -9,9 +9,6 @@ run:
 		--setenv=DBUS_SESSION_BUS_ADDRESS="$${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$$(id -u)/bus}" \
 		"$(CURDIR)/target/debug/true-switcher"
 
-run-learn:
-	cargo run --bin learn
-
 run-input-debug:
 	cargo build --bin input-debug
 	chcon -t bin_t "$(CURDIR)/target/debug/input-debug"

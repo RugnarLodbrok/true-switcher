@@ -139,6 +139,15 @@ impl DictionaryTrie {
             Prefix::ConversionFailed => None,
         }
     }
+
+    fn word_score(&self, prefix: Prefix, is_first_space: bool) -> Option<f64> {
+        let prefix = if is_first_space {
+            self.advance(prefix, WORD_END)
+        } else {
+            prefix
+        };
+        self.score(prefix)
+    }
 }
 
 fn parse_record(line: &str) -> Option<(&str, u64)> {
@@ -156,13 +165,21 @@ fn invalid(message: impl Into<String>) -> io::Error {
 }
 
 fn compile_full_match_pattern(pattern: &str, setting: &str) -> io::Result<Option<Regex>> {
+    compile_anchored_pattern(pattern, setting, r"\z")
+}
+
+fn compile_anchored_pattern(
+    pattern: &str,
+    setting: &str,
+    end_anchor: &str,
+) -> io::Result<Option<Regex>> {
     if pattern.is_empty() {
         return Ok(None);
     }
     let invalid_pattern = |error| invalid(format!("Invalid {setting}: {error}"));
     Regex::new(pattern).map_err(invalid_pattern)?; // Reject unmatched groups before wrapping.
     // The newline terminates a trailing verbose-mode comment and is ignored otherwise.
-    Regex::new(&format!("\\A(?:{pattern}(?x)\n)\\z"))
+    Regex::new(&format!("\\A(?:{pattern}(?x)\n){end_anchor}"))
         .map(Some)
         .map_err(invalid_pattern)
 }
@@ -176,7 +193,8 @@ struct Dictionary {
 #[derive(Default)]
 pub(crate) struct DictionaryAutoSwitch {
     dictionaries: Vec<Dictionary>,
-    block_pattern: Option<Regex>,
+    full_punctuation: Option<Regex>,
+    leading_punctuation: Option<Regex>,
     pub(crate) learned: crate::learned_rules::LearnedRules,
 }
 
@@ -198,8 +216,9 @@ impl DictionaryAutoSwitch {
         }
         let skip_pattern =
             compile_full_match_pattern(&settings.dict_skip_pattern, "dict_skip_pattern")?;
-        let block_pattern =
-            compile_full_match_pattern(&settings.dict_block_pattern, "dict_block_pattern")?;
+        let full_punctuation = compile_full_match_pattern(&settings.punctuation, "punctuation")?;
+        let leading_punctuation =
+            compile_anchored_pattern(&settings.punctuation, "punctuation", "")?;
         let mut targets = HashSet::new();
         let mut dictionaries = Vec::new();
         for setting in &settings.dict {
@@ -227,7 +246,8 @@ impl DictionaryAutoSwitch {
         }
         Ok(Self {
             dictionaries,
-            block_pattern,
+            full_punctuation,
+            leading_punctuation,
             ..Self::default()
         })
     }
@@ -256,13 +276,12 @@ impl DictionaryAutoSwitch {
     fn layout_score(&self, word: &Word, index: usize, is_first_space: bool) -> Option<(f64, u128)> {
         let dictionary = &self.dictionaries[index];
         let prefix = *word.dictionary_prefixes.get(index)?.last()?;
-        let trie = &dictionary.trie;
-        let prefix = if is_first_space {
-            trie.advance(prefix, WORD_END)
-        } else {
-            prefix
-        };
-        let score = trie.score(prefix)?;
+        let mut score = dictionary.trie.word_score(prefix, is_first_space)?;
+        if let Some(remainder_score) =
+            self.punctuation_remainder_score(word, dictionary, is_first_space)
+        {
+            score = score.max(remainder_score);
+        }
         let learned = self.learned.count(&dictionary.target, word, is_first_space);
         let score = if score == f64::NEG_INFINITY && learned > 0 {
             LEARNED_BASE_SCORE
@@ -270,6 +289,23 @@ impl DictionaryAutoSwitch {
             score
         };
         Some((score, learned))
+    }
+
+    fn punctuation_remainder_score(
+        &self,
+        word: &Word,
+        dictionary: &Dictionary,
+        is_first_space: bool,
+    ) -> Option<f64> {
+        let pattern = self.leading_punctuation.as_ref()?;
+        let text = dictionary.target.to_text(word.strokes()).ok()?;
+        let matched = pattern.find(&text)?;
+        if matched.is_empty() || matched.end() == text.len() {
+            return None;
+        }
+        let trie = &dictionary.trie;
+        let prefix = trie.advance(Prefix::Node(0), &text[matched.end()..]);
+        trie.word_score(prefix, is_first_space)
     }
 
     fn comparison(
@@ -307,7 +343,7 @@ impl DictionaryAutoSwitch {
     ) -> Option<Arc<Layout>> {
         let (alternative, score) = self.comparison(word, current, is_first_space)?;
         let target = (score > alternative.threshold).then_some(&alternative.target)?;
-        let is_blocked = self.block_pattern.as_ref().is_some_and(|pattern| {
+        let is_blocked = self.full_punctuation.as_ref().is_some_and(|pattern| {
             current
                 .to_text(word.strokes())
                 .is_ok_and(|text| pattern.is_match(&text))
@@ -339,9 +375,15 @@ pub(crate) fn test_dictionaries(
                 threshold,
             })
             .collect(),
-        block_pattern: compile_full_match_pattern(
-            crate::config::DEFAULT_DICT_BLOCK_PATTERN,
-            "dict_block_pattern",
+        full_punctuation: compile_full_match_pattern(
+            crate::config::DEFAULT_PUNCTUATION,
+            "punctuation",
+        )
+        .unwrap(),
+        leading_punctuation: compile_anchored_pattern(
+            crate::config::DEFAULT_PUNCTUATION,
+            "punctuation",
+            "",
         )
         .unwrap(),
         ..Default::default()
@@ -539,17 +581,23 @@ mod tests {
     }
 
     #[test]
-    fn loads_dictionary_block_patterns_from_configuration() {
+    fn loads_punctuation_from_configuration() {
         for (settings, expected) in [
-            ("", [true, true, false]),
-            (r"dict_block_pattern = '[./\\]+'", [true, false, false]),
-            ("dict_block_pattern = ''", [false, false, false]),
+            ("", [true, true, true, true, true, false]),
+            (
+                r"punctuation = '[./\\]+'",
+                [true, false, false, false, false, false],
+            ),
+            ("punctuation = ''", [false; 6]),
         ] {
             let dictionaries = load_dictionaries_with_settings(settings, "cat 1", "кот 1").unwrap();
-            for (token, matches) in ["../", "!?", "v1.2"].into_iter().zip(expected) {
+            for (token, matches) in ["../", "!?", "~", "<", ">", "v1.2"]
+                .into_iter()
+                .zip(expected)
+            {
                 assert_eq!(
                     dictionaries
-                        .block_pattern
+                        .full_punctuation
                         .as_ref()
                         .is_some_and(|regex| regex.is_match(token)),
                     matches,
@@ -557,24 +605,21 @@ mod tests {
                 );
             }
         }
-        let error = load_dictionaries_with_settings("dict_block_pattern = '['", "cat 1", "кот 1")
+        let error = load_dictionaries_with_settings("punctuation = '['", "cat 1", "кот 1")
             .err()
-            .expect("invalid block pattern should fail to load");
-        assert!(
-            error.to_string().contains("Invalid dict_block_pattern"),
-            "{error}"
-        );
+            .expect("invalid punctuation regex should fail to load");
+        assert!(error.to_string().contains("Invalid punctuation"), "{error}");
     }
 
     #[test]
-    fn custom_or_empty_block_pattern_allows_mixed_punctuation_outside_the_pattern() {
+    fn custom_or_empty_punctuation_changes_dictionary_blocking() {
         use crate::word::WordStroke;
 
         let current = Layout::new("us", "", "", "");
         for (settings, should_switch) in [
             ("", false),
-            (r"dict_block_pattern = '[./\\]+'", true),
-            ("dict_block_pattern = ''", true),
+            (r"punctuation = '[./\\]+'", true),
+            ("punctuation = ''", true),
         ] {
             let dictionaries = load_dictionaries_with_settings(settings, "cat 1", "ёж 1").unwrap();
             let mut word = Word::default();
@@ -597,6 +642,163 @@ mod tests {
                     "{settings}, first space: {is_first_space}"
                 );
             }
+        }
+    }
+
+    fn word_from_keys(dictionaries: &DictionaryAutoSwitch, keys: &[KeyCode]) -> Word {
+        let mut word = Word::default();
+        for &key in keys {
+            let stroke = Stroke { key, shift: false };
+            word.entries.push(crate::word::WordStroke {
+                stroke,
+                layout: None,
+            });
+            dictionaries.push(&mut word, &stroke);
+        }
+        word
+    }
+
+    #[test]
+    fn scores_the_best_dictionary_key_with_or_without_leading_punctuation() {
+        for (records, prefix_score, exact_score) in [
+            (".git 2\ngithub 6", 0.75_f64.log2(), -2.0),
+            (".git 6\ngit 2", 0.75_f64.log2(), 0.75_f64.log2()),
+            ("git 8", 0.0, 0.0),
+        ] {
+            let dictionaries =
+                test_dictionaries([("us", "", records, 5.0), ("ru", "", "юпше 1", 5.0)]);
+            let word = word_from_keys(
+                &dictionaries,
+                &[
+                    KeyCode::KEY_DOT,
+                    KeyCode::KEY_G,
+                    KeyCode::KEY_I,
+                    KeyCode::KEY_T,
+                ],
+            );
+            assert_eq!(
+                dictionaries.layout_score(&word, 0, false),
+                Some((prefix_score, 0))
+            );
+            assert_eq!(
+                dictionaries.layout_score(&word, 0, true),
+                Some((exact_score, 0))
+            );
+        }
+    }
+
+    #[test]
+    fn scores_only_a_nonempty_remainder_of_the_leading_punctuation_match() {
+        for (settings, keys, score) in [
+            (
+                "",
+                &[
+                    KeyCode::KEY_DOT,
+                    KeyCode::KEY_G,
+                    KeyCode::KEY_I,
+                    KeyCode::KEY_T,
+                ][..],
+                0.0,
+            ),
+            (
+                "punctuation = ''",
+                &[
+                    KeyCode::KEY_DOT,
+                    KeyCode::KEY_G,
+                    KeyCode::KEY_I,
+                    KeyCode::KEY_T,
+                ][..],
+                f64::NEG_INFINITY,
+            ),
+            (
+                r"punctuation = '\.{2}|,+'",
+                &[
+                    KeyCode::KEY_DOT,
+                    KeyCode::KEY_DOT,
+                    KeyCode::KEY_G,
+                    KeyCode::KEY_I,
+                    KeyCode::KEY_T,
+                ][..],
+                0.0,
+            ),
+            (
+                r"punctuation = '\.{2}|,+'",
+                &[
+                    KeyCode::KEY_A,
+                    KeyCode::KEY_COMMA,
+                    KeyCode::KEY_G,
+                    KeyCode::KEY_I,
+                    KeyCode::KEY_T,
+                ][..],
+                f64::NEG_INFINITY,
+            ),
+            (
+                "",
+                &[KeyCode::KEY_SEMICOLON, KeyCode::KEY_SEMICOLON][..],
+                f64::NEG_INFINITY,
+            ),
+        ] {
+            let dictionaries = load_dictionaries_with_settings(settings, "git 1", "кот 1").unwrap();
+            let word = word_from_keys(&dictionaries, keys);
+            for is_first_space in [false, true] {
+                assert_eq!(
+                    dictionaries.layout_score(&word, 0, is_first_space),
+                    Some((score, 0))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn leading_punctuation_affects_both_layout_scores_but_learned_counts_use_the_full_token() {
+        let us = Layout::new("us", "", "", "");
+        let ru = Layout::new("ru", "", "", "");
+        let mut dictionaries =
+            test_dictionaries([("us", "", "git 1", 5.0), ("ru", "", "юпше 1\nя 255", 5.0)]);
+        let word = word_from_keys(
+            &dictionaries,
+            &[
+                KeyCode::KEY_DOT,
+                KeyCode::KEY_G,
+                KeyCode::KEY_I,
+                KeyCode::KEY_T,
+            ],
+        );
+
+        dictionaries.learned.increment("us", "git").unwrap();
+        for is_first_space in [false, true] {
+            assert_eq!(
+                dictionaries
+                    .comparison(&word, &us, is_first_space)
+                    .unwrap()
+                    .1,
+                -8.0
+            );
+            assert_eq!(
+                dictionaries
+                    .comparison(&word, &ru, is_first_space)
+                    .unwrap()
+                    .1,
+                8.0
+            );
+        }
+
+        dictionaries.learned.increment("us", ".git").unwrap();
+        for is_first_space in [false, true] {
+            assert_eq!(
+                dictionaries
+                    .comparison(&word, &us, is_first_space)
+                    .unwrap()
+                    .1,
+                -9.0
+            );
+            assert_eq!(
+                dictionaries
+                    .comparison(&word, &ru, is_first_space)
+                    .unwrap()
+                    .1,
+                9.0
+            );
         }
     }
 
@@ -844,7 +1046,7 @@ mod tests {
                 "Exactly two dictionaries must be configured"
             );
         }
-        for setting in ["dict_skip_pattern", "dict_block_pattern"] {
+        for setting in ["dict_skip_pattern", "punctuation"] {
             let error = compile(&format!("{setting} = '['"), 2, false)
                 .err()
                 .unwrap();
