@@ -123,6 +123,9 @@ The installed `polkit` rule allows your user to start, stop, and restart `true-s
  - configuration changes via tray are in-memory, config file is not affected
 
 ### config example
+
+These are basic settings; other parts of config are shown in latter sections.
+
 ```toml
 switch_key = "KEY_PAUSE"     # Required Linux key name; e.g. KEY_PAUSE, KEY_F12, ...
 log_level = "info"           # off, error, warn, info, debug, trace; trace logs typed words
@@ -131,11 +134,6 @@ auto_switch = false          # Enable automatic switching using dictionaries
 auto_switch_sound = true     # Play a sound after a successful automatic switch
 
 ```
-
-To complete this example or the starter config created by the installer, add the two required dictionary entries shown below. Rules and dictionaries are validated even when both flags are disabled. [Dictionary configuration example](#dictionary-matching)
-
-`RUST_LOG` does not override `log_level`. Sound playback requires a PulseAudio-compatible server such as `pipewire-pulse`; playback errors are logged without interrupting switching.
-
 ## Automatic switching
 
 There are two distinct ways to auto-switch 
