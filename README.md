@@ -199,7 +199,7 @@ threshold = 15.0
 #### implementation details and meaning of thresholds
 
 - `dict word score` in dictionary - calculated as log(P); P is probability of given word in dictionary, including its frequency
-- `word score` - combined score of all words that are prefixed with the given typed word, (ΣP, not Σlog2(P))
+- `word score` - combined score of all words that are prefixed with the given typed word, (log2(ΣP), not Σlog2(P))
 - `delta score` = `word score` in alternative layout minus `word score` in given layout. Used for auto-switch decision 
 
 #### manual correction and learned-rules
