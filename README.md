@@ -6,6 +6,29 @@ Keyboard layout switcher.
    - Regex-based rules - for user-defined cases
    - dictionary-based heuristics - for general words
 
+## Table of contents
+
+- [Why Another Switcher?](#why-another-switcher)
+  - [Comparison with Alternatives](#comparison-with-alternatives)
+- [Supported environments](#supported-environments)
+- [Requirements](#requirements)
+  - [Runtime requirements](#runtime-requirements)
+  - [Build requirements](#build-requirements)
+- [Installation](#installation)
+  - [Prebuilt](#prebuilt)
+  - [From sources](#from-sources)
+    - [what `make install` does](#what-make-install-does)
+    - [systemd integration](#systemd-integration)
+- [Tray and configuration](#tray-and-configuration)
+  - [config example](#config-example)
+- [Automatic switching](#automatic-switching)
+  - [Regex rules](#regex-rules)
+  - [Dictionary-based switch](#dictionary-based-switch)
+    - [config](#config)
+    - [implementation details and meaning of thresholds](#implementation-details-and-meaning-of-thresholds)
+    - [manual correction and learned-rules](#manual-correction-and-learned-rules)
+- [Switching statistics](#switching-statistics)
+
 ## Why Another Switcher?
 
 ### Comparison with Alternatives
