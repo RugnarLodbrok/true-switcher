@@ -12,11 +12,11 @@ Keyboard layout switcher.
 
 | Alternative | Downsides |
 | --- | --- |
-| [XNeur](https://manpages.ubuntu.com/manpages/resolute/man1/xneur.1.html) | does not support wayland |
-| [PolterType](https://poltertype.com/) | solid switcher, but custom commands and autoswitch seemed limited to me. No way to bind switch on PauseBreak. Also switches `.туц` -> `.new`, not `/new` and it is a dealbreakr | 
-| [layout-fix](https://github.com/AkuLinker/layout-fix) | doesn't support last word retype, but has different features|
+| [XNeur](https://manpages.ubuntu.com/manpages/resolute/man1/xneur.1.html) | does not support Wayland |
+| [PolterType](https://poltertype.com/) | solid switcher, but custom commands and autoswitch seemed limited to me. No way to bind the switch to PauseBreak. Also switches `.туц` -> `.new`, not `/new` and it is a dealbreaker | 
+| [layout-fix](https://github.com/AkuLinker/layout-fix) | doesn't support last word retyping, but has different features|
 | [XSwitcher](https://github.com/ds-voix/xswitcher) | probably has bugs, or I couldn't configure it well. Very convoluted way of configuration |
-| [GSwitch](https://github.com/arumata/gswitch) | uses noticeable delays for switching. When delays're configured to 0 works unreliably. Slow switch often interferes with fast typing |
+| [GSwitch](https://github.com/arumata/gswitch) | uses noticeable delays for switching. It works unreliably when the delays are set to 0. Slow switching often interferes with fast typing |
 | [Mahou](https://gitea.com/BladeMight/Mahou) | Best of them all, but only for Windows. Inspiration for TrueSwitcher |
 | [Mahou3](https://github.com/Sippelin/Mahou3) | continuation of Mahou |
 
@@ -37,7 +37,7 @@ Efforts to improve this coverage are welcomed.
 
 ### Runtime requirements
 
-- Linux with `evdev` and `uinput` support (basically any linux)
+- Linux with `evdev` and `uinput` support (basically any Linux)
 - KDE Plasma on Wayland.
 - `systemd` and a `qdbus` executable in the runtime `PATH`. Supported names, in preference order: `qdbus-qt6`, `qdbus6`, `qdbus`. Fedora/Bazzite provides it in `qt6-qttools`.
 - `libxkbcommon` and XKB layout data (`xkeyboard-config`)
@@ -76,10 +76,10 @@ make install
 
 - Creates `~/.config/true-switcher/config.toml`, no overwrite
 - Installs the binary in `/usr/local/bin` and tray icons in `/usr/local/share/true-switcher/icons`.
-- Installs system and user `systemd` units and a `polkit` rule. Details on systemd units see below  
+- Installs system and user `systemd` units and a `polkit` rule. See below for details on the systemd units
 - Restores the binary's SELinux label when applicable.
 - Starts True Switcher and enables it to start automatically in future graphical sessions.
-- gives manual steps to check SELinux permissions issues, if any happen.
+- Provides steps for checking for SELinux permission issues
 
 #### systemd integration
 
@@ -96,7 +96,7 @@ The installed `polkit` rule allows your user to start, stop, and restart `true-s
 ## Tray and configuration
 
  - application config is `~/.config/true-switcher/config.toml`
- - to apply read changes from file the app needs restart (tray → right click → reload)
+ - to apply read changes from file the app needs a restart (tray → right click → reload)
  - configuration changes via tray are in-memory, config file is not affected
 
 ### config example
@@ -125,7 +125,7 @@ Regex rules are deterministic and have strict priority over dictionary-based swi
 ### Regex rules
 
 True-switcher uses Rust `regex` syntax.
-Automatic switch is triggered when any pattern matches the last typed word, including first trailing space.
+An automatic switch is triggered when any pattern matches the last typed word, including the first trailing space.
 
 configuration example
 
@@ -134,7 +134,7 @@ pattern_switch = false  # Enable automatic switching using regex rules
 [[switch_rules]]        # Optional; repeat this block to add more rules
 target = "us"           # XKB layout identifier configured in KDE, e.g. us or ru. The layout must be present in KDE 
 patterns = [            # Rust regex patterns matched against the converted word.
-    '^/[a-z]',          # this rule will switch for examole `.ыефке` -> `/start`
+    '^/[a-z]',          # this rule will switch for example `.ыефке` -> `/start`
     "^cd $",            # rule for bash command `cd`, with trailing space
 ] 
 ```
@@ -144,17 +144,17 @@ patterns = [            # Rust regex patterns matched against the converted word
 True-switcher can trigger automatic switches using word dictionaries and heuristics.
 And there are also ways to adjust the behavior. 
 
-- this repo doesn't supply dictionaries; you can find suitable dicts in https://github.com/hermitdave/FrequencyWords
-  - default config will not have configured dictionaries
-  - dictionaries file paths should be relative to config location
-- expected dict format: `<word> <frequency>`; for example `apple 12345`
-- dict-based switching is supported only for scenario with 2 layouts and both dictionaries should be supplied 
+- This repo doesn't supply dictionaries; you can find suitable dicts in https://github.com/hermitdave/FrequencyWords
+  - Default config will not have configured dictionaries
+  - Dictionary file paths should be relative to config location
+- Expected dict format: `<word> <frequency>`; for example `apple 12345`
+- Dict-based switching is supported only with two layouts and both dictionaries should be supplied 
 
 #### config
 
 ```toml
-# defines which words will be dropepd entirely from dictionaries.
-# This example drops all words with capitals and words starting with.
+# defines which words will be dropped entirely from dictionaries.
+# In this example, pattern drops all words with capitals and words starting with `.`
 dict_skip_pattern = '.*\p{Lu}.*'   
 
 # pattern that disables dictionary-based switch. This example protects punctuation. 
@@ -166,7 +166,7 @@ dict_block_pattern = '[\p{P}\x{0060}]+'
 target = "us"
 file = "dictionaries/en_full.txt"
 threshold = 15.0  # autoswitch threshold for `delta score` - see below
-# values in range ~5-20 will work fine, highter values make more conservative behavior
+# values in the range ~5-20 will work fine. Higher values make switching more conservative
 
 [[dict]]
 target = "ru"
@@ -181,13 +181,13 @@ threshold = 15.0
 
 #### manual correction and learned-rules
 
-dictionary-based switch can do undesired switches. To prevent these, there is learned-rules 
+dictionary-based switch can do undesired switches. To prevent these, there are _learned-rules_ 
 
 - `switch_key` manually corrects the last typed word. Use `Shift` + `switch_key` to also _teach_
-  - to switch undesired switch back
+  - to undo an unwanted switch
   - to switch word that you want to be switched automatically
 - each successful _teach_ adds score to currently typed word (unfinished words saved as-is), word with one trailing space counts.
-- score is added to `delta score` (see above) and used in Used for auto-switch decision-making
+- score is added to `delta score` (see above) and used for auto-switch decision-making
 - learned rules are stored in `~/.config/true-switcher/learned-rules.toml`
 
 ```toml
@@ -201,7 +201,7 @@ dictionary-based switch can do undesired switches. To prevent these, there is le
 
 ## Switching statistics
 
-Currently, true-switcher writes typing and switching statistics in sqlite, everything, and passwords too
+Currently, true-switcher writes typing and switching statistics in sqlite. All typing is saved, and passwords too
 `~/.local/state/true-switcher/statistics.sqlite3 `
 
 TODO: make it optional
