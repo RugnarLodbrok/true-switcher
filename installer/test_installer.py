@@ -68,6 +68,39 @@ class QdbusTests(unittest.TestCase):
                 self._find(str(service_directory))
 
 
+class UserConfigTests(unittest.TestCase):
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = Path(directory.name) / 'config' / 'config.toml'
+        self.missing_template = Path(directory.name) / 'missing.toml'
+
+    def test_copies_the_template_verbatim(self) -> None:
+        with patch.object(installer, 'USER_CONFIG', self.path), patch('builtins.print'):
+            installer._ensure_user_config()
+        self.assertEqual(self.path.read_bytes(), installer.CONFIG_TEMPLATE.read_bytes())
+
+    def test_keeps_existing_config_without_reading_the_template(self) -> None:
+        original = b'switch_key = "KEY_F12"\n'
+        self.path.parent.mkdir()
+        self.path.write_bytes(original)
+        with patch.object(installer, 'USER_CONFIG', self.path), \
+                patch.object(installer, 'CONFIG_TEMPLATE', self.missing_template):
+            installer._ensure_user_config()
+        self.assertEqual(self.path.read_bytes(), original)
+
+    def test_missing_template_aborts_install_before_creating_config(self) -> None:
+        with patch.object(installer, 'USER_CONFIG', self.path), \
+                patch.object(installer, 'CONFIG_TEMPLATE', self.missing_template), \
+                patch.object(installer, '_preflight', return_value=False), \
+                patch.object(installer, '_install_file') as install_file:
+            with self.assertRaises(FileNotFoundError) as raised:
+                installer._install()
+        self.assertEqual(raised.exception.filename, str(self.missing_template))
+        self.assertFalse(self.path.exists())
+        install_file.assert_not_called()
+
+
 class TrayInstallationTests(unittest.TestCase):
     def test_only_explicit_restart_exit_status_forces_restart(self) -> None:
         system, *_ = installer._contents()

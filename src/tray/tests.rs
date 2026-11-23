@@ -233,7 +233,7 @@ fn runtime_menu_exports_log_levels_in_a_submenu() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("config.toml");
     fs::write(&path, format!("{RUNTIME_CONFIG}log_level = 'debug'\n")).unwrap();
-    export_runtime_menu(&tray, sender, &path, || Ok(2));
+    export_runtime_menu(&tray, sender, &path, false, || Ok(2));
     let menu = Proxy::new(
         &client,
         tray.unique_name().unwrap().as_str(),
@@ -304,11 +304,18 @@ fn export_runtime_menu(
     tray: &Connection,
     sender: InputEventSender,
     path: &Path,
+    is_dictionary_pair_loaded: bool,
     layout_count: impl Fn() -> io::Result<usize> + Send + Sync + 'static,
 ) -> RuntimeSettings {
     let (config, file) = crate::config::load_from(path).unwrap();
     let settings = RuntimeSettings::from(&config);
-    let runtime = menu::RuntimeMenu::new(sender.clone(), &config, file, layout_count);
+    let runtime = menu::RuntimeMenu::new(
+        sender.clone(),
+        &config,
+        file,
+        is_dictionary_pair_loaded,
+        layout_count,
+    );
     let mut exported_menu = menu::Menu::new(sender);
     exported_menu.runtime = Some(Arc::new(runtime));
     exported_menu.refresh();
@@ -344,7 +351,7 @@ fn runtime_menu_applies_toggles_and_checks_layout_count_again_on_click() {
     let path = directory.path().join("config.toml");
     fs::write(&path, RUNTIME_CONFIG).unwrap();
     let count = Arc::new(AtomicUsize::new(2));
-    let settings = export_runtime_menu(&tray, sender, &path, {
+    let settings = export_runtime_menu(&tray, sender, &path, true, {
         let count = count.clone();
         move || Ok(count.load(Ordering::Relaxed))
     });
@@ -401,6 +408,68 @@ fn runtime_menu_applies_toggles_and_checks_layout_count_again_on_click() {
 }
 
 #[test]
+fn runtime_menu_requires_loaded_dictionaries_until_reload() {
+    let bus = TestBus::start();
+    let client = bus.connect();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    fs::write(&path, RUNTIME_CONFIG).unwrap();
+
+    for is_pair_configured in [false, true] {
+        let (config, _) = crate::config::load_from(&path).unwrap();
+        let dictionaries = crate::dictionary::DictionaryAutoSwitch::load(
+            &config,
+            |name| Ok(Arc::new(crate::layout::Layout::new(name, "", "", ""))),
+            || Ok(2),
+        )
+        .unwrap();
+        let tray = bus.connect();
+        let (sender, events) = InputEvents::new();
+        let settings =
+            export_runtime_menu(&tray, sender, &path, dictionaries.is_pair_loaded(), || {
+                Ok(2)
+            });
+        let input = start_input(events, settings);
+        let menu = Proxy::new(
+            &client,
+            tray.unique_name().unwrap().as_str(),
+            MENU_PATH,
+            MENU_INTERFACE,
+        )
+        .unwrap();
+        assert_eq!(
+            menu_property::<bool>(&menu, 3, "enabled"),
+            is_pair_configured
+        );
+        assert_eq!(menu_property::<i32>(&menu, 3, "toggle-state"), 0);
+        click(&menu, 3);
+        assert_eq!(
+            menu_property::<i32>(&menu, 3, "toggle-state"),
+            i32::from(is_pair_configured)
+        );
+        if is_pair_configured {
+            click(&menu, 2);
+            assert_eq!(input.join().unwrap(), ShutdownReason::Stop);
+        } else {
+            assert!(
+                menu_property::<String>(&menu, 3, "label").contains("configure two dictionaries")
+            );
+            fs::write(directory.path().join("words.txt"), "apple 1\n").unwrap();
+            fs::write(
+                &path,
+                format!(
+                    "{RUNTIME_CONFIG}[[dict]]\ntarget = 'us'\nfile = 'words.txt'\nthreshold = 15.0\n\
+                     [[dict]]\ntarget = 'ru'\nfile = 'words.txt'\nthreshold = 15.0\n"
+                ),
+            )
+            .unwrap();
+            click(&menu, 1);
+            assert_eq!(input.join().unwrap(), ShutdownReason::Restart);
+        }
+    }
+}
+
+#[test]
 fn runtime_menu_changes_disk_only_on_save_and_reload_reads_saved_settings() {
     let bus = TestBus::start();
     let client = bus.connect();
@@ -418,7 +487,7 @@ fn runtime_menu_changes_disk_only_on_save_and_reload_reads_saved_settings() {
     for (is_selected, command) in [(false, 1), (false, 7), (true, 2)] {
         let (sender, events) = InputEvents::new();
         let tray = bus.connect();
-        let settings = export_runtime_menu(&tray, sender, &path, || Ok(2));
+        let settings = export_runtime_menu(&tray, sender, &path, false, || Ok(2));
         let input = start_input(events, settings);
         let menu = Proxy::new(
             &client,

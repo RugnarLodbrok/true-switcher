@@ -38,11 +38,13 @@ impl Tray {
         sender: InputEventSender,
         config: &Configuration,
         config_file: ConfigurationFile,
+        is_dictionary_pair_loaded: bool,
     ) -> io::Result<Self> {
         let runtime = menu::RuntimeMenu::new(
             sender.clone(),
             config,
             config_file,
+            is_dictionary_pair_loaded,
             crate::kde::layout_count,
         );
         let mut menu = menu::Menu::new(sender);

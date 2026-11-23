@@ -47,6 +47,7 @@ pub(super) struct Menu {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AutoSwitchAvailability {
     Available,
+    MissingDictionaries,
     TooManyLayouts,
     UnknownLayoutCount,
 }
@@ -61,6 +62,7 @@ pub(super) struct RuntimeMenu {
     sender: InputEventSender,
     state: Mutex<MenuState>,
     config_file: ConfigurationFile,
+    is_dictionary_pair_loaded: bool,
     layout_count: Box<dyn Fn() -> io::Result<usize> + Send + Sync>,
 }
 
@@ -69,6 +71,7 @@ impl RuntimeMenu {
         sender: InputEventSender,
         config: &Configuration,
         config_file: ConfigurationFile,
+        is_dictionary_pair_loaded: bool,
         layout_count: impl Fn() -> io::Result<usize> + Send + Sync + 'static,
     ) -> Self {
         Self {
@@ -79,6 +82,7 @@ impl RuntimeMenu {
                 log_level: config.log_level,
             }),
             config_file,
+            is_dictionary_pair_loaded,
             layout_count: Box::new(layout_count),
         }
     }
@@ -86,6 +90,8 @@ impl RuntimeMenu {
     fn refresh_availability(&self, state: &mut MenuState) -> bool {
         let availability = if state.settings.is_auto_switch {
             AutoSwitchAvailability::Available
+        } else if !self.is_dictionary_pair_loaded {
+            AutoSwitchAvailability::MissingDictionaries
         } else {
             match (self.layout_count)() {
                 Ok(..=DICTIONARY_COUNT) => AutoSwitchAvailability::Available,
@@ -157,6 +163,9 @@ impl RuntimeMenu {
             RuntimeSetting::AutoSwitch => (
                 match state.availability {
                     AutoSwitchAvailability::Available => "Auto-switch",
+                    AutoSwitchAvailability::MissingDictionaries => {
+                        "Auto-switch (configure two dictionaries and Reload)"
+                    }
                     AutoSwitchAvailability::TooManyLayouts => {
                         "Auto-switch (requires at most two KDE layouts)"
                     }

@@ -1260,6 +1260,17 @@ patterns = ['^\.тф']
     #[test]
     fn learning_uses_shift_at_switch_press_without_enabling_auto_switch() {
         let (mut input, _) = channel_input();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(crate::learned_rules::FILE_NAME);
+        let config = crate::config::from_contents("switch_key = 'KEY_PAUSE'").unwrap();
+        input.auto_switch.dictionaries = crate::dictionary::DictionaryAutoSwitch::load(
+            &config,
+            |_| panic!("No dictionary layout should be resolved"),
+            || panic!("No dictionary layout count should be requested"),
+        )
+        .unwrap();
+        input.auto_switch.dictionaries.learned =
+            crate::learned_rules::LearnedRules::load(path.clone()).unwrap();
         input.pending.cancel();
         input.settings.is_auto_switch = false;
         let now = Instant::now();
@@ -1272,6 +1283,10 @@ patterns = ['^\.тф']
         assert_eq!(request.mode, crate::switcher::SwitchMode::Manual);
         assert!(request.is_learning);
         assert!(!request.word.unwrap().entries[0].stroke.shift);
+        input.remember_word("ru", "ф").unwrap();
+        let contents = std::fs::read_to_string(path).unwrap();
+        let saved = contents.parse::<toml::Table>().unwrap();
+        assert_eq!(saved["ru"]["ф"].as_integer(), Some(1));
     }
 
     #[test]

@@ -18,19 +18,12 @@ ERROR_ICON = ICON.parent / ERROR_ICON_NAME
 SYSTEM_UNIT = Path('/etc/systemd/system/true-switcher.service')
 USER_UNIT = Path.home() / '.config/systemd/user/true-switcher-session.service'
 USER_CONFIG = Path.home() / '.config/true-switcher/config.toml'
+CONFIG_TEMPLATE = Path(__file__).resolve().with_name('config.example.toml')
 POLKIT = Path('/etc/polkit-1/rules.d/49-true-switcher.rules')
 SYSTEM_NAME = 'true-switcher.service'
 USER_NAME = 'true-switcher-session.service'
 SYSTEM_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 QDBUS_NAMES = ('qdbus-qt6', 'qdbus6', 'qdbus')
-DEFAULT_USER_CONFIG = '''# Restart the service to apply changes:
-# Select Reload in the tray menu, or run:
-# systemctl --system --no-block restart true-switcher.service
-# Examples: KEY_PAUSE, KEY_CAPSLOCK, KEY_RIGHTCTRL, KEY_RIGHTSHIFT,
-# KEY_RIGHTALT, KEY_RIGHTMETA, KEY_SCROLLLOCK, KEY_MENU, KEY_F12, KEY_F13
-switch_key = "KEY_PAUSE"
-manual_switch_sound = false
-'''
 
 
 def _run(args: List[str], check: bool = True) -> subprocess.CompletedProcess:
@@ -116,10 +109,13 @@ def _preflight() -> bool:
 
 
 def _ensure_user_config() -> None:
+    if os.path.lexists(USER_CONFIG):
+        return
+    template = CONFIG_TEMPLATE.read_bytes()
     USER_CONFIG.parent.mkdir(parents=True, exist_ok=True)
     try:
-        with USER_CONFIG.open('x', encoding='utf-8') as config:
-            config.write(DEFAULT_USER_CONFIG)
+        with USER_CONFIG.open('xb') as config:
+            config.write(template)
     except FileExistsError:
         return
     print(f'created user config {USER_CONFIG}')

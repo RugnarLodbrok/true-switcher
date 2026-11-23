@@ -186,7 +186,9 @@ impl DictionaryAutoSwitch {
         resolve: impl Fn(&str) -> io::Result<Arc<Layout>>,
         layout_count: impl FnOnce() -> io::Result<usize>,
     ) -> io::Result<Self> {
-        if settings.dict.len() != DICTIONARY_COUNT {
+        if settings.dict.len() != DICTIONARY_COUNT
+            && (settings.auto_switch || !settings.dict.is_empty())
+        {
             return Err(invalid("Exactly two dictionaries must be configured"));
         }
         if settings.auto_switch && layout_count()? > DICTIONARY_COUNT {
@@ -228,6 +230,10 @@ impl DictionaryAutoSwitch {
             block_pattern,
             ..Self::default()
         })
+    }
+
+    pub(crate) fn is_pair_loaded(&self) -> bool {
+        self.dictionaries.len() == DICTIONARY_COUNT
     }
 
     pub(crate) fn push(&self, word: &mut Word, stroke: &Stroke) {
@@ -763,6 +769,38 @@ mod tests {
     }
 
     #[test]
+    fn installer_template_loads_before_and_after_configuring_dictionaries() {
+        let contents = include_str!("../installer/config.example.toml");
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let load = || {
+            let (config, _) = crate::config::load_from(&path).unwrap();
+            assert!(!config.auto_switch);
+            DictionaryAutoSwitch::load(
+                &config,
+                |name| Ok(Arc::new(Layout::new(name, "", "", ""))),
+                || Ok(DICTIONARY_COUNT),
+            )
+            .unwrap()
+        };
+        std::fs::write(&path, contents).unwrap();
+        assert!(!load().is_pair_loaded());
+
+        let (settings, dictionaries) = contents.split_once("# [[dict]]").unwrap();
+        let uncommented = dictionaries
+            .lines()
+            .map(|line| line.strip_prefix("# ").unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let files = directory.path().join("dictionaries");
+        std::fs::create_dir(&files).unwrap();
+        std::fs::write(files.join("en_full.txt"), "apple 1\n").unwrap();
+        std::fs::write(files.join("ru_full.txt"), "яблоко 1\n").unwrap();
+        std::fs::write(&path, format!("{settings}[[dict]]{uncommented}\n")).unwrap();
+        assert!(load().is_pair_loaded());
+    }
+
+    #[test]
     fn validates_dictionary_settings_and_layout_count() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
@@ -798,12 +836,21 @@ mod tests {
         assert_eq!(compile(&valid, 2, true).unwrap().dictionaries.len(), 2);
         assert!(compile(&valid, 3, true).is_err());
         assert_eq!(compile(&valid, 3, false).unwrap().dictionaries.len(), 2);
-        for invalid_config in [
-            String::new(),
-            us.clone(),
-            format!("{us}{us}"),
-            format!("{valid}{us}"),
-        ] {
+        for empty in ["", "dict = []"] {
+            assert!(compile(empty, 2, false).unwrap().dictionaries.is_empty());
+            let error = compile(empty, 2, true).err().unwrap();
+            assert_eq!(
+                error.to_string(),
+                "Exactly two dictionaries must be configured"
+            );
+        }
+        for setting in ["dict_skip_pattern", "dict_block_pattern"] {
+            let error = compile(&format!("{setting} = '['"), 2, false)
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains(setting));
+        }
+        for invalid_config in [us.clone(), format!("{us}{us}"), format!("{valid}{us}")] {
             for is_enabled in [true, false] {
                 assert!(compile(&invalid_config, 2, is_enabled).is_err());
             }

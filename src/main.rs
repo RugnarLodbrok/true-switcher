@@ -40,7 +40,12 @@ fn run() -> io::Result<ShutdownReason> {
     };
 
     log::set_max_level(config.log_level);
-    let _tray = tray::Tray::start(sender.clone(), &config, config_file)?;
+    let _tray = tray::Tray::start(
+        sender.clone(),
+        &config,
+        config_file,
+        auto_switch.dictionaries.is_pair_loaded(),
+    )?;
 
     let desktop = kde::KdePlasma::new()?;
     let keyboard = output::KeyboardOutput::new()?;

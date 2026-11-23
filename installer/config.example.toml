@@ -1,0 +1,46 @@
+# True Switcher configuration
+# After editing ~/.config/true-switcher/config.toml, select Reload in the tray menu.
+
+# Linux key name for correcting the last word. Hold Shift to remember the correction.
+switch_key = "KEY_PAUSE"
+
+# off, error, warn, info, debug, trace. (!) Trace logs can include typed words.
+log_level = "info"
+
+# Play a sound after a successful manual or automatic switch
+manual_switch_sound = false
+auto_switch_sound = true
+
+# Enable regex-based corrections after adding rules below, see section [[switch_rules]]
+pattern_switch = false
+
+# Enable dictionary-based corrections after configuring both dictionaries below.
+auto_switch = false
+
+# Skip dictionary entries whose word matches this entire regex.
+# An empty string keeps entries of any case. Use '.*\p{Lu}.*' to skip words containing uppercase letters.
+dict_skip_pattern = ''
+
+# Block dictionary-based correction if the entire token matches this regex.
+# The default protects punctuation-only tokens and backticks. An empty string disables it.
+dict_block_pattern = '[\p{P}\x{0060}]+'
+
+
+[[switch_rules]]       # Optional regex rule set
+target = "us"          # XKB layout identifier configured in KDE
+patterns = ['^/[a-z]']
+
+# To use dictionaries, put both files next to config.toml under dictionaries/,
+# uncomment both blocks, and set auto_switch = true or enable Auto-switch
+# for detailes check README.md
+# Paths are relative to config.toml. A higher threshold makes switching less likely.
+#
+# [[dict]]
+# target = "us"
+# file = "dictionaries/en_full.txt"
+# threshold = 15.0
+#
+# [[dict]]
+# target = "ru"
+# file = "dictionaries/ru_full.txt"
+# threshold = 15.0
