@@ -190,6 +190,15 @@ struct Dictionary {
     threshold: f64,
 }
 
+struct DictionaryComparison<'a> {
+    alternative_dictionary: &'a Dictionary,
+    delta_score: f64,
+    current_score: f64,
+    alternative_score: f64,
+    learned_current: u128,
+    learned_alternative: u128,
+}
+
 #[derive(Default)]
 pub(crate) struct DictionaryAutoSwitch {
     dictionaries: Vec<Dictionary>,
@@ -313,7 +322,7 @@ impl DictionaryAutoSwitch {
         word: &Word,
         current: &Layout,
         is_first_space: bool,
-    ) -> Option<(&Dictionary, f64)> {
+    ) -> Option<DictionaryComparison<'_>> {
         let current_index = self
             .dictionaries
             .iter()
@@ -322,7 +331,7 @@ impl DictionaryAutoSwitch {
         let (current, learned_current) = self.layout_score(word, current_index, is_first_space)?;
         let (alternative, learned_alternative) =
             self.layout_score(word, alternative_index, is_first_space)?;
-        let score = if current == f64::NEG_INFINITY && alternative == f64::NEG_INFINITY {
+        let delta_score = if current == f64::NEG_INFINITY && alternative == f64::NEG_INFINITY {
             0.0
         } else {
             let learned_delta = if learned_alternative >= learned_current {
@@ -332,7 +341,14 @@ impl DictionaryAutoSwitch {
             };
             alternative - current + learned_delta
         };
-        Some((&self.dictionaries[alternative_index], score))
+        Some(DictionaryComparison {
+            alternative_dictionary: &self.dictionaries[alternative_index],
+            delta_score,
+            current_score: current,
+            alternative_score: alternative,
+            learned_current,
+            learned_alternative,
+        })
     }
 
     pub(crate) fn target(
@@ -341,8 +357,10 @@ impl DictionaryAutoSwitch {
         current: &Layout,
         is_first_space: bool,
     ) -> Option<Arc<Layout>> {
-        let (alternative, score) = self.comparison(word, current, is_first_space)?;
-        let target = (score > alternative.threshold).then_some(&alternative.target)?;
+        let comparison = self.comparison(word, current, is_first_space)?;
+        let alternative = comparison.alternative_dictionary;
+        let target =
+            (comparison.delta_score > alternative.threshold).then_some(&alternative.target)?;
         let is_blocked = self.full_punctuation.as_ref().is_some_and(|pattern| {
             current
                 .to_text(word.strokes())
@@ -351,14 +369,41 @@ impl DictionaryAutoSwitch {
         (!is_blocked).then(|| target.clone())
     }
 
-    pub(crate) fn trace_score(&self, word: &Word, current: Option<&Layout>, is_first_space: bool) {
-        if self.dictionaries.is_empty() || !log::log_enabled!(log::Level::Trace) {
+    pub(crate) fn log_score(&self, word: &Word, current: Option<&Layout>, is_first_space: bool) {
+        if self.dictionaries.is_empty() || !log::log_enabled!(log::Level::Debug) {
             return;
         }
-        match current.and_then(|layout| self.comparison(word, layout, is_first_space)) {
-            Some((_, score)) => log::trace!("dict switch score: {score:+.2}"),
-            None => log::trace!("dict switch score: unavailable"),
+        let Some(comparison) =
+            current.and_then(|layout| self.comparison(word, layout, is_first_space))
+        else {
+            log::debug!("dict switch score: unavailable");
+            return;
+        };
+
+        let delta = comparison.delta_score;
+        let current = comparison.current_score.abs();
+        let alternative = comparison.alternative_score.abs();
+        if current.is_infinite() && alternative.is_infinite() {
+            log::debug!("dict switch score: {delta:+6.2} (both layout scores missing)");
+            return;
         }
+
+        let learned = comparison
+            .learned_alternative
+            .abs_diff(comparison.learned_current);
+        let correction = if learned == 0 {
+            String::new()
+        } else {
+            let sign = if comparison.learned_alternative > comparison.learned_current {
+                '+'
+            } else {
+                '-'
+            };
+            format!(" {sign} {learned:2}")
+        };
+        log::debug!(
+            "dict switch score: {delta:+6.2} = {current:5.2} - {alternative:5.2}{correction}"
+        );
     }
 }
 
@@ -771,14 +816,14 @@ mod tests {
                 dictionaries
                     .comparison(&word, &us, is_first_space)
                     .unwrap()
-                    .1,
+                    .delta_score,
                 -8.0
             );
             assert_eq!(
                 dictionaries
                     .comparison(&word, &ru, is_first_space)
                     .unwrap()
-                    .1,
+                    .delta_score,
                 8.0
             );
         }
@@ -789,14 +834,14 @@ mod tests {
                 dictionaries
                     .comparison(&word, &us, is_first_space)
                     .unwrap()
-                    .1,
+                    .delta_score,
                 -9.0
             );
             assert_eq!(
                 dictionaries
                     .comparison(&word, &ru, is_first_space)
                     .unwrap()
-                    .1,
+                    .delta_score,
                 9.0
             );
         }
@@ -824,7 +869,10 @@ mod tests {
         ] {
             dictionaries.push(&mut word, &Stroke { key, shift: false });
             assert_eq!(
-                dictionaries.comparison(&word, &current, false).unwrap().1,
+                dictionaries
+                    .comparison(&word, &current, false)
+                    .unwrap()
+                    .delta_score,
                 expected_score
             );
             let target = dictionaries.target(&word, &current, false);
@@ -876,7 +924,7 @@ mod tests {
             assert_eq!(
                 dictionaries
                     .comparison(&word, &current, false)
-                    .map(|(_, score)| score),
+                    .map(|comparison| comparison.delta_score),
                 expected_score
             );
             let target = dictionaries.target(&word, &current, false);
@@ -899,11 +947,14 @@ mod tests {
             let mut word = Word::default();
             dictionaries.push(&mut word, &Stroke { key, shift: false });
             let prefixes = word.dictionary_prefixes.clone();
-            let prefix_score = dictionaries.comparison(&word, &current, false).unwrap().1;
+            let prefix_score = dictionaries
+                .comparison(&word, &current, false)
+                .unwrap()
+                .delta_score;
             assert_eq!(prefix_score, 0.0);
             let score = dictionaries
                 .comparison(&word, &current, true)
-                .map(|(_, score)| score);
+                .map(|comparison| comparison.delta_score);
             assert_eq!(score, expected_score);
             let target = dictionaries.target(&word, &current, true);
             assert_eq!(target.as_deref().map(Layout::name), expected_target);
@@ -936,7 +987,10 @@ mod tests {
             let mut word = original_word.clone();
             dictionaries.push(&mut word, &stroke);
             assert_eq!(
-                dictionaries.comparison(&word, &ru, false).unwrap().1,
+                dictionaries
+                    .comparison(&word, &ru, false)
+                    .unwrap()
+                    .delta_score,
                 f64::INFINITY
             );
 
@@ -950,14 +1004,14 @@ mod tests {
                     dictionaries
                         .comparison(&word, &ru, is_first_space)
                         .unwrap()
-                        .1,
+                        .delta_score,
                     1.0
                 );
                 assert_eq!(
                     dictionaries
                         .comparison(&word, &us, is_first_space)
                         .unwrap()
-                        .1,
+                        .delta_score,
                     -1.0
                 );
                 assert!(dictionaries.target(&word, &ru, is_first_space).is_none());
@@ -965,7 +1019,13 @@ mod tests {
 
             dictionaries.learned.increment("us", "a").unwrap();
             dictionaries.learned.increment("us", "a").unwrap();
-            assert_eq!(dictionaries.comparison(&word, &ru, true).unwrap().1, 3.0);
+            assert_eq!(
+                dictionaries
+                    .comparison(&word, &ru, true)
+                    .unwrap()
+                    .delta_score,
+                3.0
+            );
             assert_eq!(dictionaries.target(&word, &ru, true).unwrap().name(), "us");
         }
     }

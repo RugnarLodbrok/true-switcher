@@ -611,7 +611,7 @@ impl Input {
         if (is_text || is_first_space) && self.settings.is_auto_switch {
             self.auto_switch
                 .dictionaries
-                .trace_score(word, self.layout.as_deref(), is_first_space);
+                .log_score(word, self.layout.as_deref(), is_first_space);
         }
         if word.has_dead_key {
             self.pending.cancel_auto();
@@ -2627,6 +2627,22 @@ threshold = 7.0
         assert!(input.pending.is_none());
     }
 
+    fn logged_dictionary_scores(
+        input: &mut Input,
+        key: KeyCode,
+        level: log::LevelFilter,
+    ) -> Vec<String> {
+        let (_, messages) = crate::test_logging::capture_at(level, || press(input, key));
+        messages
+            .into_iter()
+            .filter_map(|message| {
+                message
+                    .strip_prefix("dict switch score: ")
+                    .map(str::to_owned)
+            })
+            .collect()
+    }
+
     #[test]
     fn logs_dictionary_score_for_text_and_first_space() {
         let mut input = auto_input_with_patterns("");
@@ -2636,27 +2652,75 @@ threshold = 7.0
         ]);
 
         for (key, expected) in [
-            (KeyCode::KEY_A, Some("+3.43")),
-            (KeyCode::KEY_SPACE, Some("+3.73")),
+            (KeyCode::KEY_A, Some(" +3.43 =  4.32 -  0.89")),
+            (KeyCode::KEY_SPACE, Some(" +3.73 =  4.64 -  0.92")),
             (KeyCode::KEY_SPACE, None),
             (KeyCode::KEY_BACKSPACE, None),
             (KeyCode::KEY_BACKSPACE, None),
-            (KeyCode::KEY_P, Some("+0.00")),
-            (KeyCode::KEY_SPACE, Some("+0.00")),
+            (KeyCode::KEY_P, Some(" +0.00 =  6.64 -  6.64")),
+            (KeyCode::KEY_SPACE, Some(" +0.00 =  6.64 -  6.64")),
             (KeyCode::KEY_BACKSPACE, None),
-            (KeyCode::KEY_SPACE, Some("+0.00")),
-            (KeyCode::KEY_B, Some("-inf")),
-            (KeyCode::KEY_SPACE, Some("-inf")),
-            (KeyCode::KEY_C, Some("+inf")),
-            (KeyCode::KEY_SPACE, Some("+inf")),
-            (KeyCode::KEY_X, Some("+0.00")),
+            (KeyCode::KEY_SPACE, Some(" +0.00 =  6.64 -  6.64")),
+            (KeyCode::KEY_B, Some("  -inf =  6.64 -   inf")),
+            (KeyCode::KEY_SPACE, Some("  -inf =  6.64 -   inf")),
+            (KeyCode::KEY_C, Some("  +inf =   inf -  6.64")),
+            (KeyCode::KEY_SPACE, Some("  +inf =   inf -  6.64")),
+            (KeyCode::KEY_X, Some(" +0.00 (both layout scores missing)")),
         ] {
-            let (_, messages) = crate::test_logging::capture(|| press(&mut input, key));
-            let scores: Vec<_> = messages
-                .iter()
-                .filter_map(|message| message.strip_prefix("dict switch score: "))
-                .collect();
+            let scores = logged_dictionary_scores(&mut input, key, log::LevelFilter::Debug);
             assert_eq!(scores, expected.as_slice(), "{key:?}");
+        }
+    }
+
+    #[test]
+    fn logs_learned_dictionary_correction_as_an_integer() {
+        for (learned_current, learned_alternative, expected) in [
+            (1, 1, " +0.00 =  8.00 -  8.00"),
+            (0, 1, " +1.00 =  8.00 -  8.00 +  1"),
+            (1, 0, " -1.00 =  8.00 -  8.00 -  1"),
+            (0, 100, "+100.00 =  8.00 -  8.00 + 100"),
+        ] {
+            let mut input = auto_input_with_patterns("");
+            let mut dictionaries = crate::dictionary::test_dictionaries([
+                ("us", "", "a 1\nb 255", 200.0),
+                ("ru", "", "ф 1\nи 255", 200.0),
+            ]);
+            for _ in 0..learned_current {
+                dictionaries.learned.increment("ru", "ф").unwrap();
+            }
+            for _ in 0..learned_alternative {
+                dictionaries.learned.increment("us", "a").unwrap();
+            }
+            input.auto_switch.dictionaries = dictionaries;
+
+            let scores =
+                logged_dictionary_scores(&mut input, KeyCode::KEY_A, log::LevelFilter::Debug);
+            assert_eq!(scores, [expected]);
+        }
+    }
+
+    #[test]
+    fn filters_dictionary_score_logs_and_reports_unavailable_comparisons() {
+        use log::LevelFilter;
+
+        let mut input = auto_input_with_patterns("");
+        assert!(
+            logged_dictionary_scores(&mut input, KeyCode::KEY_A, LevelFilter::Debug).is_empty()
+        );
+
+        input.auto_switch.dictionaries =
+            crate::dictionary::test_dictionaries([("us", "", "a 1", 5.0), ("ru", "", "ф 1", 7.0)]);
+        input.accept_layout(Some(layout("de")), false);
+        for (level, expected) in [
+            (LevelFilter::Off, None),
+            (LevelFilter::Error, None),
+            (LevelFilter::Warn, None),
+            (LevelFilter::Info, None),
+            (LevelFilter::Debug, Some("unavailable")),
+            (LevelFilter::Trace, Some("unavailable")),
+        ] {
+            let scores = logged_dictionary_scores(&mut input, KeyCode::KEY_A, level);
+            assert_eq!(scores, expected.as_slice(), "{level:?}");
         }
     }
 
