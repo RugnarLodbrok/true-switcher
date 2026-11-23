@@ -209,8 +209,8 @@ dictionary-based switch can do undesired switches. To prevent these, there are _
 - `switch_key` manually corrects the last typed word. Use `Shift` + `switch_key` to also _teach_
   - to undo an unwanted switch
   - to switch word that you want to be switched automatically
-- each successful _teach_ adds score to currently typed word (unfinished words saved as-is), word with one trailing space counts.
-- score is added to `delta score` (see above) and used for auto-switch decision-making
+- each successful _teach_ adds score to currently typed word (unfinished words saved as-is), a word is also counted if _teach_ happens after trailing spaces.
+- score is added to `delta score` (see above) and affects auto-switch decision-making
 - learned rules are stored in `~/.config/true-switcher/learned-rules.toml`
 
 ```toml
