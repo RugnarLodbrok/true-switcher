@@ -194,8 +194,8 @@ struct DictionaryComparison<'a> {
     current_threshold: f64,
     alternative_dictionary: &'a Dictionary,
     delta_score: f64,
-    current_score: f64,
-    alternative_score: f64,
+    current_base_score: f64,
+    alternative_base_score: f64,
     learned_current: u128,
     learned_alternative: u128,
 }
@@ -218,7 +218,7 @@ fn score_with_learned_baseline(score: f64, learned: u128) -> f64 {
 #[derive(Default)]
 pub(crate) struct DictionaryAutoSwitch {
     dictionaries: Vec<Dictionary>,
-    ambiguity_score_floor: f64,
+    ambiguity_score_floor: Option<f64>,
     full_punctuation: Option<Regex>,
     leading_punctuation: Option<Regex>,
     pub(crate) learned: crate::learned_rules::LearnedRules,
@@ -361,8 +361,8 @@ impl DictionaryAutoSwitch {
             current_threshold: self.dictionaries[current_index].threshold,
             alternative_dictionary: &self.dictionaries[alternative_index],
             delta_score,
-            current_score,
-            alternative_score,
+            current_base_score: current,
+            alternative_base_score: alternative,
             learned_current,
             learned_alternative,
         })
@@ -379,10 +379,13 @@ impl DictionaryAutoSwitch {
         };
         let alternative = comparison.alternative_dictionary;
         let is_switch = comparison.delta_score > alternative.threshold;
+        let ambiguity_lower_bound = self
+            .ambiguity_score_floor
+            .unwrap_or(-comparison.current_threshold);
         let is_ambiguous = is_first_space
-            && comparison.current_score >= self.ambiguity_score_floor
-            && comparison.alternative_score >= self.ambiguity_score_floor
-            && comparison.delta_score >= -comparison.current_threshold
+            && comparison.current_base_score.is_finite()
+            && comparison.alternative_base_score.is_finite()
+            && comparison.delta_score >= ambiguity_lower_bound
             && comparison.delta_score <= alternative.threshold;
         if !is_switch && !is_ambiguous {
             return DictionaryDecision::Keep;
@@ -423,13 +426,8 @@ impl DictionaryAutoSwitch {
         };
 
         let delta = comparison.delta_score;
-        let current =
-            score_with_learned_baseline(comparison.current_score, comparison.learned_current).abs();
-        let alternative = score_with_learned_baseline(
-            comparison.alternative_score,
-            comparison.learned_alternative,
-        )
-        .abs();
+        let current = comparison.current_base_score.abs();
+        let alternative = comparison.alternative_base_score.abs();
         if current.is_infinite() && alternative.is_infinite() {
             log::debug!("dict switch score: {delta:+6.2} (both layout scores missing)");
             return;
@@ -459,7 +457,7 @@ pub(crate) fn test_dictionaries(
     entries: [(&str, &str, &str, f64); DICTIONARY_COUNT],
 ) -> DictionaryAutoSwitch {
     DictionaryAutoSwitch {
-        ambiguity_score_floor: crate::config::DEFAULT_AMBIGUITY_SCORE_FLOOR,
+        ambiguity_score_floor: None,
         dictionaries: entries
             .iter()
             .map(|&(name, variant, records, threshold)| Dictionary {
@@ -929,32 +927,51 @@ mod tests {
     }
 
     #[test]
-    fn ambiguity_uses_both_raw_score_floors_and_inclusive_delta_bounds() {
+    fn ambiguity_uses_inclusive_delta_bounds_and_optional_lower_bound() {
         use DictionaryDecision::{Ambiguous, Keep, Switch};
 
         let mut dictionaries = test_dictionaries([
-            ("us", "", "a 1\nb 4\nz 11", 2.0),
-            ("ru", "", "ф 4\nи 1\nя 11", 2.0),
+            ("us", "", "a 1\nb 4\nz 1048571", 2.0),
+            ("ru", "", "ф 4\nи 1\nя 1048571", 2.0),
         ]);
         let us = Layout::new("us", "", "", "");
         let a = word_from_keys(&dictionaries, &[KeyCode::KEY_A]);
         let b = word_from_keys(&dictionaries, &[KeyCode::KEY_B]);
-        dictionaries.ambiguity_score_floor = -4.0;
         for word in [&a, &b] {
             assert_eq!(dictionaries.decision(word, &us, false), Keep);
             assert_eq!(dictionaries.decision(word, &us, true), Ambiguous);
         }
 
-        dictionaries.ambiguity_score_floor = -3.99;
-        for word in [&a, &b] {
-            assert_eq!(dictionaries.decision(word, &us, true), Keep);
-        }
+        dictionaries.ambiguity_score_floor = Some(-1.0);
+        assert_eq!(dictionaries.decision(&a, &us, true), Ambiguous);
+        assert_eq!(dictionaries.decision(&b, &us, true), Keep);
 
-        dictionaries.ambiguity_score_floor = -4.0;
+        dictionaries.ambiguity_score_floor = Some(-2.0);
+        assert_eq!(dictionaries.decision(&b, &us, true), Ambiguous);
         dictionaries.learned.increment("ru", "ф").unwrap();
         dictionaries.learned.increment("us", "b").unwrap();
         assert!(matches!(dictionaries.decision(&a, &us, true), Switch(_)));
         assert_eq!(dictionaries.decision(&b, &us, true), Keep);
+
+        dictionaries.ambiguity_score_floor = Some(-3.0);
+        assert_eq!(dictionaries.decision(&b, &us, true), Ambiguous);
+    }
+
+    #[test]
+    fn ambiguity_accepts_a_learned_baseline_and_rejects_two_missing_scores() {
+        use DictionaryDecision::{Ambiguous, Keep};
+
+        let mut dictionaries =
+            test_dictionaries([("us", "", "a 1\nz 131071", 2.0), ("ru", "", "я 1", 2.0)]);
+        let us = Layout::new("us", "", "", "");
+        let a = word_from_keys(&dictionaries, &[KeyCode::KEY_A]);
+        let missing = word_from_keys(&dictionaries, &[KeyCode::KEY_B]);
+        assert_eq!(dictionaries.decision(&a, &us, true), Keep);
+        assert_eq!(dictionaries.decision(&missing, &us, true), Keep);
+
+        dictionaries.learned.increment("ru", "ф").unwrap();
+        assert_eq!(dictionaries.decision(&a, &us, true), Ambiguous);
+        assert_eq!(dictionaries.decision(&missing, &us, true), Keep);
     }
 
     #[test]
@@ -1074,7 +1091,7 @@ mod tests {
             dictionaries.learned.increment("ru", "ф").unwrap();
             assert_eq!(
                 dictionaries.decision(&word, &ru, true),
-                DictionaryDecision::Keep
+                DictionaryDecision::Ambiguous
             );
             for is_first_space in [false, true] {
                 assert_eq!(

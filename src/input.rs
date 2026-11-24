@@ -221,12 +221,10 @@ impl Input {
             PendingSwitch::Manual { is_learning, .. } => (SwitchMode::Manual, None, *is_learning),
             PendingSwitch::Idle => return None,
         };
+        let word_count = self.correction_word_count();
         Some(SwitchRequest {
-            previous: self.previous_word().cloned(),
-            words: self
-                .history
-                .latest_words(self.correction_word_count())
-                .to_vec(),
+            previous: self.history.word_before_latest(word_count).cloned(),
+            words: self.history.latest_words(word_count).to_vec(),
             target,
             mode,
             is_learning,
@@ -295,10 +293,6 @@ impl Input {
 
     pub(crate) fn runtime_settings(&self) -> RuntimeSettings {
         self.settings
-    }
-
-    pub fn previous_word(&self) -> Option<&crate::word::Word> {
-        self.history.previous_word()
     }
 
     fn set_correction_layout(&mut self, count: usize, layout: Option<Arc<crate::layout::Layout>>) {
@@ -1955,12 +1949,12 @@ patterns = ['^\.тф']
                 event_at(&mut input, 0, key, 1, now);
                 event_at(&mut input, 0, key, 0, now);
             }
-            assert!(input.previous_word().is_some());
+            assert!(input.history.word_before_latest(1).is_some());
             event_at(&mut input, 0, key, 1, now);
             event_at(&mut input, 0, key, 2, now);
             assert!(input.is_backing_off, "{key:?}");
             assert!(input.latest_word().is_none());
-            assert!(input.previous_word().is_none());
+            assert!(input.history.word_before_latest(1).is_none());
             assert!(input.pending.is_none());
             assert!(!input.pending.is_original_key_held());
             assert!(source.borrow().writes.is_empty());
@@ -2446,6 +2440,7 @@ patterns = ['^\.тф']
         let request = interceptor.take_request().unwrap();
         assert_eq!(request.mode, crate::switcher::SwitchMode::Auto);
         assert_eq!(request.words.len(), 2);
+        assert!(request.previous.is_none());
         assert_eq!(request.words[0].text().unwrap(), "f");
         assert_eq!(request.words[0].trailing_spaces, 1);
         assert_eq!(request.words[1].text().unwrap(), "r");
@@ -2457,6 +2452,7 @@ patterns = ['^\.тф']
     #[test]
     fn first_space_switch_includes_entire_ambiguous_chain() {
         let mut input = ambiguity_input("", "f 1\nbp 1\nrjhj,rbx 16");
+        tap_keys(&mut input, [KeyCode::KEY_Q, KeyCode::KEY_SPACE]);
         tap_keys(
             &mut input,
             [
@@ -2476,7 +2472,7 @@ patterns = ['^\.тф']
         let mut interceptor = enter_interceptor(&mut input).unwrap().unwrap();
         let request = interceptor.take_request().unwrap();
         assert_eq!(request.mode, crate::switcher::SwitchMode::Auto);
-        assert_eq!(request.previous.unwrap().text().unwrap(), "bp");
+        assert_eq!(request.previous.unwrap().text().unwrap(), "q");
         let target = request.target.unwrap();
         let words = request
             .words
@@ -2558,19 +2554,20 @@ patterns = ['^\.тф']
             let request = input.switch_request().unwrap();
             assert_eq!(request.mode, mode);
             assert_eq!(request.words.len(), 1);
+            assert_eq!(request.previous.unwrap().text().unwrap(), "f");
         }
     }
 
     #[test]
-    fn unmarked_word_breaks_the_ambiguous_chain() {
+    fn word_missing_in_both_layouts_breaks_the_ambiguous_chain() {
         let mut input = ambiguity_input("", "f 1\nbp 1");
         tap_keys(&mut input, [KeyCode::KEY_F, KeyCode::KEY_SPACE]);
         assert!(input.latest_word().unwrap().is_ambiguous);
+        tap_keys(&mut input, [KeyCode::KEY_Q, KeyCode::KEY_SPACE]);
+        assert!(!input.latest_word().unwrap().is_ambiguous);
         tap_keys(
             &mut input,
             [
-                KeyCode::KEY_Q,
-                KeyCode::KEY_SPACE,
                 KeyCode::KEY_B,
                 KeyCode::KEY_P,
                 KeyCode::KEY_SPACE,

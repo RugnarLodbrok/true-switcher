@@ -18,11 +18,9 @@ impl History {
         self.words.iter().rev().skip(1)
     }
 
-    pub fn previous_word(&self) -> Option<&Word> {
-        self.words
-            .len()
-            .checked_sub(2)
-            .and_then(|index| self.words.get(index))
+    pub(crate) fn word_before_latest(&self, count: usize) -> Option<&Word> {
+        let preceding_count = self.words.len().checked_sub(count)?;
+        self.words[..preceding_count].last()
     }
 
     pub fn latest_word(&self) -> Option<&Word> {
@@ -194,7 +192,7 @@ mod tests {
         press(&mut history, KeyCode::KEY_BACKSPACE);
         assert_eq!(history.latest_word().unwrap().text().as_deref(), Ok("ф"));
         assert_eq!(history.latest_word().unwrap().trailing_spaces, 2);
-        assert!(history.previous_word().is_none());
+        assert!(history.word_before_latest(1).is_none());
         for _ in 0..4 {
             press(&mut history, KeyCode::KEY_BACKSPACE);
         }

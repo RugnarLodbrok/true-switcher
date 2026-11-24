@@ -715,7 +715,7 @@ mod tests {
     }
 
     #[test]
-    fn dictionary_range_stores_one_row_with_spaces_even_when_replay_is_cancelled() {
+    fn dictionary_range_stores_context_and_spaces_even_when_replay_is_cancelled() {
         use std::sync::atomic::AtomicBool;
 
         let us = layout("us");
@@ -747,7 +747,13 @@ mod tests {
                 1,
             ),
         ];
-        for is_cancelled in [false, true] {
+        let context = make_word(&[KeyCode::KEY_Q], 1);
+        for (previous, expected_prev, is_cancelled) in [
+            (None, "", false),
+            (None, "", true),
+            (Some(&context), "q", false),
+            (Some(&context), "q", true),
+        ] {
             let (sender, receiver) = mpsc::channel();
             let statistics = Statistics { sender };
             let mut is_replayed = false;
@@ -756,7 +762,7 @@ mod tests {
                 || {},
                 || {
                     statistics.record_switch_with_mode(
-                        Some(&words[1]),
+                        previous,
                         &words,
                         &ru,
                         UNIX_EPOCH,
@@ -803,7 +809,7 @@ mod tests {
             assert_eq!(
                 row,
                 (
-                    "bp".into(),
+                    expected_prev.into(),
                     "f  bp rjhj,rb".into(),
                     "а  из коробки".into(),
                     2,
