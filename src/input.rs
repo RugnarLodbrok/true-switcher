@@ -83,7 +83,7 @@ pub enum InputRequest {
 #[derive(Debug)]
 pub struct SwitchRequest {
     pub previous: Option<crate::word::Word>,
-    pub word: Option<crate::word::Word>,
+    pub words: Vec<crate::word::Word>,
     pub target: Option<Arc<crate::layout::Layout>>,
     pub mode: crate::switcher::SwitchMode,
     pub is_learning: bool,
@@ -219,11 +219,42 @@ impl Input {
         };
         Some(SwitchRequest {
             previous: self.previous_word().cloned(),
-            word: self.latest_word().cloned(),
+            words: self
+                .history
+                .latest_words(self.correction_word_count())
+                .to_vec(),
             target,
             mode,
             is_learning,
         })
+    }
+
+    fn correction_word_count(&self) -> usize {
+        let PendingSwitch::Auto {
+            kind: AutoSwitchKind::Dictionary,
+            target,
+            ..
+        } = &self.pending
+        else {
+            return 1;
+        };
+        let Some(source) = self.layout.as_deref() else {
+            return 1;
+        };
+        1 + self
+            .history
+            .preceding_words()
+            .take_while(|word| {
+                word.is_ambiguous
+                    && word
+                        .entries
+                        .iter()
+                        .all(|entry| entry.layout.as_deref() == Some(source))
+                    && !word.has_dead_key
+                    && !word.has_dead_key_in(source)
+                    && !word.has_dead_key_in(target)
+            })
+            .count()
     }
 
     fn has_valid_pending_request(&self) -> bool {
@@ -266,17 +297,22 @@ impl Input {
         self.history.previous_word()
     }
 
-    pub fn set_latest_layout(&mut self, layout: Option<Arc<crate::layout::Layout>>) {
+    fn set_correction_layout(&mut self, count: usize, layout: Option<Arc<crate::layout::Layout>>) {
         if layout.is_some() {
             self.layout = layout.clone();
             self.observed_layout = layout.clone();
         }
-        self.history.set_latest_layout(layout);
+        self.history.set_layout_for_latest_words(count, layout);
     }
 
-    pub fn begin_correction(&mut self, layout: Option<Arc<crate::layout::Layout>>) {
-        self.set_latest_layout(layout);
-        self.history.block_auto_switch();
+    #[cfg(test)]
+    pub(crate) fn set_latest_layout(&mut self, layout: Option<Arc<crate::layout::Layout>>) {
+        self.set_correction_layout(1, layout);
+    }
+
+    pub fn begin_correction(&mut self, count: usize, layout: Option<Arc<crate::layout::Layout>>) {
+        self.set_correction_layout(count, layout);
+        self.history.block_auto_switch(count);
         self.pending.cancel_auto();
     }
 
@@ -628,29 +664,40 @@ impl Input {
     }
 
     fn update_auto_switch(&mut self, index: usize, is_first_space: bool) {
-        let target = self
-            .latest_word()
-            .zip(self.layout.as_ref())
-            .and_then(|(word, layout)| {
-                self.settings
-                    .is_pattern_switch
-                    .then(|| self.auto_switch.target(word, layout))
-                    .flatten()
-                    .map(|target| (target, AutoSwitchKind::Regex))
-                    .or_else(|| {
-                        if !self.settings.is_auto_switch {
-                            return None;
-                        }
-                        self.auto_switch
-                            .dictionaries
-                            .target(word, layout, is_first_space)
-                            .filter(|_| {
-                                !self.settings.is_pattern_switch
-                                    || !self.auto_switch.matches_current(word, layout)
-                            })
-                            .map(|target| (target, AutoSwitchKind::Dictionary))
-                    })
-            });
+        use crate::dictionary::DictionaryDecision;
+
+        let word = self.history.latest_word_mut().unwrap();
+        let Some(layout) = self.layout.as_ref() else {
+            self.pending.update_auto(index, None);
+            return;
+        };
+        if self.settings.is_pattern_switch
+            && let Some(target) = self.auto_switch.target(word, layout)
+        {
+            self.pending
+                .update_auto(index, Some((target, AutoSwitchKind::Regex)));
+            return;
+        }
+        let decision = if self.settings.is_auto_switch {
+            self.auto_switch
+                .dictionaries
+                .decision(word, layout, is_first_space)
+        } else {
+            DictionaryDecision::Keep
+        };
+        let target = match decision {
+            DictionaryDecision::Keep => None,
+            _ if self.settings.is_pattern_switch
+                && self.auto_switch.matches_current(word, layout) =>
+            {
+                None
+            }
+            DictionaryDecision::Switch(target) => Some((target, AutoSwitchKind::Dictionary)),
+            DictionaryDecision::Ambiguous => {
+                word.is_ambiguous = true;
+                None
+            }
+        };
         self.pending.update_auto(index, target);
     }
 
@@ -1282,7 +1329,11 @@ patterns = ['^\.тф']
         let request = input.switch_request().unwrap();
         assert_eq!(request.mode, crate::switcher::SwitchMode::Manual);
         assert!(request.is_learning);
-        assert!(!request.word.unwrap().entries[0].stroke.shift);
+        assert!(
+            !request.words.into_iter().last().unwrap().entries[0]
+                .stroke
+                .shift
+        );
         input.remember_word("ru", "ф").unwrap();
         let contents = std::fs::read_to_string(path).unwrap();
         let saved = contents.parse::<toml::Table>().unwrap();
@@ -1309,7 +1360,7 @@ patterns = ['^\.тф']
             .update_auto(0, Some((layout("us"), AutoSwitchKind::Regex)));
 
         assert_eq!(request.mode, crate::switcher::SwitchMode::Pattern);
-        assert_eq!(request.word, expected_word);
+        assert_eq!(request.words.last(), expected_word.as_ref());
         assert_eq!(request.target.unwrap().name(), "ru");
     }
 
@@ -1616,7 +1667,7 @@ patterns = ['^\.тф']
                 .as_deref(),
             Ok("a")
         );
-        CorrectionInterceptor::input(&mut interception).begin_correction(Some(layout("ru")));
+        CorrectionInterceptor::input(&mut interception).begin_correction(1, Some(layout("ru")));
         sender.send(InputEventMessage::CorrectionFinished {
             result: Ok(()),
             layout: Some(layout("ru")),
@@ -1644,7 +1695,7 @@ patterns = ['^\.тф']
         press(&mut input, KeyCode::KEY_A);
         event_at(&mut input, 0, KeyCode::KEY_A, 0, Instant::now());
         let mut interception = Interceptor::enter(&mut input).unwrap().unwrap();
-        CorrectionInterceptor::input(&mut interception).begin_correction(Some(layout("ru")));
+        CorrectionInterceptor::input(&mut interception).begin_correction(1, Some(layout("ru")));
         sender.send(InputEventMessage::CorrectionFinished {
             result: Ok(()),
             layout: Some(layout("ru")),
@@ -1969,7 +2020,7 @@ patterns = ['^\.тф']
         assert!(input.pending.is_some());
         assert!(!input.is_auto_request());
         input.pending.cancel();
-        input.begin_correction(Some(layout(target)));
+        input.begin_correction(1, Some(layout(target)));
         input
             .process_message(
                 InputEventMessage::CorrectionFinished {
@@ -2079,7 +2130,7 @@ patterns = ['^\.тф']
         let us = input.automatic_target().unwrap();
         assert_eq!(us.name(), "us");
         assert_eq!(input.latest_word().unwrap().text().as_deref(), Ok(".т"));
-        input.begin_correction(Some(us.clone()));
+        input.begin_correction(1, Some(us.clone()));
         input
             .process_message(
                 InputEventMessage::CorrectionFinished {
@@ -2156,6 +2207,292 @@ patterns = ['^\.тф']
     }
 
     #[test]
+    fn ambiguity_is_reassessed_only_on_the_first_space_and_cleared_by_context_reset() {
+        let mut input = auto_input_with_patterns("");
+        input.auto_switch.dictionaries =
+            crate::dictionary::test_dictionaries([("us", "", "a 1", 5.0), ("ru", "", "ф 1", 5.0)]);
+        for (key, expected) in [
+            (KeyCode::KEY_A, false),
+            (KeyCode::KEY_SPACE, true),
+            (KeyCode::KEY_SPACE, true),
+            (KeyCode::KEY_BACKSPACE, true),
+            (KeyCode::KEY_BACKSPACE, false),
+            (KeyCode::KEY_SPACE, true),
+        ] {
+            press(&mut input, key);
+            statistics_event(&mut input, key, 0);
+            assert_eq!(
+                input.latest_word().unwrap().is_ambiguous,
+                expected,
+                "{key:?}"
+            );
+            assert!(input.switch_request().is_none());
+        }
+        input
+            .process_message(InputEventMessage::FocusChanged, None)
+            .unwrap();
+        assert!(input.latest_word().is_none());
+    }
+
+    #[test]
+    fn ambiguity_respects_pattern_priority_and_dictionary_guards() {
+        use crate::switcher::SwitchMode;
+        for (source, patterns, is_auto, key, expected_mode) in [
+            (
+                "ru",
+                "'^a $'",
+                true,
+                KeyCode::KEY_A,
+                Some(SwitchMode::Pattern),
+            ),
+            ("us", "'^a $'", true, KeyCode::KEY_A, None),
+            ("us", "", false, KeyCode::KEY_A, None),
+            ("us", "", true, KeyCode::KEY_GRAVE, None),
+        ] {
+            let mut input = auto_input_with_patterns(patterns);
+            input.accept_layout(Some(layout(source)), false);
+            input.settings.is_auto_switch = is_auto;
+            input.auto_switch.dictionaries = crate::dictionary::test_dictionaries([
+                ("us", "", "a 1\n` 1", 5.0),
+                ("ru", "", "ф 1\nё 1", 5.0),
+            ]);
+            press(&mut input, key);
+            press(&mut input, KeyCode::KEY_SPACE);
+            assert_eq!(
+                input.switch_request().map(|request| request.mode),
+                expected_mode
+            );
+            assert!(!input.latest_word().unwrap().is_ambiguous);
+        }
+
+        let mut input = auto_input_with_patterns("");
+        input.auto_switch.dictionaries =
+            crate::dictionary::test_dictionaries([("us", "", "a 1", 5.0), ("ru", "", "ф 1", 5.0)]);
+        press(&mut input, KeyCode::KEY_A);
+        complete_manual_correction(&mut input, "us");
+        press(&mut input, KeyCode::KEY_SPACE);
+        assert!(!input.latest_word().unwrap().is_ambiguous);
+    }
+
+    const BOX_KEYS: [KeyCode; 7] = [
+        KeyCode::KEY_R,
+        KeyCode::KEY_J,
+        KeyCode::KEY_H,
+        KeyCode::KEY_J,
+        KeyCode::KEY_COMMA,
+        KeyCode::KEY_R,
+        KeyCode::KEY_B,
+    ];
+
+    fn ambiguity_input(patterns: &str, us_records: &str) -> Input {
+        let mut input = auto_input();
+        input.accept_layout(Some(layout("us")), false);
+        let config = crate::config::from_contents(&format!(
+            "switch_key = 'KEY_PAUSE'\npattern_switch = true\n[[switch_rules]]\ntarget = 'gb'\npatterns = [{patterns}]"
+        )).unwrap();
+        input.auto_switch =
+            crate::switch_rules::AutoSwitchRules::compile(&config, |name| Ok(layout(name)))
+                .unwrap();
+        input.auto_switch.dictionaries = crate::dictionary::test_dictionaries([
+            ("us", "", us_records, 5.0),
+            ("ru", "", "а 1\nиз 1\nкоробки 16", 5.0),
+        ]);
+        input
+    }
+
+    fn tap_keys(input: &mut Input, keys: impl IntoIterator<Item = KeyCode>) {
+        for key in keys {
+            press(input, key);
+            statistics_event(input, key, 0);
+        }
+    }
+
+    #[test]
+    fn captured_prefix_switch_includes_previous_ambiguous_word() {
+        let mut input = ambiguity_input("", "f 1\nbp 1");
+        tap_keys(&mut input, [KeyCode::KEY_F, KeyCode::KEY_SPACE]);
+        assert!(input.switch_request().is_none());
+
+        tap_keys(&mut input, [KeyCode::KEY_R]);
+        let mut interceptor = enter_interceptor(&mut input).unwrap().unwrap();
+        assert!(interceptor.input().keyboard_input.is_any_grabbed());
+        let request = interceptor.take_request().unwrap();
+        assert_eq!(request.mode, crate::switcher::SwitchMode::Auto);
+        assert_eq!(request.words.len(), 2);
+        assert_eq!(request.words[0].text().unwrap(), "f");
+        assert_eq!(request.words[0].trailing_spaces, 1);
+        assert_eq!(request.words[1].text().unwrap(), "r");
+        assert_eq!(request.words[1].trailing_spaces, 0);
+        interceptor.finish().unwrap();
+        assert!(!input.keyboard_input.is_any_grabbed());
+    }
+
+    #[test]
+    fn first_space_switch_includes_entire_ambiguous_chain() {
+        let mut input = ambiguity_input("", "f 1\nbp 1\nrjhj,rbx 16");
+        tap_keys(
+            &mut input,
+            [
+                KeyCode::KEY_F,
+                KeyCode::KEY_SPACE,
+                KeyCode::KEY_SPACE,
+                KeyCode::KEY_B,
+                KeyCode::KEY_P,
+                KeyCode::KEY_SPACE,
+            ],
+        );
+        for key in BOX_KEYS {
+            tap_keys(&mut input, [key]);
+            assert!(input.switch_request().is_none());
+        }
+        tap_keys(&mut input, [KeyCode::KEY_SPACE]);
+        let mut interceptor = enter_interceptor(&mut input).unwrap().unwrap();
+        let request = interceptor.take_request().unwrap();
+        assert_eq!(request.mode, crate::switcher::SwitchMode::Auto);
+        assert_eq!(request.previous.unwrap().text().unwrap(), "bp");
+        let target = request.target.unwrap();
+        let words = request
+            .words
+            .iter()
+            .map(|word| {
+                (
+                    target.to_text(word.strokes()).unwrap(),
+                    word.trailing_spaces,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            words,
+            [("а".into(), 2), ("из".into(), 1), ("коробки".into(), 1)]
+        );
+        interceptor.finish().unwrap();
+    }
+
+    #[test]
+    fn range_correction_updates_history_and_blocks_auto_switch_after_backspace() {
+        let mut input = ambiguity_input("'q$'", "f 1\nbp 1");
+        tap_keys(
+            &mut input,
+            [
+                KeyCode::KEY_F,
+                KeyCode::KEY_SPACE,
+                KeyCode::KEY_SPACE,
+                KeyCode::KEY_B,
+                KeyCode::KEY_P,
+                KeyCode::KEY_SPACE,
+                KeyCode::KEY_R,
+            ],
+        );
+        let mut interceptor = enter_interceptor(&mut input).unwrap().unwrap();
+        let request = interceptor.take_request().unwrap();
+        assert_eq!(request.words.len(), 3);
+        interceptor
+            .input()
+            .begin_correction(request.words.len(), request.target);
+        interceptor.finish().unwrap();
+
+        for (expected, spaces) in [("к", 0), ("из", 1), ("а", 2)] {
+            let word = input.latest_word().unwrap();
+            assert_eq!(word.text().unwrap(), expected);
+            assert_eq!(word.trailing_spaces, spaces);
+            assert!(!word.is_ambiguous);
+            let length = word.entries.len();
+            tap_keys(
+                &mut input,
+                std::iter::repeat_n(KeyCode::KEY_BACKSPACE, spaces),
+            );
+            assert!(input.history.is_auto_switch_blocked());
+            tap_keys(&mut input, [KeyCode::KEY_Q]);
+            assert!(input.switch_request().is_none());
+            tap_keys(
+                &mut input,
+                std::iter::repeat_n(KeyCode::KEY_BACKSPACE, length + 1),
+            );
+        }
+        assert!(input.latest_word().is_none());
+        assert!(!input.history.is_auto_switch_blocked());
+    }
+
+    #[test]
+    fn pattern_and_manual_requests_leave_ambiguous_context_outside_the_range() {
+        use crate::switcher::SwitchMode;
+
+        for (patterns, trigger, mode) in [
+            ("'^r$'", KeyCode::KEY_R, SwitchMode::Pattern),
+            ("", KeyCode::KEY_PAUSE, SwitchMode::Manual),
+        ] {
+            let mut input = ambiguity_input(patterns, "f 1\nbp 1");
+            tap_keys(&mut input, [KeyCode::KEY_F, KeyCode::KEY_SPACE]);
+            assert!(input.latest_word().unwrap().is_ambiguous);
+            if mode == SwitchMode::Manual {
+                tap_keys(&mut input, [KeyCode::KEY_Q]);
+            }
+            tap_keys(&mut input, [trigger]);
+            let request = input.switch_request().unwrap();
+            assert_eq!(request.mode, mode);
+            assert_eq!(request.words.len(), 1);
+        }
+    }
+
+    #[test]
+    fn unmarked_word_breaks_the_ambiguous_chain() {
+        let mut input = ambiguity_input("", "f 1\nbp 1");
+        tap_keys(&mut input, [KeyCode::KEY_F, KeyCode::KEY_SPACE]);
+        assert!(input.latest_word().unwrap().is_ambiguous);
+        tap_keys(
+            &mut input,
+            [
+                KeyCode::KEY_Q,
+                KeyCode::KEY_SPACE,
+                KeyCode::KEY_B,
+                KeyCode::KEY_P,
+                KeyCode::KEY_SPACE,
+                KeyCode::KEY_R,
+            ],
+        );
+        let request = input.switch_request().unwrap();
+        assert_eq!(
+            request
+                .words
+                .iter()
+                .map(|word| word.text().unwrap())
+                .collect::<Vec<_>>(),
+            ["bp", "r"]
+        );
+    }
+
+    #[test]
+    fn dead_key_in_either_layout_breaks_the_ambiguous_chain() {
+        for (source_variant, target_variant) in [("intl", ""), ("", "intl")] {
+            let mut input = auto_input_with_patterns("");
+            let source = Arc::new(crate::layout::Layout::new("us", source_variant, "", ""));
+            let target = Arc::new(crate::layout::Layout::new("us", target_variant, "", ""));
+            input.accept_layout(Some(source), false);
+            tap_keys(&mut input, [KeyCode::KEY_F, KeyCode::KEY_SPACE]);
+            input.history.latest_word_mut().unwrap().is_ambiguous = true;
+            tap_keys(&mut input, [KeyCode::KEY_APOSTROPHE, KeyCode::KEY_SPACE]);
+            // Check that range selection revalidates a previously marked word.
+            input.history.latest_word_mut().unwrap().is_ambiguous = true;
+            tap_keys(&mut input, [KeyCode::KEY_B, KeyCode::KEY_SPACE]);
+            input.history.latest_word_mut().unwrap().is_ambiguous = true;
+            tap_keys(&mut input, [KeyCode::KEY_R]);
+            input
+                .pending
+                .update_auto(0, Some((target, AutoSwitchKind::Dictionary)));
+
+            let request = input.switch_request().unwrap();
+            assert_eq!(
+                request
+                    .words
+                    .iter()
+                    .map(|word| word.text().unwrap())
+                    .collect::<Vec<_>>(),
+                ["b", "r"]
+            );
+        }
+    }
+
+    #[test]
     fn dictionary_switch_keeps_leading_punctuation_in_the_replayed_word() {
         let mut input = auto_input_with_patterns("");
         input.accept_layout(Some(layout("ru")), false);
@@ -2179,7 +2516,7 @@ patterns = ['^\.тф']
         assert_eq!(request.mode, crate::switcher::SwitchMode::Auto);
         let target = request.target.unwrap();
         assert_eq!(target.name(), "us");
-        let word = request.word.unwrap();
+        let word = request.words.into_iter().last().unwrap();
         assert_eq!(word.text().as_deref(), Ok("юпше"));
         assert_eq!(target.to_text(word.strokes()).as_deref(), Ok(".git"));
         assert_eq!(word.trailing_spaces, 1);
@@ -2204,7 +2541,7 @@ patterns = ['^\.тф']
         let request = input.switch_request().unwrap();
         assert_eq!(request.mode, crate::switcher::SwitchMode::Auto);
         assert_eq!(request.target.unwrap().name(), "ru");
-        let word = request.word.unwrap();
+        let word = request.words.into_iter().last().unwrap();
         assert_eq!(word.text().as_deref(), Ok("bkb"));
         assert_eq!(word.trailing_spaces, 1);
 
@@ -2453,7 +2790,7 @@ patterns = ['^\.тф']
                 crate::switcher::SwitchMode::Auto
             };
             assert_eq!(request.mode, expected_mode);
-            let word = request.word.unwrap();
+            let word = request.words.into_iter().last().unwrap();
             assert_eq!(word.trailing_spaces, 1);
             assert!(word.entries[0].stroke.shift);
             interception.finish().unwrap();
@@ -2779,7 +3116,7 @@ threshold = 7.0
         press(&mut input, KeyCode::KEY_A);
         assert_eq!(input.automatic_target().unwrap().name(), "us");
         assert!(!input.pending.is_dictionary());
-        input.begin_correction(Some(layout("us")));
+        input.begin_correction(1, Some(layout("us")));
         press(&mut input, KeyCode::KEY_B);
         assert!(input.pending.is_none());
 
@@ -2788,7 +3125,7 @@ threshold = 7.0
             crate::dictionary::test_dictionaries([("ru", "", "с 1", 5.0), ("us", "", "a 1", 5.0)]);
         press(&mut input, KeyCode::KEY_C);
         assert!(input.pending.is_dictionary());
-        input.begin_correction(Some(layout("ru")));
+        input.begin_correction(1, Some(layout("ru")));
         input.auto_switch = auto_input_with_patterns("'^ca$'").auto_switch;
         press(&mut input, KeyCode::KEY_A);
         assert!(input.pending.is_none());
@@ -3015,7 +3352,7 @@ threshold = 7.0
             } else {
                 Box::new(interception::UncapturedInterceptor::enter(&mut input).unwrap())
             };
-            interceptor.input().begin_correction(Some(layout("ru")));
+            interceptor.input().begin_correction(1, Some(layout("ru")));
             assert_eq!(
                 interceptor.input().latest_word().unwrap().text().as_deref(),
                 Ok("ф")
@@ -3040,7 +3377,7 @@ threshold = 7.0
         input.accept_layout(Some(layout("us")), false);
         press(&mut input, KeyCode::KEY_A);
         let mut interceptor = interception::UncapturedInterceptor::enter(&mut input).unwrap();
-        interceptor.input().begin_correction(Some(layout("ru")));
+        interceptor.input().begin_correction(1, Some(layout("ru")));
         press(interceptor.input(), KeyCode::KEY_B);
         assert_eq!(
             interceptor.input().latest_word().unwrap().text().as_deref(),
@@ -3069,7 +3406,7 @@ threshold = 7.0
         let mut input = auto_input();
         press(&mut input, KeyCode::KEY_A);
         let mut interceptor = interception::UncapturedInterceptor::enter(&mut input).unwrap();
-        interceptor.input().begin_correction(Some(layout("us")));
+        interceptor.input().begin_correction(1, Some(layout("us")));
         for key in [
             KeyCode::KEY_SPACE,
             KeyCode::KEY_SLASH,

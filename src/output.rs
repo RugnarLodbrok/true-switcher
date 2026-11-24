@@ -72,23 +72,14 @@ impl KeyboardOutput {
     }
 
     /// Send one Backspace tap per character to remove, including trailing spaces.
-    pub fn erase(&mut self, count: usize, is_cancelled: &AtomicBool) -> io::Result<()> {
-        self.strokes(
-            std::iter::repeat_n(
-                Stroke {
-                    key: KeyCode::KEY_BACKSPACE,
-                    shift: false,
-                },
-                count,
-            ),
-            is_cancelled,
-        )
+    pub fn erase(&mut self, words: &[Word], is_cancelled: &AtomicBool) -> io::Result<()> {
+        self.strokes(erase_strokes(words), is_cancelled)
     }
 
     /// Replay each stored stroke as a tap, including repeats, then all spaces.
     /// This does not change the active layout or the stored word.
-    pub fn replay(&mut self, word: &Word, is_cancelled: &AtomicBool) -> io::Result<()> {
-        self.strokes(replay_strokes(word)?, is_cancelled)
+    pub fn replay(&mut self, words: &[Word], is_cancelled: &AtomicBool) -> io::Result<()> {
+        self.strokes(replay_strokes(words)?, is_cancelled)
     }
 
     fn strokes(
@@ -155,22 +146,41 @@ fn emit_batch(
     result
 }
 
-fn replay_strokes(word: &Word) -> io::Result<impl Iterator<Item = Stroke> + '_> {
-    // Validate before typing anything, so unsupported keys cannot leave a
-    // partially replayed word or trigger navigation/shortcuts.
-    if word.strokes().any(|stroke| !is_text_key(stroke.key)) {
+fn erase_strokes(words: &[Word]) -> impl Iterator<Item = Stroke> {
+    let count = words
+        .iter()
+        .map(|word| word.entries.len() + word.trailing_spaces)
+        .sum();
+    std::iter::repeat_n(
+        Stroke {
+            key: KeyCode::KEY_BACKSPACE,
+            shift: false,
+        },
+        count,
+    )
+}
+
+fn replay_strokes(words: &[Word]) -> io::Result<impl Iterator<Item = Stroke> + '_> {
+    // Validate the whole range before replaying any of it.
+    if words
+        .iter()
+        .flat_map(Word::strokes)
+        .any(|stroke| !is_text_key(stroke.key))
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "word contains a non-text key",
         ));
     }
-    Ok(word.strokes().copied().chain(std::iter::repeat_n(
-        Stroke {
-            key: KeyCode::KEY_SPACE,
-            shift: false,
-        },
-        word.trailing_spaces,
-    )))
+    let space = Stroke {
+        key: KeyCode::KEY_SPACE,
+        shift: false,
+    };
+    Ok(words.iter().flat_map(move |word| {
+        word.strokes()
+            .copied()
+            .chain(std::iter::repeat_n(space, word.trailing_spaces))
+    }))
 }
 
 fn emit_strokes(
@@ -281,7 +291,11 @@ mod tests {
             trailing_spaces: 3,
             ..Default::default()
         };
-        assert_batch_matches_legacy(replay_strokes(&word).unwrap().collect());
+        assert_batch_matches_legacy(
+            replay_strokes(std::slice::from_ref(&word))
+                .unwrap()
+                .collect(),
+        );
     }
 
     #[test]
@@ -354,6 +368,44 @@ mod tests {
     }
 
     #[test]
+    fn erase_and_replay_cover_every_word_and_space_in_the_range() {
+        let word = |key, trailing_spaces| Word {
+            entries: vec![crate::word::WordStroke {
+                stroke: Stroke { key, shift: false },
+                layout: None,
+            }],
+            trailing_spaces,
+            ..Default::default()
+        };
+        let words = [
+            word(KeyCode::KEY_F, 2),
+            word(KeyCode::KEY_B, 1),
+            word(KeyCode::KEY_R, 1),
+        ];
+        assert_eq!(
+            erase_strokes(&words)
+                .map(|stroke| stroke.key)
+                .collect::<Vec<_>>(),
+            [KeyCode::KEY_BACKSPACE; 7],
+        );
+        assert_eq!(
+            replay_strokes(&words)
+                .unwrap()
+                .map(|stroke| stroke.key)
+                .collect::<Vec<_>>(),
+            [
+                KeyCode::KEY_F,
+                KeyCode::KEY_SPACE,
+                KeyCode::KEY_SPACE,
+                KeyCode::KEY_B,
+                KeyCode::KEY_SPACE,
+                KeyCode::KEY_R,
+                KeyCode::KEY_SPACE
+            ],
+        );
+    }
+
+    #[test]
     fn replay_preserves_word_and_spaces_and_deletion_matches_their_length() {
         let word = Word {
             entries: vec![
@@ -373,10 +425,13 @@ mod tests {
             ..Default::default()
         };
         let mut events = Vec::new();
-        emit_strokes(replay_strokes(&word).unwrap(), |key, value| {
-            events.push((key, value));
-            Ok(())
-        })
+        emit_strokes(
+            replay_strokes(std::slice::from_ref(&word)).unwrap(),
+            |key, value| {
+                events.push((key, value));
+                Ok(())
+            },
+        )
         .unwrap();
         assert_eq!(
             events
@@ -415,7 +470,7 @@ mod tests {
         );
         assert_eq!(word.entries.len(), 2);
         assert_eq!(word.trailing_spaces, 3);
-        assert_eq!(replay_strokes(&Word::default()).unwrap().count(), 0);
+        assert_eq!(replay_strokes(&[Word::default()]).unwrap().count(), 0);
     }
 
     #[test]
@@ -441,7 +496,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            matches!(replay_strokes(&word), Err(error) if error.kind() == io::ErrorKind::InvalidInput)
+            matches!(replay_strokes(std::slice::from_ref(&word)), Err(error) if error.kind() == io::ErrorKind::InvalidInput)
         );
     }
 

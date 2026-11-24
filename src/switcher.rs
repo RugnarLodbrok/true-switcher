@@ -17,7 +17,7 @@ pub enum SwitchMode {
 
 struct Correction {
     previous: Option<word::Word>,
-    word: Option<word::Word>,
+    words: Vec<word::Word>,
     target: Option<Arc<layout::Layout>>,
     mode: SwitchMode,
     is_sound_enabled: bool,
@@ -28,7 +28,7 @@ impl Correction {
     fn from_request(request: input::SwitchRequest, settings: RuntimeSettings) -> Self {
         Self {
             previous: request.previous,
-            word: request.word,
+            words: request.words,
             target: request.target,
             mode: request.mode,
             is_learning: request.is_learning,
@@ -40,16 +40,7 @@ impl Correction {
     }
 
     fn has_dead_key_in(&self, layout: &layout::Layout) -> bool {
-        self.word.as_ref().is_some_and(|word| {
-            let space = word::Stroke {
-                key: evdev::KeyCode::KEY_SPACE,
-                shift: false,
-            };
-            let strokes = word
-                .strokes()
-                .chain((word.trailing_spaces > 0).then_some(&space));
-            crate::xkb::has_dead_key(layout, strokes) == Ok(true)
-        })
+        self.words.iter().any(|word| word.has_dead_key_in(layout))
     }
 
     fn learned_word(
@@ -60,7 +51,7 @@ impl Correction {
         if !self.is_learning || *outcome != CorrectionOutcome::Completed {
             return Ok(None);
         }
-        let Some(word) = &self.word else {
+        let Some(word) = self.words.last() else {
             return Ok(None);
         };
         let mut text = layout.to_text(word.strokes())?;
@@ -151,7 +142,7 @@ impl Switcher {
             Some(target) if correction.has_dead_key_in(target) => {
                 return Ok(CorrectionOutcome::Cancelled);
             }
-            None if correction.word.is_some() => {
+            None if !correction.words.is_empty() => {
                 let (index, layout) = kde::next_layout()?;
                 if correction.has_dead_key_in(&layout) || interception.read_available()? {
                     return Ok(CorrectionOutcome::Cancelled);
@@ -182,12 +173,14 @@ impl Switcher {
                 record_switch(
                     statistics,
                     correction.previous.as_ref(),
-                    correction.word.as_ref(),
+                    &correction.words,
                     correction.mode,
                 )
             },
             |target| {
-                interception.input().begin_correction(target.clone());
+                interception
+                    .input()
+                    .begin_correction(correction.words.len(), target.clone());
                 let outcome = Self::correct(keyboard, layouts, interception, correction)?;
                 if let Some(target) = target
                     .as_deref()
@@ -210,7 +203,7 @@ impl Switcher {
         thread::scope(|scope| -> ProcessingResult<CorrectionOutcome> {
             let worker = scope.spawn(|| {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    correct_word(correction, keyboard, &is_cancelled)
+                    correct_words(correction, keyboard, &is_cancelled)
                 }))
                 .unwrap_or_else(|_| Err(io::Error::other("correction thread panicked")));
                 layouts.finish_correction(result);
@@ -252,7 +245,7 @@ impl Switcher {
     }
 }
 
-fn correct_word(
+fn correct_words(
     correction: &Correction,
     keyboard: &mut output::KeyboardOutput,
     is_cancelled: &AtomicBool,
@@ -262,17 +255,11 @@ fn correct_word(
         is_cancelled,
         |keyboard| {
             log::debug!("SYNTHETIC erase");
-            if let Some(word) = &correction.word {
-                keyboard.erase(word.entries.len() + word.trailing_spaces, is_cancelled)?;
-            }
-            Ok(())
+            keyboard.erase(&correction.words, is_cancelled)
         },
         |keyboard| {
             log::debug!("SYNTHETIC replay");
-            if let Some(word) = &correction.word {
-                keyboard.replay(word, is_cancelled)?;
-            }
-            Ok(())
+            keyboard.replay(&correction.words, is_cancelled)
         },
     )
 }
@@ -296,13 +283,13 @@ pub(crate) fn replay_correction<T>(
 fn record_switch(
     statistics: &statistics::Statistics,
     previous: Option<&word::Word>,
-    word: Option<&word::Word>,
+    words: &[word::Word],
     mode: SwitchMode,
 ) -> Option<Arc<layout::Layout>> {
     let time = SystemTime::now();
     match kde::current_layout() {
         Ok(target) => {
-            statistics.record_switch_with_mode(previous, word, &target, time, mode);
+            statistics.record_switch_with_mode(previous, words, &target, time, mode);
             Some(target)
         }
         Err(error) => {
@@ -337,7 +324,7 @@ mod tests {
             Correction::from_request(
                 input::SwitchRequest {
                     previous: None,
-                    word: None,
+                    words: vec![],
                     target: None,
                     mode,
                     is_learning: false,
@@ -366,7 +353,7 @@ mod tests {
             mode: SwitchMode::Manual,
             target: None,
             previous: None,
-            word: Some(word::Word {
+            words: vec![word::Word {
                 entries: vec![word::WordStroke {
                     stroke: word::Stroke {
                         key: evdev::KeyCode::KEY_APOSTROPHE,
@@ -375,7 +362,7 @@ mod tests {
                     layout: None,
                 }],
                 ..Default::default()
-            }),
+            }],
             is_sound_enabled: false,
             is_learning: false,
         };
@@ -388,7 +375,7 @@ mod tests {
         let mut correction = Correction::from_request(
             input::SwitchRequest {
                 previous: None,
-                word: Some(word::Word {
+                words: vec![word::Word {
                     entries: vec![word::WordStroke {
                         stroke: word::Stroke {
                             key: evdev::KeyCode::KEY_A,
@@ -398,7 +385,7 @@ mod tests {
                     }],
                     trailing_spaces: 2,
                     ..Default::default()
-                }),
+                }],
                 target: None,
                 mode: SwitchMode::Manual,
                 is_learning: true,
@@ -419,7 +406,7 @@ mod tests {
                 .unwrap(),
             None
         );
-        correction.word = None;
+        correction.words.clear();
         assert_eq!(
             correction
                 .learned_word(&CorrectionOutcome::Completed, &target)

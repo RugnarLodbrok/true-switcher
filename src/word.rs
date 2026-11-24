@@ -16,6 +16,8 @@ pub struct Word {
     pub trailing_spaces: usize,
     pub(crate) dictionary_prefixes: Vec<Vec<crate::dictionary::Prefix>>,
     pub(crate) has_dead_key: bool,
+    pub(crate) is_ambiguous: bool,
+    pub(crate) is_range_corrected: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -27,6 +29,17 @@ pub struct WordStroke {
 impl Word {
     pub fn strokes(&self) -> impl Iterator<Item = &Stroke> {
         self.entries.iter().map(|entry| &entry.stroke)
+    }
+
+    pub(crate) fn has_dead_key_in(&self, layout: &crate::layout::Layout) -> bool {
+        let space = Stroke {
+            key: KeyCode::KEY_SPACE,
+            shift: false,
+        };
+        let strokes = self
+            .strokes()
+            .chain((self.trailing_spaces > 0).then_some(&space));
+        crate::xkb::has_dead_key(layout, strokes) == Ok(true)
     }
 
     pub fn text(&self) -> Result<String, crate::xkb::ConversionError> {

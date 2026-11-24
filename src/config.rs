@@ -11,6 +11,7 @@ use toml_edit::DocumentMut;
 const CONFIG_DIRECTORY: &str = ".config/true-switcher";
 const CONFIG_FILE: &str = "config.toml";
 const LOG_LEVEL_KEY: &str = "log_level";
+pub(crate) const DEFAULT_AMBIGUITY_SCORE_FLOOR: f64 = -18.0;
 pub(crate) const DEFAULT_PUNCTUATION: &str = r"[`~<>\p{P}]+";
 pub(crate) const LOG_LEVELS: [(&str, log::LevelFilter); 6] = [
     ("off", log::LevelFilter::Off),
@@ -44,6 +45,11 @@ pub struct Configuration {
     pub dict_skip_pattern: String,
     #[serde(default = "default_punctuation")]
     pub punctuation: String,
+    #[serde(
+        default = "default_ambiguity_score_floor",
+        deserialize_with = "deserialize_ambiguity_score_floor"
+    )]
+    pub ambiguity_score_floor: f64,
     #[serde(default)]
     pub dict: Vec<DictionarySettings>,
 }
@@ -113,6 +119,23 @@ fn default_log_level() -> log::LevelFilter {
 
 fn default_punctuation() -> String {
     DEFAULT_PUNCTUATION.to_owned()
+}
+
+fn default_ambiguity_score_floor() -> f64 {
+    DEFAULT_AMBIGUITY_SCORE_FLOOR
+}
+
+fn deserialize_ambiguity_score_floor<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<f64, D::Error> {
+    let value = f64::deserialize(deserializer)?;
+    if value.is_finite() && value <= 0.0 {
+        Ok(value)
+    } else {
+        Err(de::Error::custom(
+            "ambiguity_score_floor must be finite and nonpositive",
+        ))
+    }
 }
 
 fn deserialize_log_level<'de, D: Deserializer<'de>>(
@@ -231,6 +254,32 @@ fn config_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_and_validates_ambiguity_score_floor() {
+        const BASE: &str = "switch_key = 'KEY_PAUSE'";
+        for contents in [BASE, include_str!("../installer/config.example.toml")] {
+            assert_eq!(
+                from_contents(contents).unwrap().ambiguity_score_floor,
+                DEFAULT_AMBIGUITY_SCORE_FLOOR
+            );
+        }
+        for (value, expected) in [("-12.5", -12.5), ("0", 0.0)] {
+            let contents = format!("{BASE}\nambiguity_score_floor = {value}");
+            assert_eq!(
+                from_contents(&contents).unwrap().ambiguity_score_floor,
+                expected
+            );
+        }
+        for value in ["'low'", "true", "1", "inf", "-inf", "nan"] {
+            let contents = format!("{BASE}\nambiguity_score_floor = {value}");
+            let error = from_contents(&contents).err().expect(value);
+            assert!(
+                error.to_string().contains("ambiguity_score_floor"),
+                "{error}"
+            );
+        }
+    }
 
     #[test]
     fn resolves_dictionary_path_from_config_location() {

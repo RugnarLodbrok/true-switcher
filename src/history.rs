@@ -10,6 +10,14 @@ pub struct History {
 }
 
 impl History {
+    pub(crate) fn latest_words(&self, count: usize) -> &[Word] {
+        &self.words[self.words.len().saturating_sub(count)..]
+    }
+
+    pub(crate) fn preceding_words(&self) -> impl Iterator<Item = &Word> {
+        self.words.iter().rev().skip(1)
+    }
+
     pub fn previous_word(&self) -> Option<&Word> {
         self.words
             .len()
@@ -25,16 +33,37 @@ impl History {
         self.words.last_mut()
     }
 
-    pub fn block_auto_switch(&mut self) {
-        self.is_auto_switch_blocked = self.latest_word().is_some();
+    pub fn block_auto_switch(&mut self, count: usize) {
+        self.is_auto_switch_blocked = count > 0 && self.latest_word().is_some();
+        if count > 1 {
+            // Backspace can make any word in the corrected range current again.
+            let start = self.words.len().saturating_sub(count);
+            for word in &mut self.words[start..] {
+                word.is_range_corrected = true;
+            }
+        }
     }
 
     pub fn is_auto_switch_blocked(&self) -> bool {
         self.is_auto_switch_blocked
+            || self
+                .latest_word()
+                .is_some_and(|word| word.is_range_corrected)
     }
 
+    #[cfg(test)]
     pub fn set_latest_layout(&mut self, layout: Option<Arc<Layout>>) {
-        if let Some(word) = self.words.last_mut() {
+        self.set_layout_for_latest_words(1, layout);
+    }
+
+    pub(crate) fn set_layout_for_latest_words(
+        &mut self,
+        count: usize,
+        layout: Option<Arc<Layout>>,
+    ) {
+        let start = self.words.len().saturating_sub(count);
+        for word in &mut self.words[start..] {
+            word.is_ambiguous = false;
             for entry in &mut word.entries {
                 entry.layout = layout.clone();
             }
@@ -92,6 +121,9 @@ impl History {
         };
         if word.trailing_spaces > 0 {
             word.trailing_spaces -= 1;
+            if word.trailing_spaces == 0 {
+                word.is_ambiguous = false;
+            }
             return;
         }
         word.entries.pop();

@@ -42,7 +42,7 @@ struct SwitchRecord {
 enum PendingRecord {
     Switch {
         previous: Option<Word>,
-        word: Option<Word>,
+        words: Vec<Word>,
         target: Layout,
         time: SystemTime,
         mode: SwitchMode,
@@ -82,20 +82,26 @@ impl Statistics {
         target: &Layout,
         time: SystemTime,
     ) {
-        self.record_switch_with_mode(previous, word, target, time, SwitchMode::Manual);
+        self.record_switch_with_mode(
+            previous,
+            word.map(std::slice::from_ref).unwrap_or_default(),
+            target,
+            time,
+            SwitchMode::Manual,
+        );
     }
 
     pub fn record_switch_with_mode(
         &self,
         previous: Option<&Word>,
-        word: Option<&Word>,
+        words: &[Word],
         target: &Layout,
         time: SystemTime,
         mode: SwitchMode,
     ) {
         self.send(PendingRecord::Switch {
             previous: previous.cloned(),
-            word: word.cloned(),
+            words: words.to_vec(),
             target: target.clone(),
             time,
             mode,
@@ -135,11 +141,11 @@ fn convert_record(pending: PendingRecord) -> Option<Record> {
             .map(|text| Record::TypingWord(text.to_lowercase())),
         PendingRecord::Switch {
             previous,
-            word,
+            words,
             target,
             time,
             mode,
-        } => make_record(previous.as_ref(), word.as_ref(), &target, time).map(|mut record| {
+        } => make_record(previous.as_ref(), &words, &target, time).map(|mut record| {
             record.mode = mode;
             Record::Switch(record)
         }),
@@ -148,7 +154,7 @@ fn convert_record(pending: PendingRecord) -> Option<Record> {
 
 fn make_record(
     previous: Option<&Word>,
-    word: Option<&Word>,
+    words: &[Word],
     target: &Layout,
     time: SystemTime,
 ) -> Option<SwitchRecord> {
@@ -166,13 +172,23 @@ fn make_record(
         prev: previous
             .map(|word| word.text().ok())
             .unwrap_or_else(|| Some(String::new()))?,
-        a: word
-            .map(|word| word.text().ok())
-            .unwrap_or_else(|| Some(String::new()))?,
-        b: word
-            .map(|word| target.to_text(word.strokes()).ok())
-            .unwrap_or_else(|| Some(String::new()))?,
+        a: range_text(words, Word::text)?,
+        b: range_text(words, |word| target.to_text(word.strokes()))?,
     })
+}
+
+fn range_text(
+    words: &[Word],
+    render: impl Fn(&Word) -> Result<String, crate::xkb::ConversionError>,
+) -> Option<String> {
+    let mut text = String::new();
+    for (index, word) in words.iter().enumerate() {
+        text.push_str(&render(word).ok()?);
+        if index + 1 < words.len() {
+            text.extend(std::iter::repeat_n(' ', word.trailing_spaces));
+        }
+    }
+    Some(text)
 }
 
 fn database_path(
@@ -269,7 +285,7 @@ mod tests {
         statistics.record_word(original.clone());
         statistics.record_switch_with_mode(
             None,
-            Some(&original),
+            std::slice::from_ref(&original),
             &layout("ru"),
             UNIX_EPOCH,
             SwitchMode::Auto,
@@ -284,13 +300,13 @@ mod tests {
         assert!(convert_record(PendingRecord::TypingWord(snapshot)).is_none());
         let switch = receiver.recv().unwrap();
         let PendingRecord::Switch {
-            word: Some(snapshot),
-            time,
-            mode,
-            ..
+            words, time, mode, ..
         } = &switch
         else {
             panic!("expected switch snapshot")
+        };
+        let [snapshot] = words.as_slice() else {
+            panic!("expected one word")
         };
         assert_eq!(snapshot.entries.len(), 3);
         assert_eq!(*time, UNIX_EPOCH);
@@ -311,7 +327,7 @@ mod tests {
         statistics.record_word(unknown);
         statistics.record_switch_with_mode(
             None,
-            Some(&word("us")),
+            &[word("us")],
             &layout("ru"),
             UNIX_EPOCH + Duration::from_secs(123),
             SwitchMode::Auto,
@@ -360,7 +376,7 @@ mod tests {
         let connection = Connection::open_in_memory().unwrap();
         connection.execute_batch("CREATE TABLE switches (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER NOT NULL, prev TEXT NOT NULL, a TEXT NOT NULL, b TEXT NOT NULL); INSERT INTO switches (timestamp, prev, a, b) VALUES (1, '', 'old', 'old');").unwrap();
         prepare_schema(&connection).unwrap();
-        let mut record = make_record(None, None, &layout("us"), UNIX_EPOCH).unwrap();
+        let mut record = make_record(None, &[], &layout("us"), UNIX_EPOCH).unwrap();
         for mode in [SwitchMode::Pattern, SwitchMode::Auto, SwitchMode::Manual] {
             record.mode = mode;
             insert(&connection, &Record::Switch(record.clone())).unwrap();
@@ -576,7 +592,13 @@ mod tests {
         let previous = word("ru");
         let original = word("us");
         let time = UNIX_EPOCH + Duration::from_secs(123);
-        let record = make_record(Some(&previous), Some(&original), &layout("ru"), time).unwrap();
+        let record = make_record(
+            Some(&previous),
+            std::slice::from_ref(&original),
+            &layout("ru"),
+            time,
+        )
+        .unwrap();
         assert_eq!(
             record,
             SwitchRecord {
@@ -591,17 +613,25 @@ mod tests {
 
     #[test]
     fn absent_words_are_empty_but_unknown_layout_skips_the_record() {
-        let record = make_record(None, None, &layout("us"), UNIX_EPOCH).unwrap();
+        let record = make_record(None, &[], &layout("us"), UNIX_EPOCH).unwrap();
         assert_eq!(
             (&record.prev, &record.a, &record.b),
             (&String::new(), &String::new(), &String::new())
         );
         let mut unknown = word("us");
         unknown.entries[0].layout = None;
-        assert!(make_record(None, Some(&unknown), &layout("ru"), UNIX_EPOCH).is_none());
-        assert!(make_record(Some(&unknown), None, &layout("ru"), UNIX_EPOCH).is_none());
+        assert!(
+            make_record(
+                None,
+                std::slice::from_ref(&unknown),
+                &layout("ru"),
+                UNIX_EPOCH
+            )
+            .is_none()
+        );
+        assert!(make_record(Some(&unknown), &[], &layout("ru"), UNIX_EPOCH).is_none());
         let invalid = layout("\0");
-        assert!(make_record(None, Some(&word("us")), &invalid, UNIX_EPOCH).is_none());
+        assert!(make_record(None, &[word("us")], &invalid, UNIX_EPOCH).is_none());
     }
 
     #[test]
@@ -609,10 +639,18 @@ mod tests {
         let mut original = word("us");
         original.entries[1].stroke.key = KeyCode::KEY_APOSTROPHE;
         let target = Arc::new(Layout::new("us", "intl", "", ""));
-        assert!(make_record(None, Some(&original), &target, UNIX_EPOCH).is_none());
+        assert!(make_record(None, std::slice::from_ref(&original), &target, UNIX_EPOCH).is_none());
         original.entries[1].layout = Some(target);
-        assert!(make_record(None, Some(&original), &layout("ru"), UNIX_EPOCH).is_none());
-        assert!(make_record(Some(&original), None, &layout("ru"), UNIX_EPOCH).is_none());
+        assert!(
+            make_record(
+                None,
+                std::slice::from_ref(&original),
+                &layout("ru"),
+                UNIX_EPOCH
+            )
+            .is_none()
+        );
+        assert!(make_record(Some(&original), &[], &layout("ru"), UNIX_EPOCH).is_none());
         assert!(convert_record(PendingRecord::TypingWord(original)).is_none());
     }
 
@@ -672,8 +710,107 @@ mod tests {
     fn database_write_error_is_returned_for_logging() {
         let connection = Connection::open_in_memory().unwrap();
         connection.execute_batch("PRAGMA query_only = ON").unwrap();
-        let record = make_record(None, None, &layout("us"), UNIX_EPOCH).unwrap();
+        let record = make_record(None, &[], &layout("us"), UNIX_EPOCH).unwrap();
         assert!(insert(&connection, &Record::Switch(record)).is_err());
+    }
+
+    #[test]
+    fn dictionary_range_stores_one_row_with_spaces_even_when_replay_is_cancelled() {
+        use std::sync::atomic::AtomicBool;
+
+        let us = layout("us");
+        let ru = layout("ru");
+        let make_word = |keys: &[KeyCode], trailing_spaces| Word {
+            entries: keys
+                .iter()
+                .map(|&key| crate::word::WordStroke {
+                    stroke: Stroke { key, shift: false },
+                    layout: Some(us.clone()),
+                })
+                .collect(),
+            trailing_spaces,
+            ..Default::default()
+        };
+        let words = [
+            make_word(&[KeyCode::KEY_F], 2),
+            make_word(&[KeyCode::KEY_B, KeyCode::KEY_P], 1),
+            make_word(
+                &[
+                    KeyCode::KEY_R,
+                    KeyCode::KEY_J,
+                    KeyCode::KEY_H,
+                    KeyCode::KEY_J,
+                    KeyCode::KEY_COMMA,
+                    KeyCode::KEY_R,
+                    KeyCode::KEY_B,
+                ],
+                1,
+            ),
+        ];
+        for is_cancelled in [false, true] {
+            let (sender, receiver) = mpsc::channel();
+            let statistics = Statistics { sender };
+            let mut is_replayed = false;
+            crate::switcher::switch_and_correct::<_, _, io::Error>(
+                || Ok(()),
+                || {},
+                || {
+                    statistics.record_switch_with_mode(
+                        Some(&words[1]),
+                        &words,
+                        &ru,
+                        UNIX_EPOCH,
+                        SwitchMode::Auto,
+                    )
+                },
+                |_| {
+                    crate::switcher::replay_correction(
+                        &mut is_replayed,
+                        &AtomicBool::new(is_cancelled),
+                        |_| Ok(()),
+                        |is_replayed| {
+                            *is_replayed = true;
+                            Ok(())
+                        },
+                    )
+                },
+            )
+            .unwrap();
+            assert_eq!(is_replayed, !is_cancelled);
+
+            let connection = Connection::open_in_memory().unwrap();
+            prepare_schema(&connection).unwrap();
+            drop(statistics);
+            write_records(receiver, |record| {
+                insert(&connection, record)?;
+                Ok(())
+            });
+            let row: (String, String, String, i64, i64) = connection
+                .query_row(
+                    "SELECT prev, a, b, mode, (SELECT count(*) FROM switches) FROM switches",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                row,
+                (
+                    "bp".into(),
+                    "f  bp rjhj,rb".into(),
+                    "а  из коробки".into(),
+                    2,
+                    1
+                )
+            );
+        }
     }
 
     #[test]
@@ -704,7 +841,13 @@ mod tests {
             assert_eq!(
                 received.recv_timeout(TEST_TIMEOUT).unwrap(),
                 Record::Switch(
-                    make_record(Some(&previous), Some(&original), &layout("ru"), time).unwrap()
+                    make_record(
+                        Some(&previous),
+                        std::slice::from_ref(&original),
+                        &layout("ru"),
+                        time
+                    )
+                    .unwrap()
                 )
             );
         }

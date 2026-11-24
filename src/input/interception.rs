@@ -287,18 +287,18 @@ pub trait CorrectionInterceptor {
 pub fn enter_interceptor(
     input: &mut Input,
 ) -> ProcessingResult<Option<Box<dyn CorrectionInterceptor + '_>>> {
-    if IS_CAPTURE_ENABLED {
-        Ok(Interceptor::enter(input)?
-            .map(|interceptor| Box::new(interceptor) as Box<dyn CorrectionInterceptor>))
-    } else {
+    if !IS_CAPTURE_ENABLED {
         input.process_available_events(None)?;
-        if input.has_valid_pending_request() {
-            Ok(Some(Box::new(UncapturedInterceptor::enter(input)?)))
-        } else {
+        if !input.has_valid_pending_request() {
             input.pending.cancel();
-            Ok(None)
+            return Ok(None);
+        }
+        if input.correction_word_count() == 1 {
+            return Ok(Some(Box::new(UncapturedInterceptor::enter(input)?)));
         }
     }
+    Ok(Interceptor::enter(input)?
+        .map(|interceptor| Box::new(interceptor) as Box<dyn CorrectionInterceptor>))
 }
 
 impl CorrectionInterceptor for Interceptor<'_> {

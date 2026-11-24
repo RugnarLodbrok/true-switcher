@@ -17,6 +17,9 @@ pattern_switch = false
 # Enable dictionary-based corrections after configuring both dictionaries below.
 auto_switch = false
 
+# Minimum score in both layouts for a word to join the next dictionary correction.
+ambiguity_score_floor = -18
+
 # Skip dictionary entries whose word matches this entire regex.
 # An empty string keeps entries of any case. Use '.*\p{Lu}.*' to skip words containing uppercase letters.
 dict_skip_pattern = ''
