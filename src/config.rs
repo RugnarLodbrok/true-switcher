@@ -11,6 +11,7 @@ use toml_edit::DocumentMut;
 const CONFIG_DIRECTORY: &str = ".config/true-switcher";
 const CONFIG_FILE: &str = "config.toml";
 const LOG_LEVEL_KEY: &str = "log_level";
+pub(crate) const DEFAULT_MOUSE_MOTION_PAUSE_MS: u64 = 500;
 pub(crate) const DEFAULT_AMBIGUITY_SCORE_FLOOR: f64 = -18.0;
 pub(crate) const DEFAULT_PUNCTUATION: &str = r"[`~<>\p{P}]+";
 pub(crate) const LOG_LEVELS: [(&str, log::LevelFilter); 6] = [
@@ -37,6 +38,8 @@ pub struct Configuration {
     pub auto_switch: bool,
     #[serde(default)]
     pub pattern_switch: bool,
+    #[serde(default = "default_mouse_motion_pause_ms")]
+    pub mouse_motion_pause_ms: u64,
     #[serde(default = "enabled")]
     pub auto_switch_sound: bool,
     #[serde(default)]
@@ -119,6 +122,10 @@ fn default_log_level() -> log::LevelFilter {
 
 fn default_punctuation() -> String {
     DEFAULT_PUNCTUATION.to_owned()
+}
+
+fn default_mouse_motion_pause_ms() -> u64 {
+    DEFAULT_MOUSE_MOTION_PAUSE_MS
 }
 
 fn default_ambiguity_score_floor() -> f64 {
@@ -393,6 +400,22 @@ threshold = 5.0
         ] {
             assert!(from_contents(text).is_err(), "{text}");
         }
+    }
+
+    #[test]
+    fn reads_mouse_motion_pause() {
+        for (setting, expected) in [
+            ("", 500),
+            ("mouse_motion_pause_ms = 0", 0),
+            ("mouse_motion_pause_ms = 1200", 1200),
+        ] {
+            let contents = format!("switch_key = 'KEY_F12'\n{setting}");
+            assert_eq!(
+                from_contents(&contents).unwrap().mouse_motion_pause_ms,
+                expected
+            );
+        }
+        assert!(from_contents("switch_key = 'KEY_F12'\nmouse_motion_pause_ms = -1").is_err());
     }
 
     #[test]

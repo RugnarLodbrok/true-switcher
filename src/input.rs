@@ -116,6 +116,8 @@ pub struct Input {
     switch_key: KeyCode,
     pending: PendingSwitch,
     is_backing_off: bool,
+    mouse_motion_pause: Duration,
+    last_mouse_motion: Option<Instant>,
 }
 
 impl Input {
@@ -140,6 +142,8 @@ impl Input {
             switch_key: config.switch_key,
             pending: PendingSwitch::default(),
             is_backing_off: false,
+            mouse_motion_pause: Duration::from_millis(config.mouse_motion_pause_ms),
+            last_mouse_motion: None,
         };
         let monitor = devices::Monitor::new()?;
         input.discover_devices(&sender, &monitor)?;
@@ -433,6 +437,12 @@ impl Input {
             InputEventMessage::FocusChanged
             | InputEventMessage::PointerPressed
             | InputEventMessage::PointerEventsLost => self.request_history_reset(),
+            InputEventMessage::MouseMoved(at) => {
+                if !self.mouse_motion_pause.is_zero() {
+                    self.last_mouse_motion = self.last_mouse_motion.max(Some(at));
+                    self.pending.cancel_auto();
+                }
+            }
             InputEventMessage::LayoutChanged(layout) => {
                 self.accept_layout(
                     layout,
@@ -573,7 +583,7 @@ impl Input {
             self.update_back_off(now);
             return Ok(());
         }
-        self.process_history_event(index, key, value, is_captured)
+        self.process_history_event(index, key, value, is_captured, now)
     }
 
     fn process_history_event(
@@ -582,6 +592,7 @@ impl Input {
         key: KeyCode,
         value: i32,
         is_captured: bool,
+        now: Instant,
     ) -> ProcessingResult<()> {
         let is_hard_separator = matches!(
             key,
@@ -604,7 +615,7 @@ impl Input {
             }
             return Ok(());
         }
-        self.process_text_event(index, key, value, is_hard_separator);
+        self.process_text_event(index, key, value, is_hard_separator, now);
         Ok(())
     }
 
@@ -614,6 +625,7 @@ impl Input {
         key: KeyCode,
         value: i32, // 0 = release, 1 = press, 2 = repeated press while holding
         is_hard_separator: bool,
+        now: Instant,
     ) {
         if !matches!(value, 1 | 2) {
             return;
@@ -658,9 +670,15 @@ impl Input {
             && !self.correction.is_active()
             && (self.pending.is_none() || self.pending.is_auto())
             && !self.history.is_auto_switch_blocked()
+            && !self.is_auto_switch_paused(now)
         {
             self.update_auto_switch(index, is_first_space);
         }
+    }
+
+    fn is_auto_switch_paused(&self, now: Instant) -> bool {
+        self.last_mouse_motion
+            .is_some_and(|at| now.saturating_duration_since(at) < self.mouse_motion_pause)
     }
 
     fn update_auto_switch(&mut self, index: usize, is_first_space: bool) {
@@ -1131,6 +1149,8 @@ pub(crate) mod tests {
             switch_key: KeyCode::KEY_PAUSE,
             pending: PendingSwitch::manual(0, false),
             is_backing_off: false,
+            mouse_motion_pause: Duration::from_millis(crate::config::DEFAULT_MOUSE_MOTION_PAUSE_MS),
+            last_mouse_motion: None,
         }
     }
 
@@ -1399,6 +1419,113 @@ patterns = ['^\.тф']
         input.process_available_events(None).unwrap();
         assert!(input.latest_word().is_none());
         assert_eq!(input.lifecycle, Lifecycle::Running);
+    }
+
+    #[test]
+    fn mouse_motion_cancels_pending_pattern_and_restarts_pause_from_latest_motion() {
+        let mut input = auto_input();
+        let now = Instant::now();
+        for key in [KeyCode::KEY_SLASH, KeyCode::KEY_N] {
+            event_at(&mut input, 0, key, 1, now);
+            event_at(&mut input, 0, key, 0, now);
+        }
+        assert!(input.pending.is_auto());
+
+        let second_motion = now + input.mouse_motion_pause / 2;
+        for at in [now, second_motion] {
+            input
+                .process_message(InputEventMessage::MouseMoved(at), None)
+                .unwrap();
+            assert!(input.pending.is_none());
+        }
+
+        let at = now + input.mouse_motion_pause;
+        event_at(&mut input, 0, KeyCode::KEY_A, 1, at);
+        event_at(&mut input, 0, KeyCode::KEY_A, 0, at);
+        assert!(input.pending.is_none());
+        assert_eq!(input.latest_word().unwrap().entries.len(), 3);
+
+        let end = second_motion + input.mouse_motion_pause;
+        event_at(&mut input, 0, KeyCode::KEY_SPACE, 1, end);
+        let request = input.switch_request().unwrap();
+        assert_eq!(request.mode, crate::switcher::SwitchMode::Pattern);
+        assert_eq!(request.target.unwrap().name(), "us");
+    }
+
+    #[test]
+    fn mouse_motion_pause_blocks_dictionary_switch_at_first_space() {
+        let mut input = auto_input_with_patterns("");
+        input.accept_layout(Some(layout("us")), false);
+        input.auto_switch.dictionaries = crate::dictionary::test_dictionaries([
+            ("us", "", "bkbfoo 1", 5.0),
+            ("ru", "", "или 1", 7.0),
+        ]);
+        let now = Instant::now();
+        input
+            .process_message(InputEventMessage::MouseMoved(now), None)
+            .unwrap();
+        for key in [
+            KeyCode::KEY_B,
+            KeyCode::KEY_K,
+            KeyCode::KEY_B,
+            KeyCode::KEY_SPACE,
+        ] {
+            event_at(&mut input, 0, key, 1, now + TEST_STEP);
+            event_at(&mut input, 0, key, 0, now + TEST_STEP);
+        }
+        assert!(input.pending.is_none());
+        assert_eq!(input.latest_word().unwrap().text().as_deref(), Ok("bkb"));
+        assert_eq!(input.latest_word().unwrap().trailing_spaces, 1);
+    }
+
+    #[test]
+    fn mouse_motion_keeps_manual_request_and_allows_correction_to_finish() {
+        let (mut input, sender) = channel_input();
+        input.pending.cancel();
+        input.accept_layout(Some(layout("us")), false);
+        let now = Instant::now();
+        event_at(&mut input, 0, KeyCode::KEY_A, 1, now);
+        event_at(&mut input, 0, KeyCode::KEY_A, 0, now);
+        sender.send(InputEventMessage::MouseMoved(now));
+        input.process_available_events(None).unwrap();
+
+        event_at(&mut input, 0, KeyCode::KEY_B, 1, now);
+        event_at(&mut input, 0, KeyCode::KEY_B, 0, now);
+        event_at(&mut input, 0, KeyCode::KEY_PAUSE, 1, now);
+        event_at(&mut input, 0, KeyCode::KEY_PAUSE, 0, now);
+        sender.send(InputEventMessage::MouseMoved(now));
+        let mut interception = Interceptor::enter(&mut input).unwrap().unwrap();
+        let request = interception.take_request().unwrap();
+        assert_eq!(request.mode, crate::switcher::SwitchMode::Manual);
+        assert_eq!(request.words[0].text().as_deref(), Ok("ab"));
+
+        sender.send(InputEventMessage::MouseMoved(now));
+        sender.send(InputEventMessage::CorrectionFinished {
+            result: Ok(()),
+            layout: Some(layout("ru")),
+        });
+        assert!(interception.wait_for_correction().unwrap().unwrap().is_ok());
+        assert!(!interception.take_cancel_request());
+        interception.finish().unwrap();
+    }
+
+    #[test]
+    fn mouse_motion_with_zero_pause_preserves_automatic_requests() {
+        let mut input = auto_input();
+        input.mouse_motion_pause = Duration::ZERO;
+        let now = Instant::now();
+        input
+            .process_message(InputEventMessage::MouseMoved(now), None)
+            .unwrap();
+        for key in [KeyCode::KEY_SLASH, KeyCode::KEY_N] {
+            event_at(&mut input, 0, key, 1, now);
+            event_at(&mut input, 0, key, 0, now);
+        }
+        assert!(input.pending.is_auto());
+        input
+            .process_message(InputEventMessage::MouseMoved(now), None)
+            .unwrap();
+        assert!(input.pending.is_auto());
     }
 
     #[test]

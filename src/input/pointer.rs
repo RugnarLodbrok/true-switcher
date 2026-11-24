@@ -10,6 +10,7 @@ use evdev::{
 };
 use nix::sys::inotify::AddWatchFlags;
 
+use super::InputEventExt;
 use super::device_watch::{self, DirectoryWatcher, INPUT_DIRECTORY, Identity};
 
 use crate::input_events::{InputEventMessage, InputEventSender};
@@ -130,6 +131,11 @@ fn start_reader(path: PathBuf, mut device: RawDevice, sender: InputEventSender) 
                                 && !reader_sender.send(InputEventMessage::PointerPressed)
                             {
                                 return;
+                            } else if is_mouse_motion(event, is_touchpad)
+                                && !reader_sender
+                                    .send(InputEventMessage::MouseMoved(event.instant()))
+                            {
+                                return;
                             }
                         }
                     }
@@ -146,6 +152,16 @@ fn start_reader(path: PathBuf, mut device: RawDevice, sender: InputEventSender) 
         log::warn!("Cannot start reader {}: {error}", path.display());
         sender.send(InputEventMessage::PointerEventsLost);
     }
+}
+
+fn is_mouse_motion(event: InputEvent, is_touchpad: bool) -> bool {
+    !is_touchpad
+        && event.event_type() == EventType::RELATIVE
+        && matches!(
+            RelativeAxisCode(event.code()),
+            RelativeAxisCode::REL_X | RelativeAxisCode::REL_Y
+        )
+        && event.value() != 0
 }
 
 fn is_syn_dropped(event: InputEvent) -> bool {
@@ -321,6 +337,28 @@ mod tests {
 
     fn abs(code: AbsoluteAxisCode, value: i32) -> InputEvent {
         InputEvent::new(EventType::ABSOLUTE.0, code.0, value)
+    }
+
+    #[test]
+    fn mouse_motion_requires_nonzero_relative_xy_and_excludes_touchpads() {
+        for axis in [RelativeAxisCode::REL_X, RelativeAxisCode::REL_Y] {
+            for delta in [-1, 1] {
+                let event = InputEvent::new(EventType::RELATIVE.0, axis.0, delta);
+                assert!(is_mouse_motion(event, false));
+                assert!(!is_mouse_motion(event, true));
+            }
+            assert!(!is_mouse_motion(
+                InputEvent::new(EventType::RELATIVE.0, axis.0, 0),
+                false
+            ));
+        }
+        for axis in [RelativeAxisCode::REL_WHEEL, RelativeAxisCode::REL_HWHEEL] {
+            assert!(!is_mouse_motion(
+                InputEvent::new(EventType::RELATIVE.0, axis.0, 1),
+                false
+            ));
+        }
+        assert!(!is_mouse_motion(abs(AbsoluteAxisCode::ABS_X, 1), false));
     }
 
     #[test]

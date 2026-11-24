@@ -16,6 +16,7 @@ pub enum InputEventMessage {
     Shutdown(ShutdownReason),
     FocusChanged,
     PointerPressed,
+    MouseMoved(Instant),
     PointerEventsLost,
     LayoutChanged(Option<Arc<Layout>>),
     ToggleSetting(RuntimeSetting, mpsc::Sender<RuntimeSettings>),

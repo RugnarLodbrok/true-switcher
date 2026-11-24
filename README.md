@@ -27,6 +27,7 @@ Keyboard layout switcher.
     - [config](#config)
     - [implementation details and meaning of thresholds](#implementation-details-and-meaning-of-thresholds)
     - [manual correction and learned-rules](#manual-correction-and-learned-rules)
+- [Autoswitch & gaming interference](#autoswitch--gaming-interference)
 - [Switching statistics](#switching-statistics)
 
 ## Why Another Switcher?
@@ -218,6 +219,20 @@ dictionary-based switch can do undesired switches. To prevent these, there are _
 ">" = 1
 -r = 1
 -rf = 1
+```
+
+## Autoswitch & gaming interference
+
+In games, movement keys can look like typed text to true-switcher.
+ - Mouse movement pauses both regex and dictionary switching.
+ - The pause lasts 500 ms (by default) after the last mouse movement.
+ - Touchpad movement and wheel scrolling don't count.
+ - Manual correction is still available.
+
+### config
+
+```toml
+mouse_motion_pause_ms = 500  # Set to 0 to disable the pause
 ```
 
 ## Switching statistics

@@ -17,6 +17,10 @@ pattern_switch = false
 # Enable dictionary-based corrections after configuring both dictionaries below.
 auto_switch = false
 
+# Pause dictionary and regex switching for this many milliseconds after mouse movement.
+# Set to 0 to disable the pause.
+mouse_motion_pause_ms = 500
+
 # Minimum score in both layouts for a word to join the next dictionary correction.
 ambiguity_score_floor = -18
 
