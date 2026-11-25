@@ -1,3 +1,4 @@
+use crate::dictionary::DictionaryAutoSwitch;
 use crate::layout::Layout;
 use crate::word::{Stroke, Word, WordStroke};
 use evdev::KeyCode;
@@ -7,6 +8,12 @@ use std::sync::Arc;
 pub struct History {
     words: Vec<Word>,
     is_auto_switch_blocked: bool,
+}
+
+pub(crate) enum HistoryEvent {
+    Stroke,
+    FirstSpace,
+    Other,
 }
 
 impl History {
@@ -68,17 +75,28 @@ impl History {
         }
     }
 
-    pub fn process(&mut self, key: KeyCode, is_shift: bool, layout: Option<Arc<Layout>>) {
+    pub(crate) fn process(
+        &mut self,
+        key: KeyCode,
+        is_shift: bool,
+        layout: Option<Arc<Layout>>,
+        dictionaries: &DictionaryAutoSwitch,
+    ) -> HistoryEvent {
         match key {
             KeyCode::KEY_SPACE => {
                 if let Some(word) = self.words.last_mut() {
                     word.trailing_spaces += 1;
                     if word.trailing_spaces == 1 {
                         log::trace!("{word}");
+                        return HistoryEvent::FirstSpace;
                     }
                 }
+                HistoryEvent::Other
             }
-            KeyCode::KEY_BACKSPACE => self.backspace(),
+            KeyCode::KEY_BACKSPACE => {
+                self.backspace();
+                HistoryEvent::Other
+            }
             key if is_text_key(key) => {
                 if self
                     .words
@@ -98,9 +116,10 @@ impl History {
                         crate::xkb::has_dead_key(layout, [&stroke]) == Ok(true)
                     });
                 }
-                word.entries.push(WordStroke { stroke, layout });
+                word.push_stroke(WordStroke { stroke, layout }, dictionaries);
+                HistoryEvent::Stroke
             }
-            _ => {}
+            _ => HistoryEvent::Other,
         }
     }
 
@@ -124,10 +143,7 @@ impl History {
             }
             return;
         }
-        word.entries.pop();
-        for stack in &mut word.dictionary_prefixes {
-            stack.pop();
-        }
+        word.pop_stroke();
         if word.entries.is_empty() {
             self.words.pop();
             self.is_auto_switch_blocked = false;
@@ -155,7 +171,12 @@ mod tests {
     use super::*;
 
     fn press(history: &mut History, key: KeyCode) {
-        history.process(key, false, Some(Arc::new(Layout::new("us", "", "", ""))));
+        history.process(
+            key,
+            false,
+            Some(Arc::new(Layout::new("us", "", "", ""))),
+            &DictionaryAutoSwitch::default(),
+        );
     }
 
     #[test]
@@ -211,7 +232,9 @@ mod tests {
         ] {
             press(&mut history, key);
         }
-        assert_eq!(history.reset()[0].text().as_deref(), Ok("ab,"));
+        let words = history.reset();
+        assert_eq!(words[0].text().as_deref(), Ok("ab,"));
+        assert!(words[0].dictionary_prefixes.is_empty());
     }
 
     #[test]
@@ -221,14 +244,21 @@ mod tests {
             KeyCode::KEY_A,
             true,
             Some(Arc::new(Layout::new("us", "", "", ""))),
+            &DictionaryAutoSwitch::default(),
         );
         history.process(
             KeyCode::KEY_B,
             false,
             Some(Arc::new(Layout::new("ru", "", "", ""))),
+            &DictionaryAutoSwitch::default(),
         );
         assert_eq!(history.latest_word().unwrap().text().as_deref(), Ok("Aи"));
-        history.process(KeyCode::KEY_C, false, None);
+        history.process(
+            KeyCode::KEY_C,
+            false,
+            None,
+            &DictionaryAutoSwitch::default(),
+        );
         assert!(matches!(
             history.latest_word().unwrap().text(),
             Err(crate::xkb::ConversionError::UnknownLayout { .. })

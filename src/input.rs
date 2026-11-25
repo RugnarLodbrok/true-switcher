@@ -26,7 +26,7 @@ use keyboard::KeyboardInput;
 use keyboard::Source;
 
 use crate::config::{Configuration, RuntimeSetting, RuntimeSettings};
-use crate::history::History;
+use crate::history::{History, HistoryEvent};
 use crate::input_events::{InputEventMessage, InputEventSender, InputEvents};
 use crate::layout::Layout;
 use crate::lifecycle::{Lifecycle, ProcessingError, ProcessingResult, ShutdownReason};
@@ -658,17 +658,18 @@ impl Input {
             .keyboard_input
             .held_keys()
             .any(|(_, code)| is_shift(KeyCode::new(code)));
-        self.history.process(key, is_shift, self.layout.clone());
-        let is_text = crate::history::is_text_key(key);
-        let Some(word) = self.history.latest_word_mut() else {
+        let event = self.history.process(
+            key,
+            is_shift,
+            self.layout.clone(),
+            &self.auto_switch.dictionaries,
+        );
+        let Some(word) = self.history.latest_word() else {
             return;
         };
-        let is_first_space = key == KeyCode::KEY_SPACE && word.trailing_spaces == 1;
-        if is_text {
-            let stroke = word.entries.last().unwrap().stroke;
-            self.auto_switch.dictionaries.push(word, &stroke);
-        }
-        if (is_text || is_first_space) && self.settings.is_auto_switch {
+        let is_first_space = matches!(event, HistoryEvent::FirstSpace);
+        let should_score = matches!(event, HistoryEvent::Stroke | HistoryEvent::FirstSpace);
+        if should_score && self.settings.is_auto_switch {
             self.auto_switch
                 .dictionaries
                 .log_score(word, self.layout.as_deref(), is_first_space);
@@ -678,7 +679,7 @@ impl Input {
             if self.correction.is_active() {
                 self.correction.request_cancel();
             }
-        } else if (is_text || is_first_space)
+        } else if should_score
             && !self.correction.is_active()
             && (self.pending.is_none() || self.pending.is_auto())
             && !self.history.is_auto_switch_blocked()

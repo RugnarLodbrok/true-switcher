@@ -16,4 +16,4 @@
 
 ## Impact
 
-`src/history.rs`, `src/word.rs`, `src/input.rs` и `src/dictionary.rs`. Выполнять третьим, после `refactor-dictionary-comparison`, чтобы отдельно проверить изменения пути ввода.
+`src/history.rs`, `src/word.rs`, `src/input.rs` и `src/dictionary.rs`.

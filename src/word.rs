@@ -1,3 +1,4 @@
+use crate::dictionary::{DictionaryAutoSwitch, Prefix};
 use evdev::KeyCode;
 use std::fmt;
 use std::sync::Arc;
@@ -14,7 +15,7 @@ pub struct Stroke {
 pub struct Word {
     pub entries: Vec<WordStroke>,
     pub trailing_spaces: usize,
-    pub(crate) dictionary_prefixes: Vec<Vec<crate::dictionary::Prefix>>,
+    pub(crate) dictionary_prefixes: Vec<Vec<Prefix>>,
     pub(crate) has_dead_key: bool,
     pub(crate) ambiguous_delta_score: Option<f64>,
     pub(crate) is_range_corrected: bool,
@@ -27,6 +28,18 @@ pub struct WordStroke {
 }
 
 impl Word {
+    pub(crate) fn push_stroke(&mut self, entry: WordStroke, dictionaries: &DictionaryAutoSwitch) {
+        dictionaries.push_prefixes(&mut self.dictionary_prefixes, &entry.stroke);
+        self.entries.push(entry);
+    }
+
+    pub(crate) fn pop_stroke(&mut self) {
+        self.entries.pop();
+        for stack in &mut self.dictionary_prefixes {
+            stack.pop();
+        }
+    }
+
     pub fn strokes(&self) -> impl Iterator<Item = &Stroke> {
         self.entries.iter().map(|entry| &entry.stroke)
     }

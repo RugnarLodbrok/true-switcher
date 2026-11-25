@@ -284,10 +284,9 @@ impl DictionaryAutoSwitch {
         self.dictionaries.len() == DICTIONARY_COUNT
     }
 
-    pub(crate) fn push(&self, word: &mut Word, stroke: &Stroke) {
-        word.dictionary_prefixes
-            .resize_with(self.dictionaries.len(), Vec::new);
-        for (dictionary, stack) in self.dictionaries.iter().zip(&mut word.dictionary_prefixes) {
+    pub(crate) fn push_prefixes(&self, prefixes: &mut Vec<Vec<Prefix>>, stroke: &Stroke) {
+        prefixes.resize_with(self.dictionaries.len(), Vec::new);
+        for (dictionary, stack) in self.dictionaries.iter().zip(prefixes) {
             let previous = stack.last().copied().unwrap_or(Prefix::Node(0));
             let next = if previous == Prefix::ConversionFailed {
                 previous
@@ -714,8 +713,6 @@ mod tests {
 
     #[test]
     fn custom_or_empty_punctuation_changes_dictionary_blocking() {
-        use crate::word::WordStroke;
-
         let current = Layout::new("us", "", "", "");
         for (settings, should_switch) in [
             ("", false),
@@ -723,15 +720,8 @@ mod tests {
             ("punctuation = ''", true),
         ] {
             let dictionaries = load_dictionaries_with_settings(settings, "cat 1", "ёж 1").unwrap();
-            let mut word = Word::default();
-            for key in [KeyCode::KEY_GRAVE, KeyCode::KEY_SEMICOLON] {
-                let stroke = Stroke { key, shift: false };
-                word.entries.push(WordStroke {
-                    stroke,
-                    layout: None,
-                });
-                dictionaries.push(&mut word, &stroke);
-            }
+            let mut word =
+                word_from_keys(&dictionaries, &[KeyCode::KEY_GRAVE, KeyCode::KEY_SEMICOLON]);
             for is_first_space in [false, true] {
                 word.trailing_spaces = usize::from(is_first_space);
                 assert_eq!(
@@ -749,14 +739,19 @@ mod tests {
     fn word_from_keys(dictionaries: &DictionaryAutoSwitch, keys: &[KeyCode]) -> Word {
         let mut word = Word::default();
         for &key in keys {
-            let stroke = Stroke { key, shift: false };
-            word.entries.push(crate::word::WordStroke {
-                stroke,
-                layout: None,
-            });
-            dictionaries.push(&mut word, &stroke);
+            push_key(&mut word, dictionaries, Stroke { key, shift: false });
         }
         word
+    }
+
+    fn push_key(word: &mut Word, dictionaries: &DictionaryAutoSwitch, stroke: Stroke) {
+        word.push_stroke(
+            crate::word::WordStroke {
+                stroke,
+                layout: None,
+            },
+            dictionaries,
+        );
     }
 
     #[test]
@@ -923,7 +918,7 @@ mod tests {
             (KeyCode::KEY_A, 2.0, None),
             (KeyCode::KEY_P, 6.0, Some("us")),
         ] {
-            dictionaries.push(&mut word, &Stroke { key, shift: false });
+            push_key(&mut word, &dictionaries, Stroke { key, shift: false });
             assert_eq!(
                 dictionaries
                     .comparison(&word, &current, false)
@@ -1028,7 +1023,7 @@ mod tests {
                     ("ru", "", "ф 1\nи 8", thresholds("ru")),
                 ]);
                 let mut word = Word::default();
-                dictionaries.push(&mut word, &Stroke { key, shift: true });
+                push_key(&mut word, &dictionaries, Stroke { key, shift: true });
                 let target = dictionaries.target(&word, &Layout::new(source, "", "", ""), false);
                 assert_eq!(target.as_deref().map(Layout::name), expected);
             }
@@ -1046,7 +1041,7 @@ mod tests {
             (KeyCode::KEY_X, Some(0.0), None),
         ] {
             let mut word = Word::default();
-            dictionaries.push(&mut word, &Stroke { key, shift: false });
+            push_key(&mut word, &dictionaries, Stroke { key, shift: false });
             assert_eq!(
                 dictionaries
                     .comparison(&word, &current, false)
@@ -1071,7 +1066,7 @@ mod tests {
             (KeyCode::KEY_C, Some(f64::INFINITY), Some("us")),
         ] {
             let mut word = Word::default();
-            dictionaries.push(&mut word, &Stroke { key, shift: false });
+            push_key(&mut word, &dictionaries, Stroke { key, shift: false });
             let prefixes = word.dictionary_prefixes.clone();
             let prefix_score = dictionaries
                 .comparison(&word, &current, false)
@@ -1090,28 +1085,19 @@ mod tests {
 
     #[test]
     fn learning_assigns_a_baseline_and_moves_the_same_word_in_both_directions() {
-        use crate::word::WordStroke;
-
         let us = Layout::new("us", "", "", "");
         let ru = Layout::new("ru", "", "", "");
         let stroke = Stroke {
             key: KeyCode::KEY_A,
             shift: false,
         };
-        let original_word = Word {
-            entries: vec![WordStroke {
-                stroke,
-                layout: None,
-            }],
-            ..Word::default()
-        };
         for scale in [1, 10] {
             let mut dictionaries = test_dictionaries([
                 ("us", "", &format!("a {scale}\nb {}", 65_535 * scale), 2.0),
                 ("ru", "", &format!("я {}\nф 0", 8 * scale), 2.0),
             ]);
-            let mut word = original_word.clone();
-            dictionaries.push(&mut word, &stroke);
+            let mut word = Word::default();
+            push_key(&mut word, &dictionaries, stroke);
             assert_eq!(
                 dictionaries
                     .comparison(&word, &ru, false)
