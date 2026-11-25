@@ -5,7 +5,7 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i64)]
@@ -22,6 +22,7 @@ struct Correction {
     mode: SwitchMode,
     is_sound_enabled: bool,
     is_learning: bool,
+    triggered_at: Option<Instant>,
 }
 
 impl Correction {
@@ -32,6 +33,7 @@ impl Correction {
             target: request.target,
             mode: request.mode,
             is_learning: request.is_learning,
+            triggered_at: request.triggered_at,
             is_sound_enabled: match request.mode {
                 SwitchMode::Pattern | SwitchMode::Auto => settings.is_auto_switch_sound,
                 SwitchMode::Manual => settings.is_manual_switch_sound,
@@ -43,12 +45,32 @@ impl Correction {
         self.words.iter().any(|word| word.has_dead_key_in(layout))
     }
 
+    fn log_timing(&self, result: &ProcessingResult<CorrectionOutcome>) {
+        let (
+            Some(triggered_at),
+            Ok(CorrectionOutcome::Completed {
+                started_at,
+                finished_at,
+            }),
+        ) = (self.triggered_at, result)
+        else {
+            return;
+        };
+        const MILLIS_PER_SECOND: f64 = 1_000.0;
+        let decision_ms = started_at.duration_since(triggered_at).as_secs_f64() * MILLIS_PER_SECOND;
+        let correction_ms =
+            finished_at.duration_since(*started_at).as_secs_f64() * MILLIS_PER_SECOND;
+        log::info!(
+            "correction timing: decision_ms={decision_ms:.1} correction_ms={correction_ms:.1}"
+        );
+    }
+
     fn learned_word(
         &self,
         outcome: &CorrectionOutcome,
         layout: &layout::Layout,
     ) -> Result<Option<String>, crate::xkb::ConversionError> {
-        if !self.is_learning || *outcome != CorrectionOutcome::Completed {
+        if !self.is_learning || !matches!(outcome, CorrectionOutcome::Completed { .. }) {
             return Ok(None);
         }
         let Some(word) = self.words.last() else {
@@ -79,7 +101,10 @@ impl Correction {
 
 #[derive(Debug, PartialEq, Eq)]
 enum CorrectionOutcome {
-    Completed,
+    Completed {
+        started_at: Instant,
+        finished_at: Instant,
+    },
     Cancelled,
     Interrupted,
 }
@@ -129,8 +154,9 @@ impl Switcher {
         } else {
             self.begin_and_correct(interception.as_mut(), &correction)?
         };
-        interception.finish()?;
-        Ok(outcome)
+        let result = interception.finish().map(|()| outcome);
+        correction.log_timing(&result);
+        result
     }
 
     fn begin_and_correct(
@@ -158,6 +184,7 @@ impl Switcher {
             sound,
             layouts,
         } = self;
+        let started_at = Instant::now();
         switch_and_correct(
             || match (&correction.target, &next_layout) {
                 (Some(target), _) => desktop.switch_to_layout(target.name()),
@@ -181,7 +208,8 @@ impl Switcher {
                 interception
                     .input()
                     .begin_correction(correction.words.len(), target.clone());
-                let outcome = Self::correct(keyboard, layouts, interception, correction)?;
+                let outcome =
+                    Self::correct(keyboard, layouts, interception, correction, started_at)?;
                 if let Some(target) = target
                     .as_deref()
                     .or_else(|| next_layout.as_ref().map(|(_, layout)| layout))
@@ -198,6 +226,7 @@ impl Switcher {
         layouts: &kde::LayoutTracker,
         interception: &mut dyn input::CorrectionInterceptor,
         correction: &Correction,
+        started_at: Instant,
     ) -> ProcessingResult<CorrectionOutcome> {
         let is_cancelled = AtomicBool::new(interception.read_available()?);
         thread::scope(|scope| -> ProcessingResult<CorrectionOutcome> {
@@ -206,7 +235,9 @@ impl Switcher {
                     correct_words(correction, keyboard, &is_cancelled)
                 }))
                 .unwrap_or_else(|_| Err(io::Error::other("correction thread panicked")));
+                let finished_at = Instant::now();
                 layouts.finish_correction(result);
+                finished_at
             });
             let mut read_error = None;
             let result = loop {
@@ -226,7 +257,7 @@ impl Switcher {
                     }
                 }
             };
-            worker
+            let finished_at = worker
                 .join()
                 .map_err(|_| io::Error::other("correction thread panicked"))?;
             if let Some(error) = read_error {
@@ -239,7 +270,10 @@ impl Switcher {
             Ok(if is_cancelled.load(Ordering::Relaxed) {
                 CorrectionOutcome::Cancelled
             } else {
-                CorrectionOutcome::Completed
+                CorrectionOutcome::Completed {
+                    started_at,
+                    finished_at,
+                }
             })
         })
     }
@@ -316,6 +350,60 @@ mod tests {
     use super::*;
     use crate::config::RuntimeSetting;
     use std::cell::RefCell;
+    use std::time::Duration;
+
+    #[test]
+    fn logs_one_info_timing_per_successful_automatic_correction() {
+        use log::LevelFilter;
+
+        let triggered_at = Instant::now();
+        let started_at = triggered_at + Duration::from_micros(12_300);
+        let finished_at = started_at + Duration::from_micros(23_400);
+        let completed = Ok(CorrectionOutcome::Completed {
+            started_at,
+            finished_at,
+        });
+        let correction = |mode| {
+            Correction::from_request(
+                input::SwitchRequest {
+                    previous: None,
+                    words: vec![],
+                    target: None,
+                    mode,
+                    is_learning: false,
+                    triggered_at: (mode != SwitchMode::Manual).then_some(triggered_at),
+                },
+                RuntimeSettings::default(),
+            )
+        };
+
+        for mode in [SwitchMode::Auto, SwitchMode::Pattern] {
+            let correction = correction(mode);
+            let (_, messages) = crate::test_logging::capture_at(LevelFilter::Info, || {
+                correction.log_timing(&completed);
+            });
+            assert_eq!(
+                messages,
+                ["correction timing: decision_ms=12.3 correction_ms=23.4"]
+            );
+            let (_, messages) = crate::test_logging::capture_at(LevelFilter::Warn, || {
+                correction.log_timing(&completed);
+            });
+            assert!(messages.is_empty());
+        }
+
+        let (_, messages) = crate::test_logging::capture(|| {
+            correction(SwitchMode::Manual).log_timing(&completed);
+            for result in [
+                Ok(CorrectionOutcome::Cancelled),
+                Err(ProcessingError::Interrupted),
+                Err(io::Error::other("correction failed").into()),
+            ] {
+                correction(SwitchMode::Auto).log_timing(&result);
+            }
+        });
+        assert!(messages.is_empty());
+    }
 
     #[test]
     fn correction_uses_each_runtime_sound_setting_independently() {
@@ -328,6 +416,7 @@ mod tests {
                     target: None,
                     mode,
                     is_learning: false,
+                    triggered_at: None,
                 },
                 settings,
             )
@@ -365,6 +454,7 @@ mod tests {
             }],
             is_sound_enabled: false,
             is_learning: false,
+            triggered_at: None,
         };
         assert!(correction.has_dead_key_in(&layout::Layout::new("us", "intl", "", "")));
         assert!(!correction.has_dead_key_in(&layout::Layout::new("us", "", "", "")));
@@ -389,13 +479,19 @@ mod tests {
                 target: None,
                 mode: SwitchMode::Manual,
                 is_learning: true,
+                triggered_at: None,
             },
             RuntimeSettings::default(),
         );
         let target = layout::Layout::new("ru", "", "", "");
+        let now = Instant::now();
+        let completed = CorrectionOutcome::Completed {
+            started_at: now,
+            finished_at: now,
+        };
         assert_eq!(
             correction
-                .learned_word(&CorrectionOutcome::Completed, &target)
+                .learned_word(&completed, &target)
                 .unwrap()
                 .as_deref(),
             Some("ф")
@@ -407,12 +503,7 @@ mod tests {
             None
         );
         correction.words.clear();
-        assert_eq!(
-            correction
-                .learned_word(&CorrectionOutcome::Completed, &target)
-                .unwrap(),
-            None
-        );
+        assert_eq!(correction.learned_word(&completed, &target).unwrap(), None);
     }
 
     #[test]

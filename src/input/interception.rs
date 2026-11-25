@@ -293,9 +293,7 @@ pub fn enter_interceptor(
             input.pending.cancel();
             return Ok(None);
         }
-        if input.correction_word_count() == 1 {
-            return Ok(Some(Box::new(UncapturedInterceptor::enter(input)?)));
-        }
+        return Ok(Some(Box::new(UncapturedInterceptor::enter(input)?)));
     }
     Ok(Interceptor::enter(input)?
         .map(|interceptor| Box::new(interceptor) as Box<dyn CorrectionInterceptor>))

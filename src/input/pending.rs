@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::layout::Layout;
 use crate::switch_rules::AutoSwitchKind;
@@ -16,6 +17,7 @@ pub(super) enum PendingSwitch {
         source: usize,
         target: Arc<Layout>,
         kind: AutoSwitchKind,
+        triggered_at: Instant,
     },
 }
 
@@ -87,12 +89,14 @@ impl PendingSwitch {
         &mut self,
         source: usize,
         target: Option<(Arc<Layout>, AutoSwitchKind)>,
+        triggered_at: Instant,
     ) {
         if let Some((target, kind)) = target {
             *self = Self::Auto {
                 source,
                 target,
                 kind,
+                triggered_at,
             };
         } else {
             self.cancel_auto();

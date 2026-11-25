@@ -21,6 +21,7 @@ schema: spec-driven
 rules:
   tasks:
     - do not include manual testing in any tasks
+    - do not make separate tasks for running auto-tests; include it in prev task
 # Per-operation guidance (optional)
 # Add advisory guidance for how apply and archive work should be conducted.
 # This is separate from artifact rules above.
