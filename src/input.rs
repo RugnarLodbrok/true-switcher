@@ -664,9 +664,11 @@ impl Input {
             && !self.correction.is_active()
             && (self.pending.is_none() || self.pending.is_auto())
             && !self.history.is_auto_switch_blocked()
-            && !self.is_auto_switch_paused(now)
         {
-            self.update_auto_switch(index, is_first_space);
+            let is_paused = self.is_auto_switch_paused(now);
+            if !is_paused || (is_first_space && self.settings.is_auto_switch) {
+                self.update_auto_switch(index, is_first_space, is_paused);
+            }
         }
     }
 
@@ -675,7 +677,7 @@ impl Input {
             .is_some_and(|at| now.saturating_duration_since(at) < self.mouse_motion_pause)
     }
 
-    fn update_auto_switch(&mut self, index: usize, is_first_space: bool) {
+    fn update_auto_switch(&mut self, index: usize, is_first_space: bool, is_paused: bool) {
         use crate::dictionary::DictionaryDecision;
 
         let word = self.history.latest_word_mut().unwrap();
@@ -686,8 +688,10 @@ impl Input {
         if self.settings.is_pattern_switch
             && let Some(target) = self.auto_switch.target(word, layout)
         {
-            self.pending
-                .update_auto(index, Some((target, AutoSwitchKind::Regex)));
+            if !is_paused {
+                self.pending
+                    .update_auto(index, Some((target, AutoSwitchKind::Regex)));
+            }
             return;
         }
         let decision = if self.settings.is_auto_switch {
@@ -710,7 +714,9 @@ impl Input {
                 None
             }
         };
-        self.pending.update_auto(index, target);
+        if !is_paused {
+            self.pending.update_auto(index, target);
+        }
     }
 
     fn should_reset_for_key(&self, key: KeyCode, value: i32) -> bool {
@@ -1470,6 +1476,33 @@ patterns = ['^\.тф']
         assert!(input.pending.is_none());
         assert_eq!(input.latest_word().unwrap().text().as_deref(), Ok("bkb"));
         assert_eq!(input.latest_word().unwrap().trailing_spaces, 1);
+    }
+
+    #[test]
+    fn mouse_motion_pause_preserves_ambiguity_for_next_dictionary_switch() {
+        let mut input = ambiguity_input("", "f 1\nbp 1");
+        let motion_at = Instant::now();
+        input
+            .process_message(InputEventMessage::MouseMoved(motion_at), None)
+            .unwrap();
+        let paused_at = motion_at + TEST_STEP;
+        for key in [KeyCode::KEY_F, KeyCode::KEY_SPACE] {
+            event_at(&mut input, 0, key, 1, paused_at);
+            event_at(&mut input, 0, key, 0, paused_at);
+        }
+        assert!(input.switch_request().is_none());
+        assert!(input.latest_word().unwrap().is_ambiguous);
+
+        let resumed_at = motion_at + input.mouse_motion_pause;
+        event_at(&mut input, 0, KeyCode::KEY_R, 1, resumed_at);
+        event_at(&mut input, 0, KeyCode::KEY_R, 0, resumed_at);
+        let request = input.switch_request().unwrap();
+        assert_eq!(request.mode, crate::switcher::SwitchMode::Auto);
+        assert_eq!(request.target.unwrap().name(), "ru");
+        assert_eq!(request.words.len(), 2);
+        assert_eq!(request.words[0].text().unwrap(), "f");
+        assert_eq!(request.words[0].trailing_spaces, 1);
+        assert_eq!(request.words[1].text().unwrap(), "r");
     }
 
     #[test]
