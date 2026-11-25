@@ -10,13 +10,13 @@ pub struct Stroke {
     pub shift: bool,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Word {
     pub entries: Vec<WordStroke>,
     pub trailing_spaces: usize,
     pub(crate) dictionary_prefixes: Vec<Vec<crate::dictionary::Prefix>>,
     pub(crate) has_dead_key: bool,
-    pub(crate) is_ambiguous: bool,
+    pub(crate) ambiguous_delta_score: Option<f64>,
     pub(crate) is_range_corrected: bool,
 }
 

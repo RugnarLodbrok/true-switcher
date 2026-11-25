@@ -14,7 +14,7 @@ mod interception;
 mod keyboard;
 mod pending;
 mod pointer;
-use pending::{AutoSwitchKind, PendingSwitch};
+use pending::PendingSwitch;
 
 use correction::CorrectionState;
 use interception::InterceptionState;
@@ -28,7 +28,9 @@ use keyboard::Source;
 use crate::config::{Configuration, RuntimeSetting, RuntimeSettings};
 use crate::history::History;
 use crate::input_events::{InputEventMessage, InputEventSender, InputEvents};
+use crate::layout::Layout;
 use crate::lifecycle::{Lifecycle, ProcessingError, ProcessingResult, ShutdownReason};
+use crate::switch_rules::{AutoSwitch, AutoSwitchDecision, AutoSwitchKind};
 
 const MODIFIERS: [KeyCode; 8] = [
     KeyCode::KEY_LEFTSHIFT,
@@ -107,7 +109,7 @@ pub struct Input {
     lifecycle: Lifecycle,
     history: History,
     statistics: Option<crate::statistics::Statistics>,
-    auto_switch: crate::switch_rules::AutoSwitchRules,
+    auto_switch: AutoSwitch,
     settings: RuntimeSettings,
     layout: Option<Arc<crate::layout::Layout>>,
     observed_layout: Option<Arc<crate::layout::Layout>>,
@@ -126,7 +128,7 @@ impl Input {
         sender: InputEventSender,
         config: &Configuration,
         statistics: crate::statistics::Statistics,
-        auto_switch: crate::switch_rules::AutoSwitchRules,
+        auto_switch: AutoSwitch,
     ) -> io::Result<Self> {
         let mut input = Self {
             keyboard_input: KeyboardInput::default(),
@@ -243,20 +245,25 @@ impl Input {
         let Some(source) = self.layout.as_deref() else {
             return 1;
         };
-        1 + self
-            .history
-            .preceding_words()
-            .take_while(|word| {
-                word.is_ambiguous
-                    && word
-                        .entries
-                        .iter()
-                        .all(|entry| entry.layout.as_deref() == Some(source))
-                    && !word.has_dead_key
-                    && !word.has_dead_key_in(source)
-                    && !word.has_dead_key_in(target)
-            })
-            .count()
+        1 + self.preceding_ambiguous_scores(source, target).count()
+    }
+
+    fn preceding_ambiguous_scores<'a>(
+        &'a self,
+        source: &'a Layout,
+        target: &'a Layout,
+    ) -> impl Iterator<Item = f64> + 'a {
+        self.history.preceding_words().map_while(move |word| {
+            let delta_score = word.ambiguous_delta_score?;
+            let is_eligible = word
+                .entries
+                .iter()
+                .all(|entry| entry.layout.as_deref() == Some(source))
+                && !word.has_dead_key
+                && !word.has_dead_key_in(source)
+                && !word.has_dead_key_in(target);
+            is_eligible.then_some(delta_score)
+        })
     }
 
     fn has_valid_pending_request(&self) -> bool {
@@ -678,39 +685,25 @@ impl Input {
     }
 
     fn update_auto_switch(&mut self, index: usize, is_first_space: bool, is_paused: bool) {
-        use crate::dictionary::DictionaryDecision;
-
-        let word = self.history.latest_word_mut().unwrap();
-        let Some(layout) = self.layout.as_ref() else {
+        let Some(layout) = self.layout.as_deref() else {
             self.pending.update_auto(index, None);
             return;
         };
-        if self.settings.is_pattern_switch
-            && let Some(target) = self.auto_switch.target(word, layout)
-        {
-            if !is_paused {
-                self.pending
-                    .update_auto(index, Some((target, AutoSwitchKind::Regex)));
-            }
-            return;
-        }
-        let decision = if self.settings.is_auto_switch {
+        let word = self.history.latest_word().unwrap();
+        let decision =
             self.auto_switch
-                .dictionaries
-                .decision(word, layout, is_first_space)
-        } else {
-            DictionaryDecision::Keep
-        };
+                .decision(word, layout, self.settings, is_first_space, |target| {
+                    if is_paused {
+                        return 0.0;
+                    }
+                    self.preceding_ambiguous_scores(layout, target).sum()
+                });
         let target = match decision {
-            DictionaryDecision::Keep => None,
-            _ if self.settings.is_pattern_switch
-                && self.auto_switch.matches_current(word, layout) =>
-            {
-                None
-            }
-            DictionaryDecision::Switch(target) => Some((target, AutoSwitchKind::Dictionary)),
-            DictionaryDecision::Ambiguous => {
-                word.is_ambiguous = true;
+            AutoSwitchDecision::Keep => None,
+            AutoSwitchDecision::Switch(target, kind) => Some((target, kind)),
+            AutoSwitchDecision::Ambiguous(delta_score) => {
+                let word = self.history.latest_word_mut().unwrap();
+                word.ambiguous_delta_score = Some(delta_score);
                 None
             }
         };
@@ -1191,7 +1184,7 @@ patterns = ['^\.тф']
 "#,
         )
         .unwrap();
-        let switch = crate::switch_rules::AutoSwitchRules::compile(&settings, |name| {
+        let switch = AutoSwitch::compile(&settings, |name| {
             Ok(Arc::new(crate::layout::Layout::new(name, "", "", "")))
         })
         .unwrap();
@@ -1209,9 +1202,7 @@ patterns = ['^\.тф']
             "switch_key = 'KEY_PAUSE'\npattern_switch = true\n[[switch_rules]]\ntarget = 'us'\npatterns = [{patterns}]"
         ))
         .unwrap();
-        input.auto_switch =
-            crate::switch_rules::AutoSwitchRules::compile(&settings, |name| Ok(layout(name)))
-                .unwrap();
+        input.auto_switch = AutoSwitch::compile(&settings, |name| Ok(layout(name))).unwrap();
         input
     }
 
@@ -1491,7 +1482,7 @@ patterns = ['^\.тф']
             event_at(&mut input, 0, key, 0, paused_at);
         }
         assert!(input.switch_request().is_none());
-        assert!(input.latest_word().unwrap().is_ambiguous);
+        assert!(input.latest_word().unwrap().ambiguous_delta_score.is_some());
 
         let resumed_at = motion_at + input.mouse_motion_pause;
         event_at(&mut input, 0, KeyCode::KEY_R, 1, resumed_at);
@@ -2363,20 +2354,23 @@ patterns = ['^\.тф']
     #[test]
     fn ambiguity_is_reassessed_only_on_the_first_space_and_cleared_by_context_reset() {
         let mut input = auto_input_with_patterns("");
-        input.auto_switch.dictionaries =
-            crate::dictionary::test_dictionaries([("us", "", "a 1", 5.0), ("ru", "", "ф 1", 5.0)]);
+        input.accept_layout(Some(layout("us")), false);
+        input.auto_switch.dictionaries = crate::dictionary::test_dictionaries([
+            ("us", "", "a 1\nz 3", 5.0),
+            ("ru", "", "ф 2\nя 2", 5.0),
+        ]);
         for (key, expected) in [
-            (KeyCode::KEY_A, false),
-            (KeyCode::KEY_SPACE, true),
-            (KeyCode::KEY_SPACE, true),
-            (KeyCode::KEY_BACKSPACE, true),
-            (KeyCode::KEY_BACKSPACE, false),
-            (KeyCode::KEY_SPACE, true),
+            (KeyCode::KEY_A, None),
+            (KeyCode::KEY_SPACE, Some(1.0)),
+            (KeyCode::KEY_SPACE, Some(1.0)),
+            (KeyCode::KEY_BACKSPACE, Some(1.0)),
+            (KeyCode::KEY_BACKSPACE, None),
+            (KeyCode::KEY_SPACE, Some(1.0)),
         ] {
             press(&mut input, key);
             statistics_event(&mut input, key, 0);
             assert_eq!(
-                input.latest_word().unwrap().is_ambiguous,
+                input.latest_word().unwrap().ambiguous_delta_score,
                 expected,
                 "{key:?}"
             );
@@ -2416,7 +2410,7 @@ patterns = ['^\.тф']
                 input.switch_request().map(|request| request.mode),
                 expected_mode
             );
-            assert!(!input.latest_word().unwrap().is_ambiguous);
+            assert!(input.latest_word().unwrap().ambiguous_delta_score.is_none());
         }
 
         let mut input = auto_input_with_patterns("");
@@ -2425,7 +2419,7 @@ patterns = ['^\.тф']
         press(&mut input, KeyCode::KEY_A);
         complete_manual_correction(&mut input, "us");
         press(&mut input, KeyCode::KEY_SPACE);
-        assert!(!input.latest_word().unwrap().is_ambiguous);
+        assert!(input.latest_word().unwrap().ambiguous_delta_score.is_none());
     }
 
     const BOX_KEYS: [KeyCode; 7] = [
@@ -2444,9 +2438,7 @@ patterns = ['^\.тф']
         let config = crate::config::from_contents(&format!(
             "switch_key = 'KEY_PAUSE'\npattern_switch = true\n[[switch_rules]]\ntarget = 'gb'\npatterns = [{patterns}]"
         )).unwrap();
-        input.auto_switch =
-            crate::switch_rules::AutoSwitchRules::compile(&config, |name| Ok(layout(name)))
-                .unwrap();
+        input.auto_switch = AutoSwitch::compile(&config, |name| Ok(layout(name))).unwrap();
         input.auto_switch.dictionaries = crate::dictionary::test_dictionaries([
             ("us", "", us_records, 5.0),
             ("ru", "", "а 1\nиз 1\nкоробки 16", 5.0),
@@ -2458,6 +2450,70 @@ patterns = ['^\.тф']
         for key in keys {
             press(input, key);
             statistics_event(input, key, 0);
+        }
+    }
+
+    #[test]
+    fn ambiguous_chain_scores_trigger_a_prefix_switch_only_for_contiguous_words() {
+        for is_interrupted in [false, true] {
+            let mut input = auto_input_with_patterns("");
+            input.accept_layout(Some(layout("us")), false);
+            input.auto_switch.dictionaries = crate::dictionary::test_dictionaries([
+                ("us", "", "a 1\nb 2\nc 1\nz 28", 5.0),
+                ("ru", "", "ф 4\nи 4\nс 8\nя 16", 5.0),
+            ]);
+            for (key, delta_score) in [(KeyCode::KEY_A, 2.0), (KeyCode::KEY_B, 1.0)] {
+                tap_keys(&mut input, [key, KeyCode::KEY_SPACE]);
+                assert_eq!(
+                    input.latest_word().unwrap().ambiguous_delta_score,
+                    Some(delta_score)
+                );
+                assert!(input.switch_request().is_none());
+            }
+
+            if is_interrupted {
+                tap_keys(&mut input, [KeyCode::KEY_Q, KeyCode::KEY_SPACE]);
+                assert!(input.switch_request().is_none());
+                assert_eq!(input.latest_word().unwrap().ambiguous_delta_score, None);
+                tap_keys(&mut input, [KeyCode::KEY_C, KeyCode::KEY_SPACE]);
+                assert!(input.switch_request().is_none());
+                assert_eq!(
+                    input.latest_word().unwrap().ambiguous_delta_score,
+                    Some(3.0)
+                );
+            } else {
+                tap_keys(&mut input, [KeyCode::KEY_C]);
+                let request = input.switch_request().unwrap();
+                assert_eq!(request.mode, crate::switcher::SwitchMode::Auto);
+                assert_eq!(request.target.unwrap().name(), "ru");
+                assert_eq!(request.words.len(), 3);
+                assert!(request.previous.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn negative_ambiguity_score_can_make_a_first_space_switch_equal_the_threshold() {
+        for has_ambiguous_word in [false, true] {
+            let mut input = auto_input_with_patterns("");
+            input.accept_layout(Some(layout("us")), false);
+            input.auto_switch.dictionaries = crate::dictionary::test_dictionaries([
+                ("us", "", "a 2\nb 1\nbx 3\nz 122", 5.0),
+                ("ru", "", "ф 1\nи 64\nя 63", 5.0),
+            ]);
+            if has_ambiguous_word {
+                tap_keys(&mut input, [KeyCode::KEY_A, KeyCode::KEY_SPACE]);
+                assert_eq!(
+                    input.latest_word().unwrap().ambiguous_delta_score,
+                    Some(-1.0)
+                );
+            }
+
+            tap_keys(&mut input, [KeyCode::KEY_B]);
+            assert!(input.switch_request().is_none());
+            tap_keys(&mut input, [KeyCode::KEY_SPACE]);
+            assert_eq!(input.switch_request().is_some(), !has_ambiguous_word);
+            assert_eq!(input.latest_word().unwrap().ambiguous_delta_score, None);
         }
     }
 
@@ -2551,7 +2607,7 @@ patterns = ['^\.тф']
             let word = input.latest_word().unwrap();
             assert_eq!(word.text().unwrap(), expected);
             assert_eq!(word.trailing_spaces, spaces);
-            assert!(!word.is_ambiguous);
+            assert!(word.ambiguous_delta_score.is_none());
             let length = word.entries.len();
             tap_keys(
                 &mut input,
@@ -2579,7 +2635,7 @@ patterns = ['^\.тф']
         ] {
             let mut input = ambiguity_input(patterns, "f 1\nbp 1");
             tap_keys(&mut input, [KeyCode::KEY_F, KeyCode::KEY_SPACE]);
-            assert!(input.latest_word().unwrap().is_ambiguous);
+            assert!(input.latest_word().unwrap().ambiguous_delta_score.is_some());
             if mode == SwitchMode::Manual {
                 tap_keys(&mut input, [KeyCode::KEY_Q]);
             }
@@ -2595,9 +2651,9 @@ patterns = ['^\.тф']
     fn word_missing_in_both_layouts_breaks_the_ambiguous_chain() {
         let mut input = ambiguity_input("", "f 1\nbp 1");
         tap_keys(&mut input, [KeyCode::KEY_F, KeyCode::KEY_SPACE]);
-        assert!(input.latest_word().unwrap().is_ambiguous);
+        assert!(input.latest_word().unwrap().ambiguous_delta_score.is_some());
         tap_keys(&mut input, [KeyCode::KEY_Q, KeyCode::KEY_SPACE]);
-        assert!(!input.latest_word().unwrap().is_ambiguous);
+        assert!(input.latest_word().unwrap().ambiguous_delta_score.is_none());
         tap_keys(
             &mut input,
             [
@@ -2626,12 +2682,24 @@ patterns = ['^\.тф']
             let target = Arc::new(crate::layout::Layout::new("us", target_variant, "", ""));
             input.accept_layout(Some(source), false);
             tap_keys(&mut input, [KeyCode::KEY_F, KeyCode::KEY_SPACE]);
-            input.history.latest_word_mut().unwrap().is_ambiguous = true;
+            input
+                .history
+                .latest_word_mut()
+                .unwrap()
+                .ambiguous_delta_score = Some(0.0);
             tap_keys(&mut input, [KeyCode::KEY_APOSTROPHE, KeyCode::KEY_SPACE]);
             // Check that range selection revalidates a previously marked word.
-            input.history.latest_word_mut().unwrap().is_ambiguous = true;
+            input
+                .history
+                .latest_word_mut()
+                .unwrap()
+                .ambiguous_delta_score = Some(0.0);
             tap_keys(&mut input, [KeyCode::KEY_B, KeyCode::KEY_SPACE]);
-            input.history.latest_word_mut().unwrap().is_ambiguous = true;
+            input
+                .history
+                .latest_word_mut()
+                .unwrap()
+                .ambiguous_delta_score = Some(0.0);
             tap_keys(&mut input, [KeyCode::KEY_R]);
             input
                 .pending
@@ -2818,9 +2886,7 @@ patterns = ['^\.тф']
                  [[switch_rules]]\ntarget = 'ru'\npatterns = ['^ёж ?$']",
             )
             .unwrap();
-            input.auto_switch =
-                crate::switch_rules::AutoSwitchRules::compile(&settings, |name| Ok(layout(name)))
-                    .unwrap();
+            input.auto_switch = AutoSwitch::compile(&settings, |name| Ok(layout(name))).unwrap();
             input.auto_switch.dictionaries = crate::dictionary::test_dictionaries([
                 ("us", "", "banana 1", 5.0),
                 ("ru", "", "ёж 1\nэф 1", 5.0),
@@ -2908,9 +2974,7 @@ patterns = ['^\.тф']
             let settings = crate::config::from_contents(&format!(
                 "switch_key = 'KEY_PAUSE'\npattern_switch = true\n[[switch_rules]]\ntarget = 'gb'\npatterns = ['{pattern}']",
             )).unwrap();
-            input.auto_switch =
-                crate::switch_rules::AutoSwitchRules::compile(&settings, |name| Ok(layout(name)))
-                    .unwrap();
+            input.auto_switch = AutoSwitch::compile(&settings, |name| Ok(layout(name))).unwrap();
             // A distinct synthetic regex target makes a replaced request observable.
             input.auto_switch.dictionaries = crate::dictionary::test_dictionaries([
                 ("us", "", "a 1\napple 1", 5.0),
@@ -2984,9 +3048,7 @@ patterns = ['^\.тф']
             ))
             .unwrap();
             input.settings.is_pattern_switch = settings.pattern_switch;
-            input.auto_switch =
-                crate::switch_rules::AutoSwitchRules::compile(&settings, |name| Ok(layout(name)))
-                    .unwrap();
+            input.auto_switch = AutoSwitch::compile(&settings, |name| Ok(layout(name))).unwrap();
             input.auto_switch.dictionaries = crate::dictionary::test_dictionaries([
                 ("us", "", "a 1", 5.0),
                 ("ru", "", "я 1", 5.0),
@@ -3041,8 +3103,7 @@ threshold = 7.0
             let mut input = auto_input();
             let resolve = |name: &str| Ok(layout(name));
             input.settings = (&settings).into();
-            input.auto_switch =
-                crate::switch_rules::AutoSwitchRules::compile(&settings, resolve).unwrap();
+            input.auto_switch = AutoSwitch::compile(&settings, resolve).unwrap();
             input.auto_switch.dictionaries =
                 crate::dictionary::DictionaryAutoSwitch::load(&settings, resolve, || Ok(2))
                     .unwrap();

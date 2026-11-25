@@ -3,7 +3,24 @@ use std::{collections::HashMap, io};
 
 use regex::RegexSet;
 
-use crate::{config::Configuration, layout::Layout, word::Word};
+use crate::{
+    config::{Configuration, RuntimeSettings},
+    dictionary::{DictionaryAutoSwitch, DictionaryDecision},
+    layout::Layout,
+    word::Word,
+};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AutoSwitchKind {
+    Regex,
+    Dictionary,
+}
+
+pub(crate) enum AutoSwitchDecision {
+    Keep,
+    Ambiguous(f64),
+    Switch(Arc<Layout>, AutoSwitchKind),
+}
 
 struct CompiledRule {
     target: Arc<Layout>,
@@ -11,18 +28,18 @@ struct CompiledRule {
 }
 
 #[derive(Default)]
-pub struct AutoSwitchRules {
+pub struct AutoSwitch {
     rules: Vec<CompiledRule>,
-    pub(crate) dictionaries: crate::dictionary::DictionaryAutoSwitch,
+    pub(crate) dictionaries: DictionaryAutoSwitch,
 }
 
-impl AutoSwitchRules {
+impl AutoSwitch {
     pub fn new(
         settings: &Configuration,
         learned: crate::learned_rules::LearnedRules,
     ) -> io::Result<Self> {
         let mut rules = Self::compile(settings, crate::kde::target_layout)?;
-        rules.dictionaries = crate::dictionary::DictionaryAutoSwitch::load(
+        rules.dictionaries = DictionaryAutoSwitch::load(
             settings,
             crate::kde::target_layout,
             crate::kde::layout_count,
@@ -52,7 +69,41 @@ impl AutoSwitchRules {
         })
     }
 
-    pub fn target(&self, word: &Word, current: &Layout) -> Option<Arc<Layout>> {
+    pub(crate) fn decision(
+        &self,
+        word: &Word,
+        current: &Layout,
+        settings: RuntimeSettings,
+        is_first_space: bool,
+        preceding_ambiguous_score: impl FnOnce(&Layout) -> f64,
+    ) -> AutoSwitchDecision {
+        if settings.is_pattern_switch
+            && let Some(target) = self.target(word, current)
+        {
+            return AutoSwitchDecision::Switch(target, AutoSwitchKind::Regex);
+        }
+        if !settings.is_auto_switch {
+            return AutoSwitchDecision::Keep;
+        }
+
+        match self
+            .dictionaries
+            .decision(word, current, is_first_space, preceding_ambiguous_score)
+        {
+            DictionaryDecision::Keep => AutoSwitchDecision::Keep,
+            _ if settings.is_pattern_switch && self.matches_current(word, current) => {
+                AutoSwitchDecision::Keep
+            }
+            DictionaryDecision::Switch(target) => {
+                AutoSwitchDecision::Switch(target, AutoSwitchKind::Dictionary)
+            }
+            DictionaryDecision::Ambiguous(delta_score) => {
+                AutoSwitchDecision::Ambiguous(delta_score)
+            }
+        }
+    }
+
+    fn target(&self, word: &Word, current: &Layout) -> Option<Arc<Layout>> {
         let mut conversions = HashMap::new();
         self.rules.iter().find_map(|rule| {
             if rule.target.name() == current.name() {
@@ -67,7 +118,7 @@ impl AutoSwitchRules {
         })
     }
 
-    pub(crate) fn matches_current(&self, word: &Word, current: &Layout) -> bool {
+    fn matches_current(&self, word: &Word, current: &Layout) -> bool {
         let mut text = None;
         self.rules
             .iter()
@@ -118,11 +169,10 @@ mod tests {
     #[test]
     fn validates_rules_even_when_disabled() {
         let settings = parse_config("[[switch_rules]]\ntarget = 'us'\npatterns = ['[']").unwrap();
-        assert!(AutoSwitchRules::compile(&settings, resolve).is_err());
+        assert!(AutoSwitch::compile(&settings, resolve).is_err());
         let settings = parse_config("[[switch_rules]]\ntarget = 'missing'\npatterns = []").unwrap();
         assert!(
-            AutoSwitchRules::compile(&settings, |_| Err(io::Error::other("absent layout")))
-                .is_err()
+            AutoSwitch::compile(&settings, |_| Err(io::Error::other("absent layout"))).is_err()
         );
     }
 
@@ -135,7 +185,7 @@ mod tests {
             "",
         ));
         let good = resolve("gb").unwrap();
-        let rules = AutoSwitchRules {
+        let rules = AutoSwitch {
             rules: [
                 (bad.clone(), "a"),
                 (bad, "a"),
@@ -162,7 +212,7 @@ mod tests {
     #[test]
     fn conversion_failure_continues_rules_without_using_partial_text() {
         let settings = parse_config("pattern_switch = true\n[[switch_rules]]\ntarget = 'us'\npatterns = ['^a']\n[[switch_rules]]\ntarget = 'gb'\npatterns = ['^a']\n[[switch_rules]]\ntarget = 'ru'\npatterns = ['^ф']").unwrap();
-        let switch = AutoSwitchRules::compile(&settings, |name| {
+        let switch = AutoSwitch::compile(&settings, |name| {
             Ok(Arc::new(Layout::new(
                 name,
                 if name == "us" { "intl" } else { "" },
@@ -179,7 +229,7 @@ mod tests {
     #[test]
     fn matches_converted_prefix_and_respects_rule_order_and_current_layout() {
         let settings = parse_config("pattern_switch = true\n[[switch_rules]]\ntarget = 'us'\npatterns = ['^/[a-z]']\n[[switch_rules]]\ntarget = 'gb'\npatterns = ['n']").unwrap();
-        let switch = AutoSwitchRules::compile(&settings, resolve).unwrap();
+        let switch = AutoSwitch::compile(&settings, resolve).unwrap();
         let ru = resolve("ru").unwrap();
         let prefix = word(&[KeyCode::KEY_SLASH, KeyCode::KEY_N]);
         assert_eq!(switch.target(&prefix, &ru).unwrap().name(), "us");
@@ -201,7 +251,7 @@ mod tests {
             "pattern_switch = true\n[[switch_rules]]\ntarget = 'us'\npatterns = ['^foo $', '^foo  $']",
         )
         .unwrap();
-        let rules = AutoSwitchRules::compile(&settings, resolve).unwrap();
+        let rules = AutoSwitch::compile(&settings, resolve).unwrap();
         let current = resolve("ru").unwrap();
         let mut word = word(&[KeyCode::KEY_F, KeyCode::KEY_O, KeyCode::KEY_O]);
         assert!(rules.target(&word, &current).is_none());
@@ -219,7 +269,7 @@ mod tests {
              [[switch_rules]]\ntarget = 'us'\npatterns = ['^a $']",
         )
         .unwrap();
-        let rules = AutoSwitchRules::compile(&settings, resolve).unwrap();
+        let rules = AutoSwitch::compile(&settings, resolve).unwrap();
         let current = resolve("us").unwrap();
         let mut word = word(&[KeyCode::KEY_A]);
         assert!(!rules.matches_current(&word, &current));

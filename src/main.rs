@@ -78,14 +78,14 @@ fn prepare_configuration() -> Result<
     (
         config::Configuration,
         config::ConfigurationFile,
-        switch_rules::AutoSwitchRules,
+        switch_rules::AutoSwitch,
     ),
     String,
 > {
     config::load().and_then(|(config, file)| {
         let learned = learned_rules::LearnedRules::load(file.learned_rules_path())
             .map_err(|error| format!("Configuration: {error}"))?;
-        switch_rules::AutoSwitchRules::new(&config, learned)
+        switch_rules::AutoSwitch::new(&config, learned)
             .map(|auto_switch| (config, file, auto_switch))
             .map_err(|error| format!("Configuration: {error}"))
     })

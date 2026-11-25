@@ -61,7 +61,7 @@ impl History {
     ) {
         let start = self.words.len().saturating_sub(count);
         for word in &mut self.words[start..] {
-            word.is_ambiguous = false;
+            word.ambiguous_delta_score = None;
             for entry in &mut word.entries {
                 entry.layout = layout.clone();
             }
@@ -120,7 +120,7 @@ impl History {
         if word.trailing_spaces > 0 {
             word.trailing_spaces -= 1;
             if word.trailing_spaces == 0 {
-                word.is_ambiguous = false;
+                word.ambiguous_delta_score = None;
             }
             return;
         }

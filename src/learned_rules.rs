@@ -78,11 +78,12 @@ impl LearnedRules {
     }
 
     pub(crate) fn increment(&mut self, layout: &str, word: &str) -> io::Result<()> {
+        let key = word.chars().flat_map(char::to_lowercase).collect();
         let mut counts = self.counts.clone();
         let count = counts
             .entry(layout.to_owned())
             .or_default()
-            .entry(word.to_owned())
+            .entry(key)
             .or_default();
         *count = count
             .checked_add(1)
@@ -156,17 +157,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn persists_counts_for_each_layout_with_quoted_keys() {
+    fn persists_lowercase_counts_for_each_layout_with_quoted_keys() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join(FILE_NAME);
         let mut rules = LearnedRules::load(path.clone()).unwrap();
-        rules.increment("us", "don't").unwrap();
-        rules.increment("ru", "don't").unwrap();
-        rules.increment("us", "don't").unwrap();
+        rules.increment("us", "Don't").unwrap();
+        rules.increment("ru", "DON'T").unwrap();
+        rules.increment("us", "DON'T").unwrap();
 
         let rules = LearnedRules::load(path).unwrap();
-        assert_eq!(rules.counts["us"]["don't"], 2);
-        assert_eq!(rules.counts["ru"]["don't"], 1);
+        assert_eq!(
+            rules.counts["us"],
+            BTreeMap::from([("don't".to_owned(), 2)])
+        );
+        assert_eq!(
+            rules.counts["ru"],
+            BTreeMap::from([("don't".to_owned(), 1)])
+        );
+    }
+
+    #[test]
+    fn preserves_existing_keys_when_saving_a_lowercase_count() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(FILE_NAME);
+        fs::write(&path, "[ru]\n\"Кот\" = 2\n").unwrap();
+        let mut rules = LearnedRules::load(path.clone()).unwrap();
+        rules.increment("ru", "КОТ").unwrap();
+
+        let rules = LearnedRules::load(path).unwrap();
+        assert_eq!(rules.counts["ru"]["Кот"], 2);
+        assert_eq!(rules.counts["ru"]["кот"], 1);
     }
 
     #[test]
@@ -174,7 +194,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("missing/learned-rules.toml");
         let mut rules = LearnedRules::load(path).unwrap();
-        assert!(rules.increment("us", "hello").is_err());
+        assert!(rules.increment("us", "Hello").is_err());
         assert!(rules.counts.is_empty());
         assert!(rules.tries.is_empty());
     }

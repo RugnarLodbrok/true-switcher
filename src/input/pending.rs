@@ -1,12 +1,7 @@
 use std::sync::Arc;
 
 use crate::layout::Layout;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum AutoSwitchKind {
-    Regex,
-    Dictionary,
-}
+use crate::switch_rules::AutoSwitchKind;
 
 #[derive(Default)]
 pub(super) enum PendingSwitch {
