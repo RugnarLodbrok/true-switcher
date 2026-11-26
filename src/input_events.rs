@@ -18,7 +18,10 @@ pub enum InputEventMessage {
     PointerPressed,
     MouseMoved(Instant),
     PointerEventsLost,
-    LayoutChanged(Option<Arc<Layout>>),
+    LayoutsChanged {
+        current: Option<Arc<Layout>>,
+        active: Vec<Layout>,
+    },
     ToggleSetting(RuntimeSetting, mpsc::Sender<RuntimeSettings>),
     CorrectionFinished {
         result: io::Result<()>,
@@ -91,7 +94,10 @@ mod tests {
         let first = sender.clone();
         let worker = thread::spawn(move || {
             assert!(first.send(InputEventMessage::FocusChanged));
-            assert!(sender.send(InputEventMessage::LayoutChanged(None)));
+            assert!(sender.send(InputEventMessage::LayoutsChanged {
+                current: None,
+                active: Vec::new()
+            }));
         });
         let deadline = Some(Instant::now() + TEST_TIMEOUT);
         assert!(matches!(
@@ -100,7 +106,7 @@ mod tests {
         ));
         assert!(matches!(
             events.wait(deadline).unwrap(),
-            Some(InputEventMessage::LayoutChanged(None))
+            Some(InputEventMessage::LayoutsChanged { current: None, .. })
         ));
         worker.join().unwrap();
         assert_eq!(

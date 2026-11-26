@@ -30,6 +30,7 @@ struct CompiledRule {
 #[derive(Default)]
 pub struct AutoSwitch {
     rules: Vec<CompiledRule>,
+    pub(crate) punctuation: crate::punctuation::Punctuation,
     pub(crate) dictionaries: DictionaryAutoSwitch,
 }
 
@@ -65,6 +66,7 @@ impl AutoSwitch {
         }
         Ok(Self {
             rules,
+            punctuation: crate::punctuation::Punctuation::new(&settings.punctuation)?,
             ..Self::default()
         })
     }
@@ -74,7 +76,7 @@ impl AutoSwitch {
         word: &Word,
         current: &Layout,
         settings: RuntimeSettings,
-        is_first_space: bool,
+        is_word_end: bool,
         preceding_ambiguous_score: impl FnOnce(&Layout) -> f64,
     ) -> AutoSwitchDecision {
         if settings.is_pattern_switch
@@ -88,7 +90,7 @@ impl AutoSwitch {
 
         match self
             .dictionaries
-            .decision(word, current, is_first_space, preceding_ambiguous_score)
+            .decision(word, current, is_word_end, preceding_ambiguous_score)
         {
             DictionaryDecision::Keep => AutoSwitchDecision::Keep,
             _ if settings.is_pattern_switch && self.matches_current(word, current) => {
@@ -103,7 +105,15 @@ impl AutoSwitch {
         }
     }
 
-    fn target(&self, word: &Word, current: &Layout) -> Option<Arc<Layout>> {
+    pub(crate) fn update_layouts(&mut self, layouts: Vec<Layout>) {
+        if self.punctuation.update_layouts(layouts) {
+            self.dictionaries
+                .learned
+                .set_strong_punctuation(self.punctuation.strong_characters_by_layout());
+        }
+    }
+
+    pub(crate) fn target(&self, word: &Word, current: &Layout) -> Option<Arc<Layout>> {
         let mut conversions = HashMap::new();
         self.rules.iter().find_map(|rule| {
             if rule.target.name() == current.name() {
@@ -118,7 +128,7 @@ impl AutoSwitch {
         })
     }
 
-    fn matches_current(&self, word: &Word, current: &Layout) -> bool {
+    pub(crate) fn matches_current(&self, word: &Word, current: &Layout) -> bool {
         let mut text = None;
         self.rules
             .iter()
@@ -132,9 +142,7 @@ impl AutoSwitch {
 
     fn pattern_text(word: &Word, layout: &Layout) -> Result<String, crate::xkb::ConversionError> {
         let mut text = layout.to_text(word.strokes())?;
-        if word.trailing_spaces > 0 {
-            text.push(' ');
-        }
+        text.extend(std::iter::repeat_n(' ', word.trailing_spaces));
         Ok(text)
     }
 }
@@ -246,7 +254,7 @@ mod tests {
     }
 
     #[test]
-    fn matches_one_trailing_space_only_after_successful_conversion() {
+    fn matches_the_actual_number_of_trailing_spaces() {
         let settings = parse_config(
             "pattern_switch = true\n[[switch_rules]]\ntarget = 'us'\npatterns = ['^foo $', '^foo  $']",
         )
@@ -257,8 +265,10 @@ mod tests {
         assert!(rules.target(&word, &current).is_none());
         word.trailing_spaces = 1;
         assert_eq!(rules.target(&word, &current).unwrap().name(), "us");
-        word.trailing_spaces = 3;
+        word.trailing_spaces = 2;
         assert_eq!(rules.target(&word, &current).unwrap().name(), "us");
+        word.trailing_spaces = 3;
+        assert!(rules.target(&word, &current).is_none());
     }
 
     #[test]

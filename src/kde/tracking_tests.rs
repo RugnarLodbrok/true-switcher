@@ -185,6 +185,8 @@ fn client_reads_current_and_target_layouts_without_caching() {
     let target = client.target_layout("ru", &read_config).unwrap();
     assert_eq!(target.variant(), "phonetic");
     assert_eq!(target.model(), "pc105");
+    let (current, active) = client.layout_snapshot(&read_config).unwrap();
+    assert_eq!(active, [(*current).clone(), (*target).clone()]);
     assert_eq!(
         client.next_layout(&read_config).unwrap(),
         (1, target.as_ref().clone())
@@ -259,8 +261,8 @@ fn wait_for(events: &crate::input_events::InputEvents, name: Option<&str>) {
             .unwrap()
             .expect("layout event before deadline")
         {
-            InputEventMessage::LayoutChanged(layout)
-                if layout.as_ref().map(|value| value.name()) == name =>
+            InputEventMessage::LayoutsChanged { current, .. }
+                if current.as_ref().map(|value| value.name()) == name =>
             {
                 return;
             }
@@ -289,7 +291,7 @@ fn serializes_layout_queries_and_completion_publication() {
         observer.observe(|| {
             started.send(()).unwrap();
             released.recv_timeout(TEST_TIMEOUT).unwrap();
-            Ok(Arc::new(Layout::new("us", "", "", "")))
+            Ok((Arc::new(Layout::new("us", "", "", "")), Vec::new()))
         })
     });
     started_query.recv_timeout(TEST_TIMEOUT).unwrap();
@@ -315,7 +317,7 @@ fn serializes_layout_queries_and_completion_publication() {
         _ => panic!("expected correction completion after older observation"),
     }
     tracker
-        .observe(|| Ok(Arc::new(Layout::new("us", "", "", ""))))
+        .observe(|| Ok((Arc::new(Layout::new("us", "", "", "")), Vec::new())))
         .unwrap();
     wait_for(&events, Some("us"));
 }

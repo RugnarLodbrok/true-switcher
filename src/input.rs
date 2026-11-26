@@ -58,6 +58,7 @@ const NAVIGATION_KEYS: [KeyCode; 9] = [
     KeyCode::KEY_END,
     KeyCode::KEY_ESC,
 ];
+const CHAIN_ACROSS_STRONG_PUNCTUATION: bool = true;
 
 trait InputEventExt {
     fn instant(&self) -> Instant;
@@ -266,10 +267,13 @@ impl Input {
     ) -> impl Iterator<Item = f64> + 'a {
         self.history.preceding_words().map_while(move |word| {
             let delta_score = word.ambiguous_delta_score?;
-            let is_eligible = word
-                .entries
-                .iter()
-                .all(|entry| entry.layout.as_deref() == Some(source))
+            let has_chain_boundary = word.trailing_spaces > 0
+                || (CHAIN_ACROSS_STRONG_PUNCTUATION && word.trailing_punctuation > 0);
+            let is_eligible = has_chain_boundary
+                && word
+                    .entries
+                    .iter()
+                    .all(|entry| entry.layout.as_deref() == Some(source))
                 && !word.has_dead_key
                 && !word.has_dead_key_in(source)
                 && !word.has_dead_key_in(target);
@@ -455,9 +459,10 @@ impl Input {
                     self.pending.cancel_auto();
                 }
             }
-            InputEventMessage::LayoutChanged(layout) => {
+            InputEventMessage::LayoutsChanged { current, active } => {
+                self.auto_switch.update_layouts(active);
                 self.accept_layout(
-                    layout,
+                    current,
                     is_captured || state.is_some_and(|state| state.recording.is_some()),
                 );
                 if self.history.latest_word().is_none() {
@@ -663,31 +668,60 @@ impl Input {
             is_shift,
             self.layout.clone(),
             &self.auto_switch.dictionaries,
+            &self.auto_switch.punctuation,
         );
         let Some(word) = self.history.latest_word() else {
             return;
         };
-        let is_first_space = matches!(event, HistoryEvent::FirstSpace);
-        let should_score = matches!(event, HistoryEvent::Stroke | HistoryEvent::FirstSpace);
+        let is_word_end = matches!(event, HistoryEvent::WordEnd);
+        let should_score =
+            matches!(event, HistoryEvent::Stroke | HistoryEvent::WordEnd) && word.has_search_text();
         if should_score && self.settings.is_auto_switch {
             self.auto_switch
                 .dictionaries
-                .log_score(word, self.layout.as_deref(), is_first_space);
+                .log_score(word, self.layout.as_deref(), is_word_end);
         }
         if word.has_dead_key {
             self.pending.cancel_auto();
             if self.correction.is_active() {
                 self.correction.request_cancel();
             }
-        } else if should_score
+        } else if !matches!(event, HistoryEvent::Other)
             && !self.correction.is_active()
             && (self.pending.is_none() || self.pending.is_auto())
             && !self.history.is_auto_switch_blocked()
         {
             let is_paused = self.is_auto_switch_paused(now);
-            if !is_paused || (is_first_space && self.settings.is_auto_switch) {
-                self.update_auto_switch(index, is_first_space, is_paused, now);
+            if should_score && (!is_paused || (is_word_end && self.settings.is_auto_switch)) {
+                self.update_auto_switch(index, is_word_end, is_paused, now);
+            } else if !is_paused {
+                self.update_pattern_switch(index, event, now);
             }
+        }
+    }
+
+    fn update_pattern_switch(&mut self, index: usize, event: HistoryEvent, now: Instant) {
+        if !self.settings.is_pattern_switch {
+            if matches!(event, HistoryEvent::LeadingPunctuation) {
+                self.pending.cancel_auto();
+            }
+            return;
+        }
+        let Some(layout) = self.layout.as_deref() else {
+            self.pending.cancel_auto();
+            return;
+        };
+        let word = self.history.latest_word().unwrap();
+        if let Some(target) = self.auto_switch.target(word, layout) {
+            self.pending
+                .update_auto(index, Some((target, AutoSwitchKind::Regex)), now);
+        } else if matches!(event, HistoryEvent::AdditionalSeparator) {
+            self.pending.cancel_auto_kind(AutoSwitchKind::Regex);
+            if self.pending.is_auto() && self.auto_switch.matches_current(word, layout) {
+                self.pending.cancel_auto_kind(AutoSwitchKind::Dictionary);
+            }
+        } else {
+            self.pending.cancel_auto();
         }
     }
 
@@ -699,7 +733,7 @@ impl Input {
     fn update_auto_switch(
         &mut self,
         index: usize,
-        is_first_space: bool,
+        is_word_end: bool,
         is_paused: bool,
         now: Instant,
     ) {
@@ -710,7 +744,7 @@ impl Input {
         let word = self.history.latest_word().unwrap();
         let decision =
             self.auto_switch
-                .decision(word, layout, self.settings, is_first_space, |target| {
+                .decision(word, layout, self.settings, is_word_end, |target| {
                     if is_paused {
                         return 0.0;
                     }
@@ -1233,6 +1267,36 @@ patterns = ['^\.тф']
                 None,
             )
             .unwrap();
+    }
+
+    fn enable_punctuation_boundaries(input: &mut Input) {
+        let config = crate::config::from_contents("switch_key = 'KEY_PAUSE'").unwrap();
+        input.auto_switch.punctuation =
+            crate::punctuation::Punctuation::new(&config.punctuation).unwrap();
+        input
+            .auto_switch
+            .update_layouts(vec![(*layout("us")).clone(), (*layout("ru")).clone()]);
+    }
+
+    #[test]
+    fn manual_request_keeps_all_trailing_punctuation() {
+        use KeyCode as K;
+        let (mut input, _) = channel_input();
+        input.pending.cancel();
+        input.accept_layout(Some(layout("us")), false);
+        enable_punctuation_boundaries(&mut input);
+        for key in [K::KEY_H, K::KEY_O, K::KEY_M, K::KEY_E]
+            .into_iter()
+            .chain(std::iter::repeat_n(K::KEY_SLASH, 7))
+        {
+            press(&mut input, key);
+            statistics_event(&mut input, key, 0);
+        }
+        press(&mut input, K::KEY_PAUSE);
+        let request = input.switch_request().unwrap();
+        assert_eq!(request.mode, crate::switcher::SwitchMode::Manual);
+        assert_eq!(request.words.len(), 1);
+        assert_eq!(request.words[0].text().as_deref(), Ok("home///////"));
     }
 
     fn event_at(input: &mut Input, source: usize, key: KeyCode, value: i32, now: Instant) {
@@ -1827,15 +1891,24 @@ patterns = ['^\.тф']
     #[test]
     fn queued_layouts_are_applied_in_order_and_duplicate_layouts_keep_history() {
         let (mut input, sender) = channel_input();
-        sender.send(InputEventMessage::LayoutChanged(Some(layout("us"))));
+        sender.send(InputEventMessage::LayoutsChanged {
+            current: Some(layout("us")),
+            active: Vec::new(),
+        });
         sender.send(InputEventMessage::Keyboard(
             0,
             InputEvent::new(EventType::KEY.0, KeyCode::KEY_A.0, 1),
         ));
-        sender.send(InputEventMessage::LayoutChanged(Some(layout("us"))));
+        sender.send(InputEventMessage::LayoutsChanged {
+            current: Some(layout("us")),
+            active: Vec::new(),
+        });
         input.process_available_events(None).unwrap();
         assert_eq!(input.latest_word().unwrap().text().as_deref(), Ok("a"));
-        sender.send(InputEventMessage::LayoutChanged(Some(layout("ru"))));
+        sender.send(InputEventMessage::LayoutsChanged {
+            current: Some(layout("ru")),
+            active: Vec::new(),
+        });
         input.process_available_events(None).unwrap();
         assert!(input.latest_word().is_none());
     }
@@ -1847,7 +1920,10 @@ patterns = ['^\.тф']
         press(&mut input, KeyCode::KEY_A);
         event_at(&mut input, 0, KeyCode::KEY_A, 0, Instant::now());
         let mut interception = Interceptor::enter(&mut input).unwrap().unwrap();
-        sender.send(InputEventMessage::LayoutChanged(Some(layout("ru"))));
+        sender.send(InputEventMessage::LayoutsChanged {
+            current: Some(layout("ru")),
+            active: Vec::new(),
+        });
         interception.read_captured().unwrap();
         assert_eq!(
             interception
@@ -1863,7 +1939,10 @@ patterns = ['^\.тф']
             result: Ok(()),
             layout: Some(layout("ru")),
         });
-        sender.send(InputEventMessage::LayoutChanged(Some(layout("ru"))));
+        sender.send(InputEventMessage::LayoutsChanged {
+            current: Some(layout("ru")),
+            active: Vec::new(),
+        });
         assert!(interception.wait_for_correction().unwrap().unwrap().is_ok());
         assert_eq!(
             interception
@@ -1891,7 +1970,10 @@ patterns = ['^\.тф']
             result: Ok(()),
             layout: Some(layout("ru")),
         });
-        sender.send(InputEventMessage::LayoutChanged(Some(layout("us"))));
+        sender.send(InputEventMessage::LayoutsChanged {
+            current: Some(layout("us")),
+            active: Vec::new(),
+        });
         assert!(interception.wait_for_correction().unwrap().unwrap().is_ok());
         interception.finish().unwrap();
         assert!(input.latest_word().is_none());
@@ -2362,8 +2444,8 @@ patterns = ['^\.тф']
     }
 
     #[test]
-    fn first_space_matches_pattern_and_later_spaces_do_not_recheck() {
-        let mut input = auto_input_with_patterns("'^foo $'");
+    fn second_space_can_match_a_pattern_using_both_spaces() {
+        let mut input = auto_input_with_patterns("'^foo  $'");
         press(&mut input, KeyCode::KEY_SPACE);
         assert!(input.automatic_target().is_none());
         for key in [KeyCode::KEY_F, KeyCode::KEY_O, KeyCode::KEY_O] {
@@ -2371,11 +2453,127 @@ patterns = ['^\.тф']
         }
         assert!(input.automatic_target().is_none());
         press(&mut input, KeyCode::KEY_SPACE);
-        assert_eq!(input.automatic_target().unwrap().name(), "us");
-        input.pending.cancel_auto();
-        press(&mut input, KeyCode::KEY_SPACE);
         assert!(input.automatic_target().is_none());
+        press(&mut input, KeyCode::KEY_SPACE);
+        assert_eq!(input.automatic_target().unwrap().name(), "us");
         assert_eq!(input.latest_word().unwrap().trailing_spaces, 2);
+    }
+
+    #[test]
+    fn regex_matches_the_full_punctuation_series_and_spaces() {
+        use KeyCode as K;
+        for (pattern, spaces) in [("'^home//$'", 0), ("'^home// $'", 1), ("'^home//  $'", 2)] {
+            let mut input = auto_input_with_patterns(pattern);
+            enable_punctuation_boundaries(&mut input);
+            tap_keys(
+                &mut input,
+                [K::KEY_H, K::KEY_O, K::KEY_M, K::KEY_E, K::KEY_SLASH],
+            );
+            assert!(input.switch_request().is_none());
+            for key in
+                std::iter::once(K::KEY_SLASH).chain(std::iter::repeat_n(K::KEY_SPACE, spaces))
+            {
+                assert!(input.switch_request().is_none());
+                tap_keys(&mut input, [key]);
+            }
+            let request = input.switch_request().unwrap();
+            assert_eq!(request.mode, crate::switcher::SwitchMode::Pattern);
+            let word = &request.words[0];
+            assert_eq!(
+                request.target.unwrap().to_text(word.strokes()).as_deref(),
+                Ok("home//")
+            );
+            assert_eq!(word.trailing_spaces, spaces);
+        }
+    }
+
+    #[test]
+    fn home_path_pattern_matches_on_the_first_strong_separator() {
+        use KeyCode as K;
+        let mut input = auto_input_with_patterns("'^~/'");
+        enable_punctuation_boundaries(&mut input);
+        press(&mut input, K::KEY_LEFTSHIFT);
+        tap_keys(&mut input, [K::KEY_GRAVE]);
+        statistics_event(&mut input, K::KEY_LEFTSHIFT, 0);
+        assert!(input.switch_request().is_none());
+        tap_keys(&mut input, [K::KEY_SLASH]);
+        let request = input.switch_request().unwrap();
+        assert_eq!(request.mode, crate::switcher::SwitchMode::Pattern);
+        assert_eq!(request.words[0].text().as_deref(), Ok("Ё."));
+    }
+
+    #[test]
+    fn punctuation_uses_one_exact_lookup_and_later_regex_can_take_priority() {
+        use KeyCode as K;
+        let mut input = auto_input_with_patterns("'^bkb// $'");
+        enable_punctuation_boundaries(&mut input);
+        input.auto_switch.dictionaries = crate::dictionary::test_dictionaries([
+            ("us", "", "bkb 1", 5.0),
+            ("ru", "", "илик 1", 5.0),
+        ]);
+        tap_keys(&mut input, [K::KEY_B, K::KEY_K, K::KEY_B]);
+        assert!(input.switch_request().is_none());
+        assert_eq!(
+            logged_dictionary_scores(&mut input, K::KEY_SLASH, log::LevelFilter::Debug).len(),
+            1
+        );
+        statistics_event(&mut input, K::KEY_SLASH, 0);
+        assert_eq!(
+            input.switch_request().unwrap().mode,
+            crate::switcher::SwitchMode::Auto
+        );
+        for key in [K::KEY_SLASH, K::KEY_SPACE] {
+            assert!(logged_dictionary_scores(&mut input, key, log::LevelFilter::Debug).is_empty());
+            statistics_event(&mut input, key, 0);
+        }
+        let request = input.switch_request().unwrap();
+        assert_eq!(request.mode, crate::switcher::SwitchMode::Pattern);
+        assert_eq!(request.words[0].text().as_deref(), Ok("или.."));
+        assert_eq!(request.words[0].trailing_spaces, 1);
+    }
+
+    #[test]
+    fn learned_search_uses_the_word_inside_strong_punctuation() {
+        use KeyCode as K;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(crate::learned_rules::FILE_NAME);
+        std::fs::write(&path, "[us]\n\"/new\" = 3\nnew = 2\nnews = 7\n").unwrap();
+        let mut input = auto_input_with_patterns("");
+        input.auto_switch.dictionaries.learned =
+            crate::learned_rules::LearnedRules::load(path).unwrap();
+        let us = layout("us");
+        let ru = layout("ru");
+        input
+            .process_message(
+                InputEventMessage::LayoutsChanged {
+                    current: Some(ru.clone()),
+                    active: vec![(*us).clone(), (*ru).clone()],
+                },
+                None,
+            )
+            .unwrap();
+
+        tap_keys(&mut input, [K::KEY_SLASH, K::KEY_N, K::KEY_E, K::KEY_W]);
+        let word = input.latest_word().unwrap();
+        assert_eq!(
+            input
+                .auto_switch
+                .dictionaries
+                .learned
+                .count(&us, word, false),
+            12
+        );
+        tap_keys(&mut input, [K::KEY_SLASH, K::KEY_SLASH]);
+        let word = input.latest_word().unwrap();
+        assert_eq!(
+            input
+                .auto_switch
+                .dictionaries
+                .learned
+                .count(&us, word, true),
+            5
+        );
+        assert_eq!(us.to_text(word.strokes()).as_deref(), Ok("/new//"));
     }
 
     #[test]
@@ -2506,6 +2704,56 @@ patterns = ['^\.тф']
         for key in keys {
             press(input, key);
             statistics_event(input, key, 0);
+        }
+    }
+
+    #[test]
+    fn dictionary_chain_crosses_strong_punctuation_until_manual_correction() {
+        use KeyCode as K;
+        for is_manually_corrected in [false, true] {
+            let mut input = auto_input_with_patterns("");
+            enable_punctuation_boundaries(&mut input);
+            input.auto_switch.dictionaries = crate::dictionary::test_dictionaries([
+                ("us", "", "home 4\nconfig 16\nz 12", 5.0),
+                ("ru", "", "рщьу 1\nсщташп 1\nсщташг 4\nя 26", 5.0),
+            ]);
+            tap_keys(
+                &mut input,
+                [K::KEY_H, K::KEY_O, K::KEY_M, K::KEY_E, K::KEY_SLASH],
+            );
+            assert_eq!(
+                input.latest_word().unwrap().ambiguous_delta_score,
+                Some(2.0)
+            );
+            assert!(input.switch_request().is_none());
+            if is_manually_corrected {
+                complete_manual_correction(&mut input, "ru");
+                assert!(input.latest_word().unwrap().ambiguous_delta_score.is_none());
+            }
+            tap_keys(
+                &mut input,
+                [K::KEY_C, K::KEY_O, K::KEY_N, K::KEY_F, K::KEY_I],
+            );
+            assert!(input.switch_request().is_none());
+            tap_keys(&mut input, [K::KEY_G]);
+            if is_manually_corrected {
+                assert!(input.switch_request().is_none());
+            } else {
+                let request = input.switch_request().unwrap();
+                assert_eq!(request.mode, crate::switcher::SwitchMode::Auto);
+                let target = request.target.unwrap();
+                assert_eq!(
+                    request
+                        .words
+                        .iter()
+                        .map(|word| (
+                            target.to_text(word.strokes()).unwrap(),
+                            word.trailing_spaces
+                        ))
+                        .collect::<Vec<_>>(),
+                    [("home/".into(), 0), ("config".into(), 0)]
+                );
+            }
         }
     }
 

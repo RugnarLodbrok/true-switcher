@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 pub(crate) const WORD_END: &str = " ";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Stroke {
     pub key: KeyCode,
     pub shift: bool,
@@ -15,6 +15,8 @@ pub struct Stroke {
 pub struct Word {
     pub entries: Vec<WordStroke>,
     pub trailing_spaces: usize,
+    pub(crate) leading_punctuation: usize,
+    pub(crate) trailing_punctuation: usize,
     pub(crate) dictionary_prefixes: Vec<Vec<Prefix>>,
     pub(crate) has_dead_key: bool,
     pub(crate) ambiguous_delta_score: Option<f64>,
@@ -34,10 +36,30 @@ impl Word {
     }
 
     pub(crate) fn pop_stroke(&mut self) {
-        self.entries.pop();
-        for stack in &mut self.dictionary_prefixes {
-            stack.pop();
+        if self.trailing_punctuation > 0 {
+            self.trailing_punctuation -= 1;
+        } else if self.has_search_text() {
+            for stack in &mut self.dictionary_prefixes {
+                stack.pop();
+            }
+        } else {
+            self.leading_punctuation -= 1;
         }
+        self.entries.pop();
+    }
+
+    pub(crate) fn has_search_text(&self) -> bool {
+        self.entries.len() > self.leading_punctuation + self.trailing_punctuation
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.trailing_spaces > 0 || self.trailing_punctuation > 0
+    }
+
+    pub(crate) fn search_strokes(&self) -> impl Iterator<Item = &Stroke> {
+        self.entries[self.leading_punctuation..self.entries.len() - self.trailing_punctuation]
+            .iter()
+            .map(|entry| &entry.stroke)
     }
 
     pub fn strokes(&self) -> impl Iterator<Item = &Stroke> {

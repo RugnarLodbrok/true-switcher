@@ -141,8 +141,8 @@ impl DictionaryTrie {
         }
     }
 
-    fn word_score(&self, prefix: Prefix, is_first_space: bool) -> Option<f64> {
-        let prefix = if is_first_space {
+    fn word_score(&self, prefix: Prefix, is_word_end: bool) -> Option<f64> {
+        let prefix = if is_word_end {
             self.advance(prefix, WORD_END)
         } else {
             prefix
@@ -165,7 +165,10 @@ fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
-fn compile_full_match_pattern(pattern: &str, setting: &str) -> io::Result<Option<Regex>> {
+pub(crate) fn compile_full_match_pattern(
+    pattern: &str,
+    setting: &str,
+) -> io::Result<Option<Regex>> {
     compile_anchored_pattern(pattern, setting, r"\z")
 }
 
@@ -300,16 +303,16 @@ impl DictionaryAutoSwitch {
         }
     }
 
-    fn layout_score(&self, word: &Word, index: usize, is_first_space: bool) -> Option<(f64, u128)> {
+    fn layout_score(&self, word: &Word, index: usize, is_word_end: bool) -> Option<(f64, u128)> {
         let dictionary = &self.dictionaries[index];
         let prefix = *word.dictionary_prefixes.get(index)?.last()?;
-        let mut score = dictionary.trie.word_score(prefix, is_first_space)?;
+        let mut score = dictionary.trie.word_score(prefix, is_word_end)?;
         if let Some(remainder_score) =
-            self.punctuation_remainder_score(word, dictionary, is_first_space)
+            self.punctuation_remainder_score(word, dictionary, is_word_end)
         {
             score = score.max(remainder_score);
         }
-        let learned = self.learned.count(&dictionary.target, word, is_first_space);
+        let learned = self.learned.count(&dictionary.target, word, is_word_end);
         Some((score, learned))
     }
 
@@ -317,24 +320,24 @@ impl DictionaryAutoSwitch {
         &self,
         word: &Word,
         dictionary: &Dictionary,
-        is_first_space: bool,
+        is_word_end: bool,
     ) -> Option<f64> {
         let pattern = self.leading_punctuation.as_ref()?;
-        let text = dictionary.target.to_text(word.strokes()).ok()?;
+        let text = dictionary.target.to_text(word.search_strokes()).ok()?;
         let matched = pattern.find(&text)?;
         if matched.is_empty() || matched.end() == text.len() {
             return None;
         }
         let trie = &dictionary.trie;
         let prefix = trie.advance(Prefix::Node(0), &text[matched.end()..]);
-        trie.word_score(prefix, is_first_space)
+        trie.word_score(prefix, is_word_end)
     }
 
     fn comparison(
         &self,
         word: &Word,
         current: &Layout,
-        is_first_space: bool,
+        is_word_end: bool,
     ) -> Option<DictionaryComparison<'_>> {
         let current_index = self
             .dictionaries
@@ -342,9 +345,9 @@ impl DictionaryAutoSwitch {
             .position(|dictionary| dictionary.target.name() == current.name())?;
         let alternative_index = 1 - current_index;
         let (current_score, learned_current) =
-            self.layout_score(word, current_index, is_first_space)?;
+            self.layout_score(word, current_index, is_word_end)?;
         let (alternative_score, learned_alternative) =
-            self.layout_score(word, alternative_index, is_first_space)?;
+            self.layout_score(word, alternative_index, is_word_end)?;
         let current = score_with_learned_baseline(current_score, learned_current);
         let alternative = score_with_learned_baseline(alternative_score, learned_alternative);
         let delta_score = if current == f64::NEG_INFINITY && alternative == f64::NEG_INFINITY {
@@ -372,10 +375,10 @@ impl DictionaryAutoSwitch {
         &self,
         word: &Word,
         current: &Layout,
-        is_first_space: bool,
+        is_word_end: bool,
         preceding_ambiguous_score: impl FnOnce(&Layout) -> f64,
     ) -> DictionaryDecision {
-        let Some(comparison) = self.comparison(word, current, is_first_space) else {
+        let Some(comparison) = self.comparison(word, current, is_word_end) else {
             return DictionaryDecision::Keep;
         };
         let alternative = comparison.alternative_dictionary;
@@ -391,7 +394,7 @@ impl DictionaryAutoSwitch {
         let ambiguity_lower_bound = self
             .ambiguity_score_floor
             .unwrap_or(-comparison.current_threshold);
-        let is_ambiguous = is_first_space
+        let is_ambiguous = is_word_end
             && has_current_score
             && has_alternative_score
             && comparison.delta_score >= ambiguity_lower_bound
@@ -416,19 +419,19 @@ impl DictionaryAutoSwitch {
     }
 
     #[cfg(test)]
-    fn target(&self, word: &Word, current: &Layout, is_first_space: bool) -> Option<Arc<Layout>> {
-        match self.decision(word, current, is_first_space, |_| 0.0) {
+    fn target(&self, word: &Word, current: &Layout, is_word_end: bool) -> Option<Arc<Layout>> {
+        match self.decision(word, current, is_word_end, |_| 0.0) {
             DictionaryDecision::Switch(target) => Some(target),
             _ => None,
         }
     }
 
-    pub(crate) fn log_score(&self, word: &Word, current: Option<&Layout>, is_first_space: bool) {
+    pub(crate) fn log_score(&self, word: &Word, current: Option<&Layout>, is_word_end: bool) {
         if self.dictionaries.is_empty() || !log::log_enabled!(log::Level::Debug) {
             return;
         }
         let Some(comparison) =
-            current.and_then(|layout| self.comparison(word, layout, is_first_space))
+            current.and_then(|layout| self.comparison(word, layout, is_word_end))
         else {
             log::debug!("dict switch score: unavailable");
             return;

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -14,6 +14,7 @@ pub(crate) struct LearnedRules {
     path: Option<PathBuf>,
     counts: Counts,
     tries: BTreeMap<String, LearnedTrie>,
+    strong_punctuation: BTreeMap<String, HashSet<char>>,
 }
 
 impl LearnedRules {
@@ -42,32 +43,51 @@ impl LearnedRules {
         let counts = read().map_err(|error| {
             io::Error::new(error.kind(), format!("{}: {error}", path.display()))
         })?;
-        let tries = counts
+        let mut rules = Self {
+            path: Some(path),
+            counts,
+            ..Self::default()
+        };
+        rules.rebuild_tries();
+        Ok(rules)
+    }
+
+    pub(crate) fn set_strong_punctuation(&mut self, punctuation: BTreeMap<String, HashSet<char>>) {
+        if self.strong_punctuation != punctuation {
+            self.strong_punctuation = punctuation;
+            self.rebuild_tries();
+        }
+    }
+
+    fn rebuild_tries(&mut self) {
+        self.tries = self
+            .counts
             .iter()
             .map(|(layout, words)| {
                 let mut trie = LearnedTrie::default();
                 for (word, &count) in words {
-                    trie.add(word, count as u128);
+                    trie.add(
+                        trim_punctuation(word, self.strong_punctuation.get(layout)),
+                        count as u128,
+                    );
                 }
                 (layout.clone(), trie)
             })
             .collect();
-        Ok(Self {
-            path: Some(path),
-            counts,
-            tries,
-        })
     }
 
-    pub(crate) fn count(&self, layout: &Layout, word: &Word, is_first_space: bool) -> u128 {
+    pub(crate) fn count(&self, layout: &Layout, word: &Word, is_word_end: bool) -> u128 {
+        if !word.has_search_text() {
+            return 0;
+        }
         self.tries
             .get(layout.name())
             .and_then(|trie| {
-                let node = word.strokes().try_fold(0, |node, stroke| {
+                let node = word.search_strokes().try_fold(0, |node, stroke| {
                     let text = crate::xkb::stroke_text(layout, stroke).ok()?;
                     trie.advance(node, &text)
                 })?;
-                let node = if is_first_space {
+                let node = if is_word_end {
                     trie.advance(node, WORD_END)?
                 } else {
                     node
@@ -96,11 +116,19 @@ impl LearnedRules {
             temporary.persist(path).map_err(|error| error.error)?;
         }
         self.counts = counts;
+        let indexed_word = trim_punctuation(word, self.strong_punctuation.get(layout));
         self.tries
             .entry(layout.to_owned())
             .or_default()
-            .add(word, 1);
+            .add(indexed_word, 1);
         Ok(())
+    }
+}
+
+fn trim_punctuation<'a>(word: &'a str, punctuation: Option<&HashSet<char>>) -> &'a str {
+    match punctuation {
+        Some(punctuation) => word.trim_matches(|character| punctuation.contains(&character)),
+        None => word,
     }
 }
 
@@ -124,6 +152,9 @@ impl Default for LearnedTrie {
 
 impl LearnedTrie {
     fn add(&mut self, word: &str, count: u128) {
+        if word.is_empty() {
+            return;
+        }
         let mut node = 0;
         self.nodes[0].count += count;
         for character in word
@@ -187,6 +218,42 @@ mod tests {
         let rules = LearnedRules::load(path).unwrap();
         assert_eq!(rules.counts["ru"]["Кот"], 2);
         assert_eq!(rules.counts["ru"]["кот"], 1);
+    }
+
+    #[test]
+    fn rebuilds_the_learned_index_from_original_keys_and_current_layouts() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(FILE_NAME);
+        let original = "[us]\n\"/new\" = 3\nnew = 2\n\"<home/config/\" = 7\n\"///\" = 11\n";
+        fs::write(&path, original).unwrap();
+        let mut rules = LearnedRules::load(path.clone()).unwrap();
+        let us = Layout::new("us", "", "pc105", "");
+        let ru = Layout::new("ru", "", "pc105", "");
+        let mut punctuation = crate::punctuation::Punctuation::new(r"[`~<>\p{P}]+").unwrap();
+        punctuation.update_layouts(vec![us.clone(), ru]);
+        rules.set_strong_punctuation(punctuation.strong_characters_by_layout());
+
+        let indexed_count = |rules: &LearnedRules, key: &str| {
+            let trie = &rules.tries["us"];
+            trie.advance(0, key).map(|node| trie.nodes[node].count)
+        };
+        assert_eq!(indexed_count(&rules, "new "), Some(5));
+        assert_eq!(indexed_count(&rules, "/new "), None);
+        assert_eq!(indexed_count(&rules, "<home/config "), Some(7));
+        assert_eq!(indexed_count(&rules, " "), None);
+        assert_eq!(indexed_count(&rules, ""), Some(12));
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+
+        rules.increment("us", "new").unwrap();
+        assert_eq!(indexed_count(&rules, "new "), Some(6));
+        assert_eq!(rules.counts["us"]["/new"], 3);
+        assert_eq!(rules.counts["us"]["new"], 3);
+
+        punctuation.update_layouts(vec![us]);
+        rules.set_strong_punctuation(punctuation.strong_characters_by_layout());
+        assert_eq!(indexed_count(&rules, "<home/config "), None);
+        assert_eq!(indexed_count(&rules, "home/config "), Some(7));
+        assert_eq!(rules.counts["us"]["<home/config/"], 7);
     }
 
     #[test]

@@ -69,18 +69,22 @@ impl LayoutTracker {
         }
     }
 
-    fn set(&self, layout: Option<Arc<Layout>>) {
-        self.sender.send(InputEventMessage::LayoutChanged(layout));
+    fn set(&self, current: Option<Arc<Layout>>, active: Vec<Layout>) {
+        self.sender
+            .send(InputEventMessage::LayoutsChanged { current, active });
     }
 
-    fn observe(&self, read: impl FnOnce() -> io::Result<Arc<Layout>>) -> io::Result<()> {
+    fn observe(
+        &self,
+        read: impl FnOnce() -> io::Result<(Arc<Layout>, Vec<Layout>)>,
+    ) -> io::Result<()> {
         let _guard = self
             .observation
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let result = read();
-        self.set(result.as_ref().ok().cloned());
-        result.map(|_| ())
+        let (current, active) = read()?;
+        self.set(Some(current), active);
+        Ok(())
     }
 
     fn invalidate(&self) {
@@ -88,7 +92,7 @@ impl LayoutTracker {
             .observation
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        self.set(None);
+        self.set(None, Vec::new());
     }
 
     pub fn finish_correction(&self, result: io::Result<()>) {
@@ -160,9 +164,8 @@ fn receive_changes(
     let mut messages = subscribe(connection)?;
     let owner = DBusProxy::new(connection)?.get_name_owner(SERVICE.try_into()?)?;
     let client = KdeClient::new(connection.clone(), owner.to_string())?;
-    tracker
-        .observe(|| client.current_layout(read_config))
-        .map_err(zbus::Error::from)?;
+    let observe = || tracker.observe(|| client.layout_snapshot(read_config));
+    observe().map_err(zbus::Error::from)?;
     on_connected();
     for message in &mut messages {
         let message = message?;
@@ -191,9 +194,7 @@ fn receive_changes(
         {
             // Requery instead of replaying queued indices: signals received during
             // `current_layout` must never overwrite the snapshot with an older layout.
-            tracker
-                .observe(|| client.current_layout(read_config))
-                .map_err(zbus::Error::from)?;
+            observe().map_err(zbus::Error::from)?;
         }
     }
     Err(io::Error::other("layout signal stream closed").into())
@@ -259,6 +260,14 @@ impl KdeClient {
         &self,
         read_config: &impl Fn() -> io::Result<String>,
     ) -> io::Result<Arc<Layout>> {
+        self.layout_snapshot(read_config)
+            .map(|(current, _)| current)
+    }
+
+    fn layout_snapshot(
+        &self,
+        read_config: &impl Fn() -> io::Result<String>,
+    ) -> io::Result<(Arc<Layout>, Vec<Layout>)> {
         let names = self.layouts()?;
         let contents = read_config()?;
         let index = self.current_layout_index()?;
@@ -266,9 +275,16 @@ impl KdeClient {
             .get(index)
             .ok_or_else(|| io::Error::other("unknown KDE layout index"))?
             .0;
-        configured_layout(&contents, index, name)
+        let current = configured_layout(&contents, index, name)
             .map(Arc::new)
-            .ok_or_else(|| io::Error::other("cannot match KDE layout to kxkbrc"))
+            .ok_or_else(|| io::Error::other("cannot match KDE layout to kxkbrc"))?;
+        let active = names
+            .iter()
+            .enumerate()
+            .map(|(index, (name, _, _))| configured_layout(&contents, index, name))
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default();
+        Ok((current, active))
     }
 
     fn current_layout_index(&self) -> io::Result<usize> {

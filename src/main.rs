@@ -10,6 +10,7 @@ mod layout;
 mod learned_rules;
 mod lifecycle;
 pub mod output;
+mod punctuation;
 mod sound;
 mod statistics;
 mod switch_rules;

@@ -76,7 +76,7 @@ impl Correction {
         let Some(word) = self.words.last() else {
             return Ok(None);
         };
-        let mut text = layout.to_text(word.strokes())?;
+        let mut text = layout.to_text(word.search_strokes())?;
         text.truncate(text.trim_end_matches(' ').len());
         Ok((!text.is_empty()).then_some(text))
     }
@@ -504,6 +504,51 @@ mod tests {
         );
         correction.words.clear();
         assert_eq!(correction.learned_word(&completed, &target).unwrap(), None);
+    }
+
+    #[test]
+    fn teach_trims_actual_strong_strokes_but_keeps_a_non_strong_way_to_type_a_symbol() {
+        use evdev::KeyCode as K;
+        let us = layout::Layout::new("us", "", "pc105", "");
+        let ru = Arc::new(layout::Layout::new("ru", "", "pc105", ""));
+        let mut punctuation = crate::punctuation::Punctuation::new(r"[`~<>\p{P}]+").unwrap();
+        punctuation.update_layouts(vec![us.clone(), (*ru).clone()]);
+        let dictionaries = crate::dictionary::DictionaryAutoSwitch::default();
+        let now = Instant::now();
+        let completed = CorrectionOutcome::Completed {
+            started_at: now,
+            finished_at: now,
+        };
+        for (first, is_shift, expected) in
+            [(K::KEY_SLASH, false, "new"), (K::KEY_COMMA, true, "<new")]
+        {
+            let mut history = crate::history::History::default();
+            history.process(
+                first,
+                is_shift,
+                Some(ru.clone()),
+                &dictionaries,
+                &punctuation,
+            );
+            for key in [K::KEY_N, K::KEY_E, K::KEY_W, K::KEY_SLASH] {
+                history.process(key, false, Some(ru.clone()), &dictionaries, &punctuation);
+            }
+            let correction = Correction::from_request(
+                input::SwitchRequest {
+                    previous: None,
+                    words: history.reset(),
+                    target: None,
+                    mode: SwitchMode::Manual,
+                    is_learning: true,
+                    triggered_at: None,
+                },
+                RuntimeSettings::default(),
+            );
+            assert_eq!(
+                correction.learned_word(&completed, &us).unwrap().as_deref(),
+                Some(expected)
+            );
+        }
     }
 
     #[test]

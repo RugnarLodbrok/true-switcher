@@ -1,5 +1,6 @@
 use crate::dictionary::DictionaryAutoSwitch;
 use crate::layout::Layout;
+use crate::punctuation::Punctuation;
 use crate::word::{Stroke, Word, WordStroke};
 use evdev::KeyCode;
 use std::sync::Arc;
@@ -12,7 +13,9 @@ pub struct History {
 
 pub(crate) enum HistoryEvent {
     Stroke,
-    FirstSpace,
+    WordEnd,
+    LeadingPunctuation,
+    AdditionalSeparator,
     Other,
 }
 
@@ -81,43 +84,66 @@ impl History {
         is_shift: bool,
         layout: Option<Arc<Layout>>,
         dictionaries: &DictionaryAutoSwitch,
+        punctuation: &Punctuation,
     ) -> HistoryEvent {
         match key {
             KeyCode::KEY_SPACE => {
-                if let Some(word) = self.words.last_mut() {
-                    word.trailing_spaces += 1;
-                    if word.trailing_spaces == 1 {
-                        log::trace!("{word}");
-                        return HistoryEvent::FirstSpace;
-                    }
+                let Some(word) = self.words.last_mut() else {
+                    return HistoryEvent::Other;
+                };
+                let is_closed = word.is_closed();
+                word.trailing_spaces += 1;
+                if is_closed {
+                    HistoryEvent::AdditionalSeparator
+                } else {
+                    log::trace!("{word}");
+                    HistoryEvent::WordEnd
                 }
-                HistoryEvent::Other
             }
             KeyCode::KEY_BACKSPACE => {
                 self.backspace();
                 HistoryEvent::Other
             }
             key if is_text_key(key) => {
+                let stroke = Stroke {
+                    key,
+                    shift: is_shift,
+                };
+                let is_strong = punctuation.is_strong(&stroke);
                 if self
                     .words
                     .last()
-                    .is_none_or(|word| word.trailing_spaces > 0)
+                    .is_none_or(|word| word.trailing_spaces > 0 || (word.is_closed() && !is_strong))
                 {
                     self.words.push(Word::default());
                     self.is_auto_switch_blocked = false;
                 }
                 let word = self.words.last_mut().unwrap();
-                let stroke = Stroke {
-                    key,
-                    shift: is_shift,
-                };
                 if !word.has_dead_key {
                     word.has_dead_key = layout.as_ref().is_some_and(|layout| {
                         crate::xkb::has_dead_key(layout, [&stroke]) == Ok(true)
                     });
                 }
-                word.push_stroke(WordStroke { stroke, layout }, dictionaries);
-                HistoryEvent::Stroke
+                let entry = WordStroke { stroke, layout };
+                if !is_strong {
+                    word.push_stroke(entry, dictionaries);
+                    return HistoryEvent::Stroke;
+                }
+                let is_word_end = word.has_search_text() && !word.is_closed();
+                if word.has_search_text() {
+                    word.trailing_punctuation += 1;
+                } else {
+                    word.leading_punctuation += 1;
+                }
+                word.entries.push(entry);
+                if is_word_end {
+                    log::trace!("{word}");
+                    HistoryEvent::WordEnd
+                } else if word.is_closed() {
+                    HistoryEvent::AdditionalSeparator
+                } else {
+                    HistoryEvent::LeadingPunctuation
+                }
             }
             _ => HistoryEvent::Other,
         }
@@ -125,7 +151,7 @@ impl History {
 
     pub fn reset(&mut self) -> Vec<Word> {
         self.is_auto_switch_blocked = false;
-        if let Some(word) = self.words.last().filter(|word| word.trailing_spaces == 0) {
+        if let Some(word) = self.words.last().filter(|word| !word.is_closed()) {
             log::trace!("{word}");
         }
         log::trace!("");
@@ -136,14 +162,15 @@ impl History {
         let Some(word) = self.words.last_mut() else {
             return;
         };
+        let was_closed = word.is_closed();
         if word.trailing_spaces > 0 {
             word.trailing_spaces -= 1;
-            if word.trailing_spaces == 0 {
-                word.ambiguous_delta_score = None;
-            }
-            return;
+        } else {
+            word.pop_stroke();
         }
-        word.pop_stroke();
+        if was_closed && !word.is_closed() {
+            word.ambiguous_delta_score = None;
+        }
         if word.entries.is_empty() {
             self.words.pop();
             self.is_auto_switch_blocked = false;
@@ -176,6 +203,7 @@ mod tests {
             false,
             Some(Arc::new(Layout::new("us", "", "", ""))),
             &DictionaryAutoSwitch::default(),
+            &Punctuation::default(),
         );
     }
 
@@ -245,12 +273,14 @@ mod tests {
             true,
             Some(Arc::new(Layout::new("us", "", "", ""))),
             &DictionaryAutoSwitch::default(),
+            &Punctuation::default(),
         );
         history.process(
             KeyCode::KEY_B,
             false,
             Some(Arc::new(Layout::new("ru", "", "", ""))),
             &DictionaryAutoSwitch::default(),
+            &Punctuation::default(),
         );
         assert_eq!(history.latest_word().unwrap().text().as_deref(), Ok("Aи"));
         history.process(
@@ -258,6 +288,7 @@ mod tests {
             false,
             None,
             &DictionaryAutoSwitch::default(),
+            &Punctuation::default(),
         );
         assert!(matches!(
             history.latest_word().unwrap().text(),
@@ -267,5 +298,97 @@ mod tests {
         assert_eq!(history.latest_word().unwrap().text().as_deref(), Ok("Aи"));
         history.set_latest_layout(Some(Arc::new(Layout::new("us", "", "", ""))));
         assert_eq!(history.latest_word().unwrap().text().as_deref(), Ok("Ab"));
+    }
+
+    #[test]
+    fn splits_a_path_by_physical_punctuation_without_a_history_reset() {
+        use KeyCode as K;
+        let us = Arc::new(Layout::new("us", "", "pc105", ""));
+        let ru = Arc::new(Layout::new("ru", "", "pc105", ""));
+        let mut punctuation = Punctuation::new(r"[`~<>\p{P}]+").unwrap();
+        punctuation.update_layouts(vec![(*us).clone(), (*ru).clone()]);
+        let dictionaries = DictionaryAutoSwitch::default();
+        let mut history = History::default();
+        for (layout, keys) in [
+            (
+                &us,
+                &[
+                    K::KEY_GRAVE,
+                    K::KEY_SLASH,
+                    K::KEY_H,
+                    K::KEY_O,
+                    K::KEY_M,
+                    K::KEY_E,
+                    K::KEY_SLASH,
+                ][..],
+            ),
+            (
+                &ru,
+                &[K::KEY_A, K::KEY_F, K::KEY_Q, K::KEY_K, K::KEY_SLASH][..],
+            ),
+            (&us, &[K::KEY_M, K::KEY_P, K::KEY_3][..]),
+        ] {
+            for &key in keys {
+                history.process(
+                    key,
+                    key == K::KEY_GRAVE,
+                    Some(layout.clone()),
+                    &dictionaries,
+                    &punctuation,
+                );
+            }
+        }
+        let words = history.reset();
+        assert_eq!(
+            words
+                .iter()
+                .map(|word| word.text().unwrap())
+                .collect::<Vec<_>>(),
+            ["~/", "home/", "файл.", "mp3"]
+        );
+    }
+
+    #[test]
+    fn keeps_initial_and_trailing_series_and_reopens_on_the_last_backspace() {
+        use KeyCode as K;
+        let us = Arc::new(Layout::new("us", "", "", ""));
+        let mut punctuation = Punctuation::new("[/]+").unwrap();
+        punctuation.update_layouts(vec![(*us).clone()]);
+        let dictionaries = DictionaryAutoSwitch::default();
+        let mut history = History::default();
+        let press = |history: &mut History, key| {
+            history.process(key, false, Some(us.clone()), &dictionaries, &punctuation)
+        };
+        for key in [
+            K::KEY_SLASH,
+            K::KEY_SLASH,
+            K::KEY_N,
+            K::KEY_E,
+            K::KEY_W,
+            K::KEY_SLASH,
+            K::KEY_SLASH,
+        ] {
+            press(&mut history, key);
+        }
+        history.latest_word_mut().unwrap().ambiguous_delta_score = Some(1.0);
+        press(&mut history, K::KEY_B);
+        press(&mut history, K::KEY_BACKSPACE);
+        let word = history.latest_word().unwrap();
+        assert_eq!(word.text().as_deref(), Ok("//new//"));
+        assert_eq!(us.to_text(word.search_strokes()).as_deref(), Ok("new"));
+        press(&mut history, K::KEY_BACKSPACE);
+        assert!(history.latest_word().unwrap().is_closed());
+        assert_eq!(
+            history.latest_word().unwrap().ambiguous_delta_score,
+            Some(1.0)
+        );
+        press(&mut history, K::KEY_BACKSPACE);
+        assert!(!history.latest_word().unwrap().is_closed());
+        assert_eq!(history.latest_word().unwrap().ambiguous_delta_score, None);
+        press(&mut history, K::KEY_B);
+        assert_eq!(
+            history.latest_word().unwrap().text().as_deref(),
+            Ok("//newb")
+        );
     }
 }
