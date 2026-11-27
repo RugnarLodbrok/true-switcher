@@ -1,6 +1,8 @@
 use crate::dictionary::DictionaryAutoSwitch;
 use crate::layout::Layout;
 use crate::punctuation::Punctuation;
+#[cfg(test)]
+use crate::word::ChainMember;
 use crate::word::{Stroke, Word, WordStroke};
 use evdev::KeyCode;
 use std::sync::Arc;
@@ -71,7 +73,7 @@ impl History {
     ) {
         let start = self.words.len().saturating_sub(count);
         for word in &mut self.words[start..] {
-            word.ambiguous_delta_score = None;
+            word.chain_member = None;
             for entry in &mut word.entries {
                 entry.layout = layout.clone();
             }
@@ -169,7 +171,7 @@ impl History {
             word.pop_stroke();
         }
         if was_closed && !word.is_closed() {
-            word.ambiguous_delta_score = None;
+            word.chain_member = None;
         }
         if word.entries.is_empty() {
             self.words.pop();
@@ -370,7 +372,8 @@ mod tests {
         ] {
             press(&mut history, key);
         }
-        history.latest_word_mut().unwrap().ambiguous_delta_score = Some(1.0);
+        history.latest_word_mut().unwrap().chain_member =
+            Some(ChainMember::Ambiguous { delta_score: 1.0 });
         press(&mut history, K::KEY_B);
         press(&mut history, K::KEY_BACKSPACE);
         let word = history.latest_word().unwrap();
@@ -379,12 +382,12 @@ mod tests {
         press(&mut history, K::KEY_BACKSPACE);
         assert!(history.latest_word().unwrap().is_closed());
         assert_eq!(
-            history.latest_word().unwrap().ambiguous_delta_score,
-            Some(1.0)
+            history.latest_word().unwrap().chain_member,
+            Some(ChainMember::Ambiguous { delta_score: 1.0 })
         );
         press(&mut history, K::KEY_BACKSPACE);
         assert!(!history.latest_word().unwrap().is_closed());
-        assert_eq!(history.latest_word().unwrap().ambiguous_delta_score, None);
+        assert_eq!(history.latest_word().unwrap().chain_member, None);
         press(&mut history, K::KEY_B);
         assert_eq!(
             history.latest_word().unwrap().text().as_deref(),

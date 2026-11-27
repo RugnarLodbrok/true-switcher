@@ -5,6 +5,12 @@ use std::sync::Arc;
 
 pub(crate) const WORD_END: &str = " ";
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum ChainMember {
+    Ambiguous { delta_score: f64 },
+    DeferredByPunctuation,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Stroke {
     pub key: KeyCode,
@@ -19,7 +25,7 @@ pub struct Word {
     pub(crate) trailing_punctuation: usize,
     pub(crate) dictionary_prefixes: Vec<Vec<Prefix>>,
     pub(crate) has_dead_key: bool,
-    pub(crate) ambiguous_delta_score: Option<f64>,
+    pub(crate) chain_member: Option<ChainMember>,
     pub(crate) is_range_corrected: bool,
 }
 

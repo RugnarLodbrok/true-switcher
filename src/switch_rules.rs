@@ -7,7 +7,7 @@ use crate::{
     config::{Configuration, RuntimeSettings},
     dictionary::{DictionaryAutoSwitch, DictionaryDecision},
     layout::Layout,
-    word::Word,
+    word::{ChainMember, Word},
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -18,7 +18,7 @@ pub(crate) enum AutoSwitchKind {
 
 pub(crate) enum AutoSwitchDecision {
     Keep,
-    Ambiguous(f64),
+    MarkChainMember(ChainMember),
     Switch(Arc<Layout>, AutoSwitchKind),
 }
 
@@ -100,7 +100,10 @@ impl AutoSwitch {
                 AutoSwitchDecision::Switch(target, AutoSwitchKind::Dictionary)
             }
             DictionaryDecision::Ambiguous(delta_score) => {
-                AutoSwitchDecision::Ambiguous(delta_score)
+                AutoSwitchDecision::MarkChainMember(ChainMember::Ambiguous { delta_score })
+            }
+            DictionaryDecision::DeferredByPunctuation => {
+                AutoSwitchDecision::MarkChainMember(ChainMember::DeferredByPunctuation)
             }
         }
     }

@@ -208,6 +208,7 @@ struct DictionaryComparison<'a> {
 pub(crate) enum DictionaryDecision {
     Keep,
     Ambiguous(f64),
+    DeferredByPunctuation,
     Switch(Arc<Layout>),
 }
 
@@ -407,6 +408,13 @@ impl DictionaryAutoSwitch {
                 .to_text(word.strokes())
                 .is_ok_and(|text| pattern.is_match(&text))
         }) {
+            if is_word_end
+                && is_switch
+                && !word.has_dead_key_in(current)
+                && !word.has_dead_key_in(&alternative.target)
+            {
+                return DictionaryDecision::DeferredByPunctuation;
+            }
             return DictionaryDecision::Keep;
         }
         if is_switch {

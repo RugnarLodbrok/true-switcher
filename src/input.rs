@@ -31,6 +31,7 @@ use crate::input_events::{InputEventMessage, InputEventSender, InputEvents};
 use crate::layout::Layout;
 use crate::lifecycle::{Lifecycle, ProcessingError, ProcessingResult, ShutdownReason};
 use crate::switch_rules::{AutoSwitch, AutoSwitchDecision, AutoSwitchKind};
+use crate::word::ChainMember;
 
 const MODIFIERS: [KeyCode; 8] = [
     KeyCode::KEY_LEFTSHIFT,
@@ -257,16 +258,16 @@ impl Input {
         let Some(source) = self.layout.as_deref() else {
             return 1;
         };
-        1 + self.preceding_ambiguous_scores(source, target).count()
+        1 + self.preceding_chain_members(source, target).count()
     }
 
-    fn preceding_ambiguous_scores<'a>(
+    fn preceding_chain_members<'a>(
         &'a self,
         source: &'a Layout,
         target: &'a Layout,
-    ) -> impl Iterator<Item = f64> + 'a {
+    ) -> impl Iterator<Item = ChainMember> + 'a {
         self.history.preceding_words().map_while(move |word| {
-            let delta_score = word.ambiguous_delta_score?;
+            let member = word.chain_member?;
             let has_chain_boundary = word.trailing_spaces > 0
                 || (CHAIN_ACROSS_STRONG_PUNCTUATION && word.trailing_punctuation > 0);
             let is_eligible = has_chain_boundary
@@ -277,7 +278,7 @@ impl Input {
                 && !word.has_dead_key
                 && !word.has_dead_key_in(source)
                 && !word.has_dead_key_in(target);
-            is_eligible.then_some(delta_score)
+            is_eligible.then_some(member)
         })
     }
 
@@ -717,8 +718,11 @@ impl Input {
                 .update_auto(index, Some((target, AutoSwitchKind::Regex)), now);
         } else if matches!(event, HistoryEvent::AdditionalSeparator) {
             self.pending.cancel_auto_kind(AutoSwitchKind::Regex);
-            if self.pending.is_auto() && self.auto_switch.matches_current(word, layout) {
+            if (self.pending.is_auto() || word.chain_member.is_some())
+                && self.auto_switch.matches_current(word, layout)
+            {
                 self.pending.cancel_auto_kind(AutoSwitchKind::Dictionary);
+                self.history.latest_word_mut().unwrap().chain_member = None;
             }
         } else {
             self.pending.cancel_auto();
@@ -748,14 +752,20 @@ impl Input {
                     if is_paused {
                         return 0.0;
                     }
-                    self.preceding_ambiguous_scores(layout, target).sum()
+                    self.preceding_chain_members(layout, target)
+                        .filter_map(|member| match member {
+                            ChainMember::Ambiguous { delta_score } => Some(delta_score),
+                            ChainMember::DeferredByPunctuation => None,
+                        })
+                        .sum()
                 });
         let target = match decision {
             AutoSwitchDecision::Keep => None,
             AutoSwitchDecision::Switch(target, kind) => Some((target, kind)),
-            AutoSwitchDecision::Ambiguous(delta_score) => {
-                let word = self.history.latest_word_mut().unwrap();
-                word.ambiguous_delta_score = Some(delta_score);
+            AutoSwitchDecision::MarkChainMember(member) => {
+                if !is_paused || matches!(member, ChainMember::Ambiguous { .. }) {
+                    self.history.latest_word_mut().unwrap().chain_member = Some(member);
+                }
                 None
             }
         };
@@ -1592,7 +1602,7 @@ patterns = ['^\.тф']
             event_at(&mut input, 0, key, 0, paused_at);
         }
         assert!(input.switch_request().is_none());
-        assert!(input.latest_word().unwrap().ambiguous_delta_score.is_some());
+        assert!(input.latest_word().unwrap().chain_member.is_some());
 
         let resumed_at = motion_at + input.mouse_motion_pause;
         event_at(&mut input, 0, KeyCode::KEY_R, 1, resumed_at);
@@ -2605,16 +2615,28 @@ patterns = ['^\.тф']
         ]);
         for (key, expected) in [
             (KeyCode::KEY_A, None),
-            (KeyCode::KEY_SPACE, Some(1.0)),
-            (KeyCode::KEY_SPACE, Some(1.0)),
-            (KeyCode::KEY_BACKSPACE, Some(1.0)),
+            (
+                KeyCode::KEY_SPACE,
+                Some(ChainMember::Ambiguous { delta_score: 1.0 }),
+            ),
+            (
+                KeyCode::KEY_SPACE,
+                Some(ChainMember::Ambiguous { delta_score: 1.0 }),
+            ),
+            (
+                KeyCode::KEY_BACKSPACE,
+                Some(ChainMember::Ambiguous { delta_score: 1.0 }),
+            ),
             (KeyCode::KEY_BACKSPACE, None),
-            (KeyCode::KEY_SPACE, Some(1.0)),
+            (
+                KeyCode::KEY_SPACE,
+                Some(ChainMember::Ambiguous { delta_score: 1.0 }),
+            ),
         ] {
             press(&mut input, key);
             statistics_event(&mut input, key, 0);
             assert_eq!(
-                input.latest_word().unwrap().ambiguous_delta_score,
+                input.latest_word().unwrap().chain_member,
                 expected,
                 "{key:?}"
             );
@@ -2654,7 +2676,7 @@ patterns = ['^\.тф']
                 input.switch_request().map(|request| request.mode),
                 expected_mode
             );
-            assert!(input.latest_word().unwrap().ambiguous_delta_score.is_none());
+            assert!(input.latest_word().unwrap().chain_member.is_none());
         }
 
         let mut input = auto_input_with_patterns("");
@@ -2663,7 +2685,7 @@ patterns = ['^\.тф']
         press(&mut input, KeyCode::KEY_A);
         complete_manual_correction(&mut input, "us");
         press(&mut input, KeyCode::KEY_SPACE);
-        assert!(input.latest_word().unwrap().ambiguous_delta_score.is_none());
+        assert!(input.latest_word().unwrap().chain_member.is_none());
     }
 
     const BOX_KEYS: [KeyCode; 7] = [
@@ -2708,6 +2730,138 @@ patterns = ['^\.тф']
     }
 
     #[test]
+    fn punctuation_defers_a_dictionary_switch_on_the_first_space() {
+        use KeyCode as K;
+        let mut input = auto_input_with_patterns("");
+        input.accept_layout(Some(layout("us")), false);
+        enable_punctuation_boundaries(&mut input);
+        input.auto_switch.dictionaries =
+            crate::dictionary::test_dictionaries([("us", "", "z 1", 5.0), ("ru", "", "ж 1", 5.0)]);
+
+        for (key, expected) in [
+            (K::KEY_SEMICOLON, None),
+            (K::KEY_SPACE, Some(ChainMember::DeferredByPunctuation)),
+            (K::KEY_SPACE, Some(ChainMember::DeferredByPunctuation)),
+            (K::KEY_BACKSPACE, Some(ChainMember::DeferredByPunctuation)),
+            (K::KEY_BACKSPACE, None),
+            (K::KEY_SPACE, Some(ChainMember::DeferredByPunctuation)),
+        ] {
+            tap_keys(&mut input, [key]);
+            let word = input.latest_word().unwrap();
+            assert_eq!(word.chain_member, expected, "{key:?}");
+            assert_eq!(word.text().as_deref(), Ok(";"));
+            assert!(input.switch_request().is_none());
+        }
+    }
+
+    #[test]
+    fn dictionary_correction_includes_a_deferred_token_with_multiple_signs() {
+        use KeyCode as K;
+        let mut input = auto_input_with_patterns("");
+        input.accept_layout(Some(layout("us")), false);
+        enable_punctuation_boundaries(&mut input);
+        input.auto_switch.dictionaries = crate::dictionary::test_dictionaries([
+            ("us", "", "c 16\ncg 8\ncgb 4\nz 36", 5.0),
+            ("ru", "", "ёж 1\nспит 16\nя 47", 5.0),
+        ]);
+
+        tap_keys(&mut input, [K::KEY_GRAVE, K::KEY_SEMICOLON, K::KEY_SPACE]);
+        let word = input.latest_word().unwrap();
+        assert_eq!(word.text().as_deref(), Ok("`;"));
+        assert_eq!(word.chain_member, Some(ChainMember::DeferredByPunctuation));
+        assert!(input.switch_request().is_none());
+
+        tap_keys(&mut input, [K::KEY_C, K::KEY_G, K::KEY_B, K::KEY_N]);
+        let request = input.switch_request().unwrap();
+        input.begin_correction(request.words.len(), request.target);
+        assert_eq!(
+            input
+                .history
+                .latest_words(2)
+                .iter()
+                .map(|word| (word.text().unwrap(), word.trailing_spaces))
+                .collect::<Vec<_>>(),
+            [("ёж".into(), 1), ("спит".into(), 0)]
+        );
+    }
+
+    #[test]
+    fn current_layout_regex_and_mouse_pause_prevent_deferring_punctuation() {
+        use KeyCode as K;
+        for (patterns, is_paused) in [("'^; $'", false), ("", true)] {
+            let mut input = auto_input_with_patterns(patterns);
+            input.accept_layout(Some(layout("us")), false);
+            enable_punctuation_boundaries(&mut input);
+            input.auto_switch.dictionaries = crate::dictionary::test_dictionaries([
+                ("us", "", "z 1", 5.0),
+                ("ru", "", "ж 1", 5.0),
+            ]);
+            let now = Instant::now();
+            if is_paused {
+                input
+                    .process_message(InputEventMessage::MouseMoved(now), None)
+                    .unwrap();
+            }
+            for key in [K::KEY_SEMICOLON, K::KEY_SPACE] {
+                event_at(&mut input, 0, key, 1, now + TEST_STEP);
+                event_at(&mut input, 0, key, 0, now + TEST_STEP);
+            }
+            assert!(input.switch_request().is_none());
+            assert_eq!(input.latest_word().unwrap().chain_member, None);
+        }
+    }
+
+    #[test]
+    fn current_layout_regex_on_the_second_space_breaks_the_chain() {
+        use KeyCode as K;
+        for (key, expected_member, expected_text) in [
+            (K::KEY_SEMICOLON, ChainMember::DeferredByPunctuation, ";"),
+            (K::KEY_F, ChainMember::Ambiguous { delta_score: 0.0 }, "f"),
+        ] {
+            let mut input = auto_input_with_patterns("'^; {2}$', '^f {2}$'");
+            input.accept_layout(Some(layout("us")), false);
+            enable_punctuation_boundaries(&mut input);
+            input.auto_switch.dictionaries = crate::dictionary::test_dictionaries([
+                ("us", "", "z 1\nf 1\ng 32\ngh 16\nx 14", 5.0),
+                ("ru", "", "я 4\nа 1\nж 1\nпра 32\nч 26", 5.0),
+            ]);
+
+            tap_keys(&mut input, [K::KEY_Z, K::KEY_SPACE]);
+            assert_eq!(
+                input.latest_word().unwrap().chain_member,
+                Some(ChainMember::Ambiguous { delta_score: 2.0 })
+            );
+            tap_keys(&mut input, [key, K::KEY_SPACE]);
+            assert_eq!(
+                input.latest_word().unwrap().chain_member,
+                Some(expected_member)
+            );
+            assert!(input.switch_request().is_none());
+
+            tap_keys(&mut input, [K::KEY_SPACE]);
+            assert_eq!(input.latest_word().unwrap().chain_member, None);
+            tap_keys(&mut input, [K::KEY_G, K::KEY_H, K::KEY_F]);
+
+            let request = input.switch_request().unwrap();
+            assert_eq!(request.words.len(), 1);
+            input.begin_correction(request.words.len(), request.target);
+            assert_eq!(
+                input
+                    .history
+                    .latest_words(3)
+                    .iter()
+                    .map(|word| (word.text().unwrap(), word.trailing_spaces))
+                    .collect::<Vec<_>>(),
+                [
+                    ("z".into(), 1),
+                    (expected_text.into(), 2),
+                    ("пра".into(), 0)
+                ]
+            );
+        }
+    }
+
+    #[test]
     fn dictionary_chain_crosses_strong_punctuation_until_manual_correction() {
         use KeyCode as K;
         for is_manually_corrected in [false, true] {
@@ -2722,13 +2876,13 @@ patterns = ['^\.тф']
                 [K::KEY_H, K::KEY_O, K::KEY_M, K::KEY_E, K::KEY_SLASH],
             );
             assert_eq!(
-                input.latest_word().unwrap().ambiguous_delta_score,
-                Some(2.0)
+                input.latest_word().unwrap().chain_member,
+                Some(ChainMember::Ambiguous { delta_score: 2.0 })
             );
             assert!(input.switch_request().is_none());
             if is_manually_corrected {
                 complete_manual_correction(&mut input, "ru");
-                assert!(input.latest_word().unwrap().ambiguous_delta_score.is_none());
+                assert!(input.latest_word().unwrap().chain_member.is_none());
             }
             tap_keys(
                 &mut input,
@@ -2769,8 +2923,8 @@ patterns = ['^\.тф']
             for (key, delta_score) in [(KeyCode::KEY_A, 2.0), (KeyCode::KEY_B, 1.0)] {
                 tap_keys(&mut input, [key, KeyCode::KEY_SPACE]);
                 assert_eq!(
-                    input.latest_word().unwrap().ambiguous_delta_score,
-                    Some(delta_score)
+                    input.latest_word().unwrap().chain_member,
+                    Some(ChainMember::Ambiguous { delta_score })
                 );
                 assert!(input.switch_request().is_none());
             }
@@ -2778,12 +2932,12 @@ patterns = ['^\.тф']
             if is_interrupted {
                 tap_keys(&mut input, [KeyCode::KEY_Q, KeyCode::KEY_SPACE]);
                 assert!(input.switch_request().is_none());
-                assert_eq!(input.latest_word().unwrap().ambiguous_delta_score, None);
+                assert_eq!(input.latest_word().unwrap().chain_member, None);
                 tap_keys(&mut input, [KeyCode::KEY_C, KeyCode::KEY_SPACE]);
                 assert!(input.switch_request().is_none());
                 assert_eq!(
-                    input.latest_word().unwrap().ambiguous_delta_score,
-                    Some(3.0)
+                    input.latest_word().unwrap().chain_member,
+                    Some(ChainMember::Ambiguous { delta_score: 3.0 })
                 );
             } else {
                 tap_keys(&mut input, [KeyCode::KEY_C]);
@@ -2794,6 +2948,47 @@ patterns = ['^\.тф']
                 assert!(request.previous.is_none());
             }
         }
+    }
+
+    #[test]
+    fn deferred_punctuation_keeps_earlier_scores_without_contributing_its_own() {
+        use KeyCode as K;
+        let mut input = auto_input_with_patterns("");
+        input.accept_layout(Some(layout("us")), false);
+        enable_punctuation_boundaries(&mut input);
+        input.auto_switch.dictionaries = crate::dictionary::test_dictionaries([
+            ("us", "", "z 1\nghf 1\ngh 24\ng 48\nq 1\nx 53", 5.0),
+            ("ru", "", "я 4\nж 1\nпра 16\nй 8\nч 99", 5.0),
+        ]);
+
+        tap_keys(&mut input, [K::KEY_Z, K::KEY_SPACE]);
+        assert_eq!(
+            input.latest_word().unwrap().chain_member,
+            Some(ChainMember::Ambiguous { delta_score: 2.0 })
+        );
+        tap_keys(&mut input, [K::KEY_SEMICOLON, K::KEY_SPACE]);
+        assert_eq!(
+            input.latest_word().unwrap().chain_member,
+            Some(ChainMember::DeferredByPunctuation)
+        );
+        assert!(input.switch_request().is_none());
+
+        tap_keys(&mut input, [K::KEY_Q]);
+        assert!(input.switch_request().is_none()); // +2 + 3 equals the threshold.
+        tap_keys(&mut input, [K::KEY_BACKSPACE, K::KEY_G, K::KEY_H, K::KEY_F]);
+
+        let request = input.switch_request().unwrap(); // +2 + 4 exceeds the threshold.
+        assert!(request.previous.is_none());
+        input.begin_correction(request.words.len(), request.target);
+        assert_eq!(
+            input
+                .history
+                .latest_words(3)
+                .iter()
+                .map(|word| (word.text().unwrap(), word.trailing_spaces))
+                .collect::<Vec<_>>(),
+            [("я".into(), 1), ("ж".into(), 1), ("пра".into(), 0)]
+        );
     }
 
     #[test]
@@ -2808,8 +3003,8 @@ patterns = ['^\.тф']
             if has_ambiguous_word {
                 tap_keys(&mut input, [KeyCode::KEY_A, KeyCode::KEY_SPACE]);
                 assert_eq!(
-                    input.latest_word().unwrap().ambiguous_delta_score,
-                    Some(-1.0)
+                    input.latest_word().unwrap().chain_member,
+                    Some(ChainMember::Ambiguous { delta_score: -1.0 })
                 );
             }
 
@@ -2817,7 +3012,7 @@ patterns = ['^\.тф']
             assert!(input.switch_request().is_none());
             tap_keys(&mut input, [KeyCode::KEY_SPACE]);
             assert_eq!(input.switch_request().is_some(), !has_ambiguous_word);
-            assert_eq!(input.latest_word().unwrap().ambiguous_delta_score, None);
+            assert_eq!(input.latest_word().unwrap().chain_member, None);
         }
     }
 
@@ -2915,7 +3110,7 @@ patterns = ['^\.тф']
             let word = input.latest_word().unwrap();
             assert_eq!(word.text().unwrap(), expected);
             assert_eq!(word.trailing_spaces, spaces);
-            assert!(word.ambiguous_delta_score.is_none());
+            assert!(word.chain_member.is_none());
             let length = word.entries.len();
             tap_keys(
                 &mut input,
@@ -2943,7 +3138,7 @@ patterns = ['^\.тф']
         ] {
             let mut input = ambiguity_input(patterns, "f 1\nbp 1");
             tap_keys(&mut input, [KeyCode::KEY_F, KeyCode::KEY_SPACE]);
-            assert!(input.latest_word().unwrap().ambiguous_delta_score.is_some());
+            assert!(input.latest_word().unwrap().chain_member.is_some());
             if mode == SwitchMode::Manual {
                 tap_keys(&mut input, [KeyCode::KEY_Q]);
             }
@@ -2959,9 +3154,9 @@ patterns = ['^\.тф']
     fn word_missing_in_both_layouts_breaks_the_ambiguous_chain() {
         let mut input = ambiguity_input("", "f 1\nbp 1");
         tap_keys(&mut input, [KeyCode::KEY_F, KeyCode::KEY_SPACE]);
-        assert!(input.latest_word().unwrap().ambiguous_delta_score.is_some());
+        assert!(input.latest_word().unwrap().chain_member.is_some());
         tap_keys(&mut input, [KeyCode::KEY_Q, KeyCode::KEY_SPACE]);
-        assert!(input.latest_word().unwrap().ambiguous_delta_score.is_none());
+        assert!(input.latest_word().unwrap().chain_member.is_none());
         tap_keys(
             &mut input,
             [
@@ -2990,24 +3185,15 @@ patterns = ['^\.тф']
             let target = Arc::new(crate::layout::Layout::new("us", target_variant, "", ""));
             input.accept_layout(Some(source), false);
             tap_keys(&mut input, [KeyCode::KEY_F, KeyCode::KEY_SPACE]);
-            input
-                .history
-                .latest_word_mut()
-                .unwrap()
-                .ambiguous_delta_score = Some(0.0);
+            input.history.latest_word_mut().unwrap().chain_member =
+                Some(ChainMember::Ambiguous { delta_score: 0.0 });
             tap_keys(&mut input, [KeyCode::KEY_APOSTROPHE, KeyCode::KEY_SPACE]);
             // Check that range selection revalidates a previously marked word.
-            input
-                .history
-                .latest_word_mut()
-                .unwrap()
-                .ambiguous_delta_score = Some(0.0);
+            input.history.latest_word_mut().unwrap().chain_member =
+                Some(ChainMember::Ambiguous { delta_score: 0.0 });
             tap_keys(&mut input, [KeyCode::KEY_B, KeyCode::KEY_SPACE]);
-            input
-                .history
-                .latest_word_mut()
-                .unwrap()
-                .ambiguous_delta_score = Some(0.0);
+            input.history.latest_word_mut().unwrap().chain_member =
+                Some(ChainMember::Ambiguous { delta_score: 0.0 });
             tap_keys(&mut input, [KeyCode::KEY_R]);
             input.pending.update_auto(
                 0,
