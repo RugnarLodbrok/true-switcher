@@ -3,10 +3,9 @@ use std::{
     io,
 };
 
-use evdev::KeyCode;
 use regex::Regex;
 
-use crate::{history::is_text_key, layout::Layout, word::Stroke};
+use crate::{key_codes::text_keys, layout::Layout, word::Stroke};
 
 #[derive(Default)]
 pub(crate) struct Punctuation {
@@ -84,15 +83,13 @@ fn single_character(text: &str) -> Option<char> {
 }
 
 fn text_strokes() -> impl Iterator<Item = Stroke> {
-    (KeyCode::KEY_1.0..=KeyCode::KEY_102ND.0)
-        .map(KeyCode::new)
-        .filter(|&key| is_text_key(key))
-        .flat_map(|key| [false, true].map(move |shift| Stroke { key, shift }))
+    text_keys().flat_map(|key| [false, true].map(move |shift| Stroke { key, shift }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use evdev::KeyCode;
 
     #[test]
     fn uses_the_physical_key_and_shift_across_all_active_layouts() {
@@ -108,6 +105,10 @@ mod tests {
         ]);
         assert!(punctuation.is_strong(&slash));
         for shift in [false, true] {
+            assert!(punctuation.is_strong(&Stroke {
+                key: KeyCode::KEY_KPSLASH,
+                shift
+            }));
             assert!(punctuation.is_strong(&Stroke {
                 key: KeyCode::KEY_MINUS,
                 shift

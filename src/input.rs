@@ -28,6 +28,7 @@ use keyboard::Source;
 use crate::config::{Configuration, RuntimeSetting, RuntimeSettings};
 use crate::history::{History, HistoryEvent};
 use crate::input_events::{InputEventMessage, InputEventSender, InputEvents};
+use crate::key_codes::is_text_key;
 use crate::layout::Layout;
 use crate::lifecycle::{Lifecycle, ProcessingError, ProcessingResult, ShutdownReason};
 use crate::switch_rules::{AutoSwitch, AutoSwitchDecision, AutoSwitchKind};
@@ -995,11 +996,10 @@ fn start_reader(
 
 fn is_repair_key(key: KeyCode) -> bool {
     ((KeyCode::KEY_ESC.0..=KeyCode::KEY_KPDOT.0).contains(&key.0) && !LOCK_KEYS.contains(&key))
+        || is_text_key(key)
         || MODIFIERS.contains(&key)
         || [
-            KeyCode::KEY_102ND,
             KeyCode::KEY_KPENTER,
-            KeyCode::KEY_KPSLASH,
             KeyCode::KEY_HOME,
             KeyCode::KEY_UP,
             KeyCode::KEY_PAGEUP,
@@ -2730,6 +2730,58 @@ patterns = ['^\.тф']
     }
 
     #[test]
+    fn keypad_navigation_keys_stay_out_of_history_across_num_lock_toggle() {
+        use KeyCode as K;
+        let mut input = auto_input_with_patterns("");
+        let keypad_keys = [
+            K::KEY_KP0,
+            K::KEY_KP1,
+            K::KEY_KP2,
+            K::KEY_KP3,
+            K::KEY_KP4,
+            K::KEY_KP5,
+            K::KEY_KP6,
+            K::KEY_KP7,
+            K::KEY_KP8,
+            K::KEY_KP9,
+            K::KEY_KPDOT,
+        ];
+
+        tap_keys(&mut input, [K::KEY_F]);
+        tap_keys(&mut input, keypad_keys);
+        assert_eq!(input.latest_word().unwrap().text().as_deref(), Ok("а"));
+
+        tap_keys(&mut input, [K::KEY_NUMLOCK]);
+        tap_keys(&mut input, keypad_keys);
+        assert_eq!(input.latest_word().unwrap().text().as_deref(), Ok("а"));
+    }
+
+    #[test]
+    fn dictionary_switch_includes_keypad_plus_in_the_word() {
+        use KeyCode as K;
+        let mut input = auto_input_with_patterns("");
+        enable_punctuation_boundaries(&mut input);
+        input.auto_switch.dictionaries = crate::dictionary::test_dictionaries([
+            ("us", "", "us+ru 32", 5.0),
+            ("ru", "", "гы+кг 1\nгы+кы 64", 5.0),
+        ]);
+
+        tap_keys(&mut input, [K::KEY_U, K::KEY_S, K::KEY_KPPLUS, K::KEY_R]);
+        assert!(input.switch_request().is_none());
+
+        tap_keys(&mut input, [K::KEY_U]);
+        let request = input.switch_request().unwrap();
+        assert_eq!(request.mode, crate::switcher::SwitchMode::Auto);
+        let [word] = request.words.as_slice() else {
+            panic!("expected one word");
+        };
+        assert_eq!(word.text().as_deref(), Ok("гы+кг"));
+        let target = request.target.unwrap();
+        assert_eq!(target.name(), "us");
+        assert_eq!(target.to_text(word.strokes()).as_deref(), Ok("us+ru"));
+    }
+
+    #[test]
     fn punctuation_defers_a_dictionary_switch_on_the_first_space() {
         use KeyCode as K;
         let mut input = auto_input_with_patterns("");
@@ -4274,6 +4326,10 @@ threshold = 7.0
     fn failed_partial_grab_repairs_and_releases_acquired_device() {
         let first = Rc::new(RefCell::new(SimulatedKeyboard {
             is_entry_interrupted: true,
+            on_grab: Some(InputEventMessage::Keyboard(
+                0,
+                InputEvent::new(EventType::KEY.0, KeyCode::KEY_KPEQUAL.0, 1),
+            )),
             ..Default::default()
         }));
         let second = Rc::new(RefCell::new(SimulatedKeyboard {
@@ -4287,15 +4343,27 @@ threshold = 7.0
         let repairs: Vec<_> = first
             .writes
             .iter()
-            .filter(|(key, _, _)| *key == KeyCode::KEY_A)
+            .filter(|(key, _, _)| matches!(*key, KeyCode::KEY_A | KeyCode::KEY_KPEQUAL))
             .copied()
             .collect();
         assert_eq!(
             repairs,
-            [(KeyCode::KEY_A, 1, true), (KeyCode::KEY_A, 0, false)]
+            [
+                (KeyCode::KEY_A, 1, true),
+                (KeyCode::KEY_KPEQUAL, 1, true),
+                (KeyCode::KEY_A, 0, false),
+                (KeyCode::KEY_KPEQUAL, 0, false),
+            ]
         );
         assert!(!first.is_grabbed);
-        assert!(!second.borrow().is_grabbed);
+        let second = second.borrow();
+        assert!(!second.is_grabbed);
+        assert!(
+            second
+                .writes
+                .iter()
+                .all(|(key, _, _)| *key != KeyCode::KEY_KPEQUAL)
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@ use evdev::{
     uinput::{VirtualDevice, VirtualDeviceBuilder},
 };
 
-use crate::history::is_text_key;
+use crate::key_codes::{is_text_key, text_keys};
 use crate::word::{Stroke, Word};
 
 const DEVICE_PHYS: &std::ffi::CStr = c"true-switcher/keyboard";
@@ -46,21 +46,7 @@ pub struct KeyboardOutput {
 
 impl KeyboardOutput {
     pub fn new() -> io::Result<Self> {
-        let mut keys = AttributeSet::<KeyCode>::new();
-        for code in KeyCode::KEY_1.0..=KeyCode::KEY_102ND.0 {
-            let key = KeyCode::new(code);
-            if is_text_key(key) {
-                keys.insert(key);
-            }
-        }
-        for key in [
-            KeyCode::KEY_BACKSPACE,
-            KeyCode::KEY_SPACE,
-            KeyCode::KEY_LEFTSHIFT,
-        ] {
-            keys.insert(key);
-        }
-
+        let keys = keyboard_keys();
         let device =
             (|| keyboard_builder()?.with_keys(&keys)?.build())().map_err(|error: io::Error| {
                 io::Error::new(
@@ -97,6 +83,18 @@ impl KeyboardOutput {
             })
         })
     }
+}
+
+fn keyboard_keys() -> AttributeSet<KeyCode> {
+    let mut keys = AttributeSet::new();
+    for key in text_keys().chain([
+        KeyCode::KEY_BACKSPACE,
+        KeyCode::KEY_SPACE,
+        KeyCode::KEY_LEFTSHIFT,
+    ]) {
+        keys.insert(key);
+    }
+    keys
 }
 
 fn emit_cancellable_strokes(
@@ -222,6 +220,54 @@ fn emit_stroke(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn virtual_keyboard_registers_all_keypad_text_keys() {
+        let keys = keyboard_keys();
+        for key in [
+            KeyCode::KEY_KPSLASH,
+            KeyCode::KEY_KPASTERISK,
+            KeyCode::KEY_KPMINUS,
+            KeyCode::KEY_KPPLUS,
+            KeyCode::KEY_KPEQUAL,
+            KeyCode::KEY_KPPLUSMINUS,
+            KeyCode::KEY_KPCOMMA,
+            KeyCode::KEY_KPJPCOMMA,
+            KeyCode::KEY_KPLEFTPAREN,
+            KeyCode::KEY_KPRIGHTPAREN,
+        ] {
+            assert!(keys.contains(key), "{key:?}");
+        }
+    }
+
+    #[test]
+    fn keypad_plus_is_erased_and_replayed_with_the_word() {
+        use KeyCode as K;
+        let keys = [K::KEY_U, K::KEY_S, K::KEY_KPPLUS, K::KEY_R, K::KEY_U];
+        let words = [Word {
+            entries: keys
+                .into_iter()
+                .map(|key| crate::word::WordStroke {
+                    stroke: Stroke { key, shift: false },
+                    layout: None,
+                })
+                .collect(),
+            ..Default::default()
+        }];
+        assert_eq!(
+            erase_strokes(&words)
+                .map(|stroke| stroke.key)
+                .collect::<Vec<_>>(),
+            [K::KEY_BACKSPACE; 5],
+        );
+        assert_eq!(
+            replay_strokes(&words)
+                .unwrap()
+                .map(|stroke| stroke.key)
+                .collect::<Vec<_>>(),
+            keys,
+        );
+    }
 
     #[test]
     fn cancellation_stops_before_next_synthetic_stroke() {

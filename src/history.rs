@@ -1,4 +1,5 @@
 use crate::dictionary::DictionaryAutoSwitch;
+use crate::key_codes::is_text_key;
 use crate::layout::Layout;
 use crate::punctuation::Punctuation;
 #[cfg(test)]
@@ -183,16 +184,6 @@ impl History {
             }
         }
     }
-}
-
-pub(crate) fn is_text_key(key: KeyCode) -> bool {
-    // Linux input keycode ranges for the alphanumeric rows, including
-    // punctuation. No layout-to-character mapping is involved.
-    (KeyCode::KEY_1.0..=KeyCode::KEY_EQUAL.0).contains(&key.0)
-        || (KeyCode::KEY_Q.0..=KeyCode::KEY_RIGHTBRACE.0).contains(&key.0)
-        || (KeyCode::KEY_A.0..=KeyCode::KEY_GRAVE.0).contains(&key.0)
-        || (KeyCode::KEY_BACKSLASH.0..=KeyCode::KEY_SLASH.0).contains(&key.0)
-        || matches!(key, KeyCode::KEY_102ND)
 }
 
 #[cfg(test)]

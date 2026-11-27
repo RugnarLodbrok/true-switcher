@@ -6,6 +6,7 @@ mod hold;
 mod input;
 mod input_events;
 mod kde;
+mod key_codes;
 mod layout;
 mod learned_rules;
 mod lifecycle;
