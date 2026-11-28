@@ -5,7 +5,7 @@ use std::{
     process::ExitCode,
 };
 
-use clap::{Arg, ArgAction, Command, value_parser};
+use clap::{Arg, ArgAction, Command};
 use rustline::{Config, Rustline, RustlineError};
 
 use crate::{config, kde};
@@ -54,7 +54,7 @@ impl Options {
         let matches =
             command().try_get_matches_from(std::iter::once(COMMAND.into()).chain(args))?;
         Ok(Self {
-            is_learned_enabled: *matches.get_one(LEARNED_RULES).expect("boolean default"),
+            is_learned_enabled: matches.get_flag(LEARNED_RULES),
             threshold: matches.get_one(THRESHOLD).copied(),
         })
     }
@@ -68,10 +68,7 @@ fn command() -> Command {
             Arg::new(LEARNED_RULES)
                 .short('l')
                 .long(LEARNED_RULES)
-                .action(ArgAction::Set)
-                .value_name("true|false")
-                .value_parser(value_parser!(bool))
-                .default_value("true")
+                .action(ArgAction::SetTrue)
                 .help("Use learned rules and show the Learned column"),
         )
         .arg(
@@ -238,18 +235,15 @@ mod tests {
         assert_eq!(
             parse(&[]),
             Options {
-                is_learned_enabled: true,
+                is_learned_enabled: false,
                 threshold: None
             }
         );
         let expected = Options {
-            is_learned_enabled: false,
+            is_learned_enabled: true,
             threshold: Some(2.5),
         };
-        assert_eq!(parse(&["-l", "false", "-t", "2.5"]), expected);
-        assert_eq!(
-            parse(&["--learned-rules", "false", "--threshold", "2.5"]),
-            expected
-        );
+        assert_eq!(parse(&["-l", "-t", "2.5"]), expected);
+        assert_eq!(parse(&["--learned-rules", "--threshold", "2.5"]), expected);
     }
 }
