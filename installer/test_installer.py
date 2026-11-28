@@ -74,11 +74,13 @@ class UserConfigTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.path = Path(directory.name) / 'config' / 'config.toml'
         self.missing_template = Path(directory.name) / 'missing.toml'
+        self.sources = self.path.with_name(installer.DICT_SOURCES_NAME)
 
     def test_copies_the_template_verbatim(self) -> None:
         with patch.object(installer, 'USER_CONFIG', self.path), patch('builtins.print'):
             installer._ensure_user_config()
         self.assertEqual(self.path.read_bytes(), installer.CONFIG_TEMPLATE.read_bytes())
+        self.assertEqual(self.sources.read_bytes(), installer.DICT_SOURCES_TEMPLATE.read_bytes())
 
     def test_keeps_existing_config_without_reading_the_template(self) -> None:
         original = b'switch_key = "KEY_F12"\n'
@@ -88,6 +90,18 @@ class UserConfigTests(unittest.TestCase):
                 patch.object(installer, 'CONFIG_TEMPLATE', self.missing_template):
             installer._ensure_user_config()
         self.assertEqual(self.path.read_bytes(), original)
+        self.assertEqual(self.sources.read_bytes(), installer.DICT_SOURCES_TEMPLATE.read_bytes())
+
+    def test_keeps_existing_dictionary_sources(self) -> None:
+        original = b'# Custom dictionary sources\n'
+        self.path.parent.mkdir()
+        self.sources.write_bytes(original)
+        with patch.object(installer, 'USER_CONFIG', self.path), \
+                patch.object(installer, 'DICT_SOURCES_TEMPLATE', self.missing_template), \
+                patch('builtins.print'):
+            installer._ensure_user_config()
+        self.assertEqual(self.sources.read_bytes(), original)
+
 
     def test_missing_template_aborts_install_before_creating_config(self) -> None:
         with patch.object(installer, 'USER_CONFIG', self.path), \

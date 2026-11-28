@@ -37,13 +37,22 @@ pub struct AutoSwitch {
 impl AutoSwitch {
     pub fn new(
         settings: &Configuration,
+        directory: &std::path::Path,
         learned: crate::learned_rules::LearnedRules,
     ) -> io::Result<Self> {
         let mut rules = Self::compile(settings, crate::kde::target_layout)?;
-        rules.dictionaries = DictionaryAutoSwitch::load(
+        let names = if settings.dict.is_empty() {
+            Vec::new()
+        } else {
+            crate::kde::layout_names()?
+        };
+        let names = names.iter().map(String::as_str).collect::<Vec<_>>();
+        rules.dictionaries = DictionaryAutoSwitch::load_with_progress(
             settings,
+            directory,
+            &names,
             crate::kde::target_layout,
-            crate::kde::layout_count,
+            None,
         )?;
         rules.dictionaries.learned = learned;
         Ok(rules)

@@ -35,7 +35,7 @@ const KEYBOARD_DISCOVERY_DELAY: Duration = Duration::from_millis(500);
 fn run() -> io::Result<ShutdownReason> {
     let (sender, events) = input_events::InputEvents::new();
     lifecycle::start_signals(sender.clone())?;
-    let (config, config_file, auto_switch) = match prepare_configuration() {
+    let (mut config, config_file, auto_switch) = match prepare_configuration() {
         Ok(prepared) => prepared,
         Err(error) => {
             log::error!("true-switcher: {error}");
@@ -43,12 +43,18 @@ fn run() -> io::Result<ShutdownReason> {
         }
     };
 
+    let is_dictionary_pair_loaded = auto_switch.dictionaries.is_pair_loaded();
+    let warning = disable_autoswitch_without_pair(&mut config, is_dictionary_pair_loaded);
+    if let Some(warning) = warning {
+        log::warn!("true-switcher: {warning}");
+    }
     log::set_max_level(config.log_level);
     let _tray = tray::Tray::start(
         sender.clone(),
         &config,
         config_file,
-        auto_switch.dictionaries.is_pair_loaded(),
+        is_dictionary_pair_loaded,
+        warning,
     )?;
 
     let desktop = kde::KdePlasma::new()?;
@@ -78,6 +84,18 @@ fn run() -> io::Result<ShutdownReason> {
     switcher.process_requests(&mut input)
 }
 
+fn disable_autoswitch_without_pair(
+    config: &mut config::Configuration,
+    is_dictionary_pair_loaded: bool,
+) -> Option<&'static str> {
+    if config.auto_switch && !is_dictionary_pair_loaded {
+        config.auto_switch = false;
+        Some("Dictionary auto-switch disabled: two current dictionaries are required")
+    } else {
+        None
+    }
+}
+
 fn prepare_configuration() -> Result<
     (
         config::Configuration,
@@ -89,7 +107,7 @@ fn prepare_configuration() -> Result<
     config::load().and_then(|(config, file)| {
         let learned = learned_rules::LearnedRules::load(file.learned_rules_path())
             .map_err(|error| format!("Configuration: {error}"))?;
-        switch_rules::AutoSwitch::new(&config, learned)
+        switch_rules::AutoSwitch::new(&config, file.directory(), learned)
             .map(|auto_switch| (config, file, auto_switch))
             .map_err(|error| format!("Configuration: {error}"))
     })
@@ -118,5 +136,32 @@ fn main() -> ExitCode {
             log::error!("true-switcher: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn startup_without_a_pair_uses_effective_settings_without_saving() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let contents = "switch_key = 'KEY_PAUSE'\nauto_switch = true\npattern_switch = true\n";
+        std::fs::write(&path, contents).unwrap();
+        let (mut config, _) = crate::config::load_from(&path).unwrap();
+        assert!(super::disable_autoswitch_without_pair(&mut config, true).is_none());
+        let auto_switch =
+            super::switch_rules::AutoSwitch::new(&config, directory.path(), Default::default())
+                .unwrap();
+        assert!(
+            super::disable_autoswitch_without_pair(
+                &mut config,
+                auto_switch.dictionaries.is_pair_loaded()
+            )
+            .is_some()
+        );
+        let settings = crate::config::RuntimeSettings::from(&config);
+        assert!(!settings.is_auto_switch);
+        assert!(settings.is_pattern_switch);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), contents);
     }
 }

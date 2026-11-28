@@ -1,0 +1,31 @@
+[[source]]
+name = "FrequencyWords 2016 by hermitdave on github"
+directory = 'frequency-words-2016'
+link = "https://github.com/RugnarLodbrok/FrequencyWords/tree/master/content/2016"
+url_template = "https://raw.githubusercontent.com/RugnarLodbrok/FrequencyWords/refs/heads/master/content/2016/{key}/{key}_full.txt"
+
+[source.layout_keys]
+br = "pt_br"
+cn = "zh"
+gb = "en"
+ru = "ru"
+ua = "uk"
+us = "en"
+de = "de"
+"us(rus)" = "ru"
+
+[[source]]
+name = "FrequencyWords 2018 by hermitdave on github"
+directory = 'frequency-words-2018'
+link = "https://github.com/RugnarLodbrok/FrequencyWords/tree/master/content/2018"
+url_template = "https://raw.githubusercontent.com/RugnarLodbrok/FrequencyWords/refs/heads/master/content/2018/{key}/{key}_full.txt"
+
+[source.layout_keys]
+br = "pt_br"
+cn = "zh_cn"
+gb = "en"
+ru = "ru"
+ua = "uk"
+us = "en"
+de = "de"
+"us(rus)" = "ru"

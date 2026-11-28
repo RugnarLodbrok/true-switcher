@@ -44,18 +44,25 @@ impl ScoreSession {
         is_learned_enabled: bool,
         observer: Option<&mut DictionaryLoadObserver<'_>>,
     ) -> io::Result<Self> {
-        if config.dict.len() != DICTIONARY_COUNT {
+        if config.dict.is_empty() {
             return Err(io::Error::other(
                 "Exactly two dictionaries must be configured",
             ));
         }
         let layouts = kde::configured_layouts_from(kde_path)?;
+        let names = layouts.iter().map(Layout::name).collect::<Vec<_>>();
         let mut dictionaries = DictionaryAutoSwitch::load_with_progress(
             config,
+            config_file.directory(),
+            &names,
             |name| resolve_layout(&layouts, kde_path, name),
-            || Ok(layouts.len()),
             observer,
         )?;
+        if !dictionaries.is_pair_loaded() {
+            return Err(io::Error::other(
+                "Exactly two dictionaries must be configured",
+            ));
+        }
         let mut punctuation = Punctuation::new(&config.punctuation)?;
         punctuation.update_layouts(layouts);
         if is_learned_enabled {

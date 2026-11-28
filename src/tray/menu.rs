@@ -3,6 +3,8 @@ use std::io;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
+use super::download::{self, ActiveLayouts, DownloadSlot};
+use super::download_menu::{Action, DOWNLOAD_MENU_ID, DownloadMenu};
 use crate::config::{
     Configuration, ConfigurationFile, LOG_LEVELS, RuntimeSetting, RuntimeSettings,
 };
@@ -19,7 +21,7 @@ const AUTO_SWITCH_ID: i32 = 3;
 const PATTERN_SWITCH_ID: i32 = 4;
 const MANUAL_SOUND_ID: i32 = 5;
 const AUTO_SOUND_ID: i32 = 6;
-const SAVE_ID: i32 = 7;
+const LOG_SEPARATOR_ID: i32 = 7;
 const LOG_LEVEL_MENU_ID: i32 = 8;
 const LOG_LEVEL_IDS: [i32; LOG_LEVELS.len()] = [9, 10, 11, 12, 13, 14];
 const SETTING_IDS: [i32; 4] = [
@@ -32,7 +34,7 @@ const REVISION: u32 = 1;
 const PROTOCOL_VERSION: u32 = 3;
 const CLICKED: &str = "clicked";
 
-type Properties = HashMap<String, OwnedValue>;
+pub(super) type Properties = HashMap<String, OwnedValue>;
 pub(super) type Layout = (i32, Properties, Vec<OwnedValue>);
 type Event = (i32, String, OwnedValue, u32);
 type LifecycleAction = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
@@ -61,7 +63,10 @@ struct MenuState {
 pub(super) struct RuntimeMenu {
     sender: InputEventSender,
     state: Mutex<MenuState>,
-    config_file: ConfigurationFile,
+    config_file: Arc<ConfigurationFile>,
+    download_menu: Option<Mutex<DownloadMenu>>,
+    download_slot: Arc<DownloadSlot>,
+    active_layouts: Arc<ActiveLayouts>,
     is_dictionary_pair_loaded: bool,
     layout_count: Box<dyn Fn() -> io::Result<usize> + Send + Sync>,
 }
@@ -73,6 +78,7 @@ impl RuntimeMenu {
         config_file: ConfigurationFile,
         is_dictionary_pair_loaded: bool,
         layout_count: impl Fn() -> io::Result<usize> + Send + Sync + 'static,
+        active_layouts: impl Fn() -> io::Result<Vec<crate::layout::Layout>> + Send + Sync + 'static,
     ) -> Self {
         Self {
             sender,
@@ -81,7 +87,14 @@ impl RuntimeMenu {
                 availability: AutoSwitchAvailability::UnknownLayoutCount,
                 log_level: config.log_level,
             }),
-            config_file,
+            download_menu: (!is_dictionary_pair_loaded).then(|| {
+                Mutex::new(DownloadMenu::new(
+                    config_file.directory().join(download::SOURCES_FILE),
+                ))
+            }),
+            config_file: Arc::new(config_file),
+            download_slot: Arc::default(),
+            active_layouts: Arc::new(active_layouts),
             is_dictionary_pair_loaded,
             layout_count: Box::new(layout_count),
         }
@@ -124,14 +137,10 @@ impl RuntimeMenu {
         if matches!(setting, RuntimeSetting::AutoSwitch) {
             self.refresh_availability(&mut state);
         }
-        Ok(())
-    }
-
-    fn save(&self) {
-        let state = self.state.lock().unwrap();
-        if let Err(error) = self.config_file.save(state.settings, state.log_level) {
-            log::warn!("true-switcher: cannot save configuration: {error}");
+        if let Err(error) = self.config_file.save_setting(setting, state.settings) {
+            log_save_error(error);
         }
+        Ok(())
     }
 
     fn select_log_level(&self, id: i32, level: log::LevelFilter) -> Vec<(i32, Properties)> {
@@ -145,7 +154,15 @@ impl RuntimeMenu {
             .find_map(|(id, (_, level))| (level == state.log_level).then_some(id))
             .expect("all log levels have menu items");
         state.log_level = level;
-        log::set_max_level(level);
+        if level != log::LevelFilter::Off {
+            log::set_max_level(level);
+        }
+        if let Err(error) = self.config_file.save_log_level(level) {
+            log_save_error(error);
+        }
+        if level == log::LevelFilter::Off {
+            log::set_max_level(level);
+        }
         vec![(previous_id, toggle_state(false)), (id, toggle_state(true))]
     }
 
@@ -158,14 +175,15 @@ impl RuntimeMenu {
     }
 
     fn properties(&self, setting: RuntimeSetting) -> Properties {
+        if matches!(setting, RuntimeSetting::AutoSwitch) && self.download_menu.is_some() {
+            return submenu_properties("Auto-switch");
+        }
         let state = self.state.lock().unwrap();
         let (label, is_checked) = match setting {
             RuntimeSetting::AutoSwitch => (
                 match state.availability {
                     AutoSwitchAvailability::Available => "Auto-switch",
-                    AutoSwitchAvailability::MissingDictionaries => {
-                        "Auto-switch (configure two dictionaries and Reload)"
-                    }
+                    AutoSwitchAvailability::MissingDictionaries => "Auto-switch",
                     AutoSwitchAvailability::TooManyLayouts => {
                         "Auto-switch (requires at most two KDE layouts)"
                     }
@@ -193,6 +211,14 @@ impl RuntimeMenu {
     }
 }
 
+fn log_save_error(error: io::Error) {
+    log::error!("true-switcher: cannot save configuration: {error}");
+}
+
+pub(super) fn separator_properties() -> Properties {
+    HashMap::from([("type".into(), Str::from("separator").into())])
+}
+
 fn setting(id: i32) -> Option<RuntimeSetting> {
     match id {
         AUTO_SWITCH_ID => Some(RuntimeSetting::AutoSwitch),
@@ -210,12 +236,18 @@ fn log_level(id: i32) -> Option<(&'static str, log::LevelFilter)> {
         .find_map(|(item_id, level)| (item_id == id).then_some(level))
 }
 
-fn item_properties(label: &str, is_enabled: bool) -> Properties {
+pub(super) fn item_properties(label: &str, is_enabled: bool) -> Properties {
     HashMap::from([
         ("label".into(), Str::from(label).into()),
         ("enabled".into(), is_enabled.into()),
         ("visible".into(), true.into()),
     ])
+}
+
+pub(super) fn submenu_properties(label: &str) -> Properties {
+    let mut properties = item_properties(label, true);
+    properties.insert("children-display".into(), Str::from("submenu").into());
+    properties
 }
 
 fn toggle_state(is_checked: bool) -> Properties {
@@ -238,11 +270,34 @@ impl Menu {
             .is_some_and(|runtime| runtime.refresh_availability(&mut runtime.state.lock().unwrap()))
     }
 
+    pub(super) fn refresh_downloads(&self) -> bool {
+        let Some(runtime) = &self.runtime else {
+            return false;
+        };
+        runtime.download_menu.as_ref().is_some_and(|menu| {
+            let layouts = (runtime.active_layouts)();
+            menu.lock().unwrap().refresh(layouts)
+        })
+    }
+
+    fn download_menu(&self) -> Option<std::sync::MutexGuard<'_, DownloadMenu>> {
+        self.runtime
+            .as_ref()?
+            .download_menu
+            .as_ref()
+            .map(|menu| menu.lock().unwrap())
+    }
+
+    fn revision(&self) -> u32 {
+        self.download_menu()
+            .map_or(REVISION, |menu| menu.revision())
+    }
+
     fn root_children(&self) -> Vec<i32> {
         let mut ids = Vec::new();
         if self.runtime.is_some() {
             ids.extend(SETTING_IDS);
-            ids.extend([LOG_LEVEL_MENU_ID, SAVE_ID]);
+            ids.extend([LOG_LEVEL_MENU_ID, LOG_SEPARATOR_ID]);
         }
         ids.extend([RELOAD_ID, QUIT_ID]);
         ids
@@ -253,6 +308,13 @@ impl Menu {
         if self.runtime.is_some() {
             ids.extend(LOG_LEVEL_IDS);
         }
+        if let Some(menu) = self.download_menu() {
+            ids.push(DOWNLOAD_MENU_ID);
+            for child in menu.children(DOWNLOAD_MENU_ID) {
+                ids.push(child);
+                ids.extend(menu.children(child));
+            }
+        }
         ids
     }
 
@@ -262,7 +324,10 @@ impl Menu {
             (_, 0) => Vec::new(),
             (ROOT_ID, _) => self.root_children(),
             (LOG_LEVEL_MENU_ID, _) => LOG_LEVEL_IDS.to_vec(),
-            _ => Vec::new(),
+            (AUTO_SWITCH_ID, _) if self.download_menu().is_some() => vec![DOWNLOAD_MENU_ID],
+            _ => self
+                .download_menu()
+                .map_or_else(Vec::new, |menu| menu.children(id)),
         };
         let child_depth = if depth < 0 { depth } else { depth - 1 };
         let mut children = Vec::with_capacity(child_ids.len());
@@ -297,7 +362,10 @@ impl Menu {
                     .await
                     .map_err(|error| zbus::fdo::Error::Failed(error.to_string()));
             }
-            if id == LOG_LEVEL_MENU_ID {
+            if matches!(id, LOG_LEVEL_MENU_ID | LOG_SEPARATOR_ID) {
+                return Ok(());
+            }
+            if runtime.download_menu.is_some() && id == AUTO_SWITCH_ID {
                 return Ok(());
             }
             if let Some(setting) = setting(id) {
@@ -310,12 +378,63 @@ impl Menu {
                 .await
                 .map_err(|error| zbus::fdo::Error::Failed(error.to_string()));
             }
-            if id == SAVE_ID {
-                runtime.save();
-                return Ok(());
-            }
         }
-        self.dispatch_lifecycle(emitter.connection(), id)
+        if matches!(id, RELOAD_ID | QUIT_ID) {
+            return self.dispatch_lifecycle(emitter.connection(), id);
+        }
+        let action = self.download_menu().and_then(|menu| menu.action(id));
+        if let (Some(runtime), Some(action)) = (&self.runtime, action) {
+            self.dispatch_download_action(emitter.connection(), runtime, action)?;
+        }
+        Ok(())
+    }
+
+    fn dispatch_download_action(
+        &self,
+        connection: &zbus::Connection,
+        runtime: &RuntimeMenu,
+        action: Action,
+    ) -> zbus::fdo::Result<()> {
+        let connection: zbus::blocking::Connection = connection.clone().into();
+        let result = match action {
+            Action::Open(target) => {
+                thread::Builder::new()
+                    .name("tray-open".into())
+                    .spawn(move || {
+                        if let Err(error) = target.open(&connection) {
+                            log::warn!("true-switcher: cannot open dictionary source: {error}");
+                            let _ = super::notify(
+                                &connection,
+                                "Cannot open dictionary source",
+                                &error.to_string(),
+                            );
+                        }
+                    })
+            }
+            Action::Download(source) => {
+                let Some(reservation) = runtime.download_slot.reserve() else {
+                    return Ok(());
+                };
+                let config_file = runtime.config_file.clone();
+                let active_layouts = runtime.active_layouts.clone();
+                let restart = self.restart.clone();
+                thread::Builder::new()
+                    .name("dictionary-download".into())
+                    .spawn(move || {
+                        let _reservation = reservation;
+                        download::run(
+                            &connection,
+                            &source,
+                            &config_file,
+                            active_layouts.as_ref(),
+                            || restart(),
+                        );
+                    })
+            }
+        };
+        result
+            .map(|_| ())
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))
     }
 
     fn dispatch_lifecycle(&self, connection: &zbus::Connection, id: i32) -> zbus::fdo::Result<()> {
@@ -343,18 +462,17 @@ impl Menu {
             ROOT_ID => HashMap::from([("children-display".into(), Str::from("submenu").into())]),
             RELOAD_ID => item_properties("Reload", true),
             QUIT_ID => item_properties("Quit", true),
-            SAVE_ID if self.runtime.is_some() => item_properties("Save to config", true),
-            LOG_LEVEL_MENU_ID if self.runtime.is_some() => {
-                let mut properties = item_properties("Log level", true);
-                properties.insert("children-display".into(), Str::from("submenu").into());
-                properties
-            }
+            LOG_SEPARATOR_ID if self.runtime.is_some() => separator_properties(),
+            LOG_LEVEL_MENU_ID if self.runtime.is_some() => submenu_properties("Log level"),
             _ => match (&self.runtime, setting(id), log_level(id)) {
                 (Some(runtime), Some(setting), _) => runtime.properties(setting),
                 (Some(runtime), _, Some((label, level))) => {
                     runtime.log_level_properties(label, level)
                 }
-                _ => return Err(zbus::fdo::Error::InvalidArgs("Unknown menu item".into())),
+                _ => self
+                    .download_menu()
+                    .and_then(|menu| menu.properties(id))
+                    .ok_or_else(|| zbus::fdo::Error::InvalidArgs("Unknown menu item".into()))?,
             },
         };
         if !names.is_empty() {
@@ -371,6 +489,13 @@ impl Menu {
         emitter: &SignalEmitter<'_>,
         updated: Vec<(i32, Properties)>,
         removed: Vec<(i32, Vec<String>)>,
+    ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn layout_updated(
+        emitter: &SignalEmitter<'_>,
+        revision: u32,
+        parent: i32,
     ) -> zbus::Result<()>;
 
     #[zbus(property)]
@@ -401,7 +526,7 @@ impl Menu {
         property_names: Vec<String>,
     ) -> zbus::fdo::Result<(u32, Layout)> {
         Ok((
-            REVISION,
+            self.revision(),
             self.layout(parent_id, recursion_depth, &property_names)?,
         ))
     }
@@ -457,24 +582,52 @@ impl Menu {
         errors
     }
 
-    fn about_to_show(&self, id: i32) -> zbus::fdo::Result<bool> {
+    async fn about_to_show(
+        &self,
+        id: i32,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<bool> {
         self.properties(id, &[])?;
-        Ok(matches!(id, ROOT_ID | AUTO_SWITCH_ID) && self.refresh())
+        let is_changed = match id {
+            DOWNLOAD_MENU_ID => self.refresh_downloads(),
+            ROOT_ID | AUTO_SWITCH_ID => self.refresh(),
+            _ => false,
+        };
+        if id == DOWNLOAD_MENU_ID && is_changed {
+            Self::layout_updated(&emitter, self.revision(), DOWNLOAD_MENU_ID)
+                .await
+                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+        }
+        Ok(is_changed)
     }
 
     #[zbus(out_args("updates_needed", "id_errors"))]
-    fn about_to_show_group(&self, ids: Vec<i32>) -> (Vec<i32>, Vec<i32>) {
+    async fn about_to_show_group(
+        &self,
+        ids: Vec<i32>,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<(Vec<i32>, Vec<i32>)> {
         let (valid, errors): (Vec<_>, Vec<_>) = ids
             .into_iter()
             .partition(|id| *id == ROOT_ID || self.ids().contains(id));
+        let is_runtime_changed = valid
+            .iter()
+            .any(|id| matches!(*id, ROOT_ID | AUTO_SWITCH_ID))
+            && self.refresh();
+        let are_downloads_changed = valid.contains(&DOWNLOAD_MENU_ID) && self.refresh_downloads();
+        if are_downloads_changed {
+            Self::layout_updated(&emitter, self.revision(), DOWNLOAD_MENU_ID)
+                .await
+                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+        }
         let updates = valid
             .into_iter()
-            .filter(|id| matches!(*id, ROOT_ID | AUTO_SWITCH_ID))
-            .collect::<Vec<_>>();
-        if !updates.is_empty() && self.refresh() {
-            (updates, errors)
-        } else {
-            (Vec::new(), errors)
-        }
+            .filter(|id| match *id {
+                ROOT_ID | AUTO_SWITCH_ID => is_runtime_changed,
+                DOWNLOAD_MENU_ID => are_downloads_changed,
+                _ => false,
+            })
+            .collect();
+        Ok((updates, errors))
     }
 }

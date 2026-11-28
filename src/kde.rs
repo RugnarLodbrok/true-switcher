@@ -210,6 +210,28 @@ pub fn target_layout(name: &str) -> io::Result<Arc<Layout>> {
     KdeClient::connect()?.target_layout(name, &read_configuration)
 }
 
+pub(crate) fn layout_names() -> io::Result<Vec<String>> {
+    Ok(KdeClient::connect()?
+        .layouts()?
+        .into_iter()
+        .map(|(name, _, _)| name)
+        .collect())
+}
+
+pub(crate) fn active_layouts() -> io::Result<Vec<Layout>> {
+    let names = layout_names()?;
+    let contents = read_configuration()?;
+    names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            configured_layout(&contents, index, name).ok_or_else(|| {
+                io::Error::other(format!("Cannot match KDE layout {name:?} to kxkbrc"))
+            })
+        })
+        .collect()
+}
+
 pub(crate) fn layout_count() -> io::Result<usize> {
     Ok(KdeClient::connect()?.layouts()?.len())
 }

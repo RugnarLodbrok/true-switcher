@@ -3,14 +3,16 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Mutex;
 
 use evdev::KeyCode;
 use serde::{Deserialize, Deserializer, de};
-use toml_edit::DocumentMut;
+use toml_edit::{ArrayOfTables, DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
 const CONFIG_DIRECTORY: &str = ".config/true-switcher";
 const CONFIG_FILE: &str = "config.toml";
 const LOG_LEVEL_KEY: &str = "log_level";
+const DEFAULT_DICTIONARY_THRESHOLD: f64 = 15.0;
 pub(crate) const DEFAULT_MOUSE_MOTION_PAUSE_MS: u64 = 500;
 pub(crate) const DEFAULT_PUNCTUATION: &str = r"[`~<>\p{P}]";
 pub(crate) const LOG_LEVELS: [(&str, log::LevelFilter); 6] = [
@@ -50,7 +52,7 @@ pub struct Configuration {
     #[serde(default, deserialize_with = "deserialize_ambiguity_score_floor")]
     pub ambiguity_score_floor: Option<f64>,
     #[serde(default)]
-    pub dict: Vec<DictionarySettings>,
+    pub dict: Vec<DictionaryEntry>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -70,15 +72,30 @@ pub(crate) enum RuntimeSetting {
 }
 
 impl RuntimeSettings {
-    pub(crate) fn toggle(&mut self, setting: RuntimeSetting) -> bool {
-        let value = match setting {
+    fn value_mut(&mut self, setting: RuntimeSetting) -> &mut bool {
+        match setting {
             RuntimeSetting::AutoSwitch => &mut self.is_auto_switch,
             RuntimeSetting::PatternSwitch => &mut self.is_pattern_switch,
             RuntimeSetting::ManualSwitchSound => &mut self.is_manual_switch_sound,
             RuntimeSetting::AutoSwitchSound => &mut self.is_auto_switch_sound,
-        };
+        }
+    }
+
+    pub(crate) fn toggle(&mut self, setting: RuntimeSetting) -> bool {
+        let value = self.value_mut(setting);
         *value = !*value;
         *value
+    }
+}
+
+impl RuntimeSetting {
+    fn key(self) -> &'static str {
+        match self {
+            Self::AutoSwitch => "auto_switch",
+            Self::PatternSwitch => "pattern_switch",
+            Self::ManualSwitchSound => "manual_switch_sound",
+            Self::AutoSwitchSound => "auto_switch_sound",
+        }
     }
 }
 
@@ -101,9 +118,28 @@ pub struct SwitchRule {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DictionarySettings {
+pub struct DictionaryEntry {
     pub target: String,
+    #[serde(flatten)]
+    fields: toml::Table,
+}
+
+impl DictionaryEntry {
+    pub(crate) fn settings(&self) -> io::Result<DictionarySettings> {
+        toml::Value::Table(self.fields.clone())
+            .try_into()
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("dict {:?}: {error}", self.target),
+                )
+            })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DictionarySettings {
     pub file: PathBuf,
     pub threshold: f64,
 }
@@ -158,52 +194,152 @@ fn deserialize_switch_key<'de, D: Deserializer<'de>>(deserializer: D) -> Result<
 
 pub(crate) struct ConfigurationFile {
     path: PathBuf,
-    document: DocumentMut,
+    snapshot: Mutex<DocumentMut>,
 }
 
 impl ConfigurationFile {
+    pub(crate) fn directory(&self) -> &Path {
+        self.path
+            .parent()
+            .expect("config path includes a directory")
+    }
+
     pub(crate) fn learned_rules_path(&self) -> PathBuf {
         self.path.with_file_name(crate::learned_rules::FILE_NAME)
     }
 
-    pub(crate) fn save(
+    pub(crate) fn save_setting(
         &self,
-        settings: RuntimeSettings,
-        log_level: log::LevelFilter,
+        setting: RuntimeSetting,
+        mut settings: RuntimeSettings,
     ) -> io::Result<()> {
-        let mut document = self.document.clone();
-        for (key, mut value) in [
-            (
-                "auto_switch",
-                toml_edit::Value::from(settings.is_auto_switch),
-            ),
-            ("pattern_switch", settings.is_pattern_switch.into()),
-            (
-                "manual_switch_sound",
-                settings.is_manual_switch_sound.into(),
-            ),
-            ("auto_switch_sound", settings.is_auto_switch_sound.into()),
-            (
-                LOG_LEVEL_KEY,
-                log_level.as_str().to_ascii_lowercase().into(),
-            ),
-        ] {
-            if let Some(old) = document.get(key).and_then(toml_edit::Item::as_value) {
-                *value.decor_mut() = old.decor().clone();
-            }
-            document[key] = toml_edit::Item::Value(value);
-        }
+        self.update(|document| {
+            set_value(
+                document.as_table_mut(),
+                setting.key(),
+                (*settings.value_mut(setting)).into(),
+            );
+            Ok(())
+        })
+    }
 
-        let directory = self
-            .path
-            .parent()
-            .expect("config path includes a directory");
-        fs::create_dir_all(directory)?;
-        let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+    pub(crate) fn save_log_level(&self, level: log::LevelFilter) -> io::Result<()> {
+        self.update(|document| {
+            set_value(
+                document.as_table_mut(),
+                LOG_LEVEL_KEY,
+                level.as_str().to_ascii_lowercase().into(),
+            );
+            Ok(())
+        })
+    }
+
+    pub(crate) fn dictionary_skip_pattern(&self) -> io::Result<String> {
+        let snapshot = self.snapshot.lock().unwrap();
+        let document = self.current_document(&snapshot)?;
+        Ok(from_contents(&document.to_string())
+            .map_err(io::Error::other)?
+            .dict_skip_pattern)
+    }
+
+    pub(crate) fn connect_dictionaries<'a>(
+        &self,
+        dictionaries: impl IntoIterator<Item = (&'a str, &'a Path)>,
+        skip_pattern: &str,
+    ) -> io::Result<()> {
+        self.update(|document| {
+            let current = from_contents(&document.to_string()).map_err(io::Error::other)?;
+            if current.dict_skip_pattern != skip_pattern {
+                return Err(io::Error::other(
+                    "dict_skip_pattern changed during dictionary download",
+                ));
+            }
+            let records = document
+                .entry("dict")
+                .or_insert(Item::ArrayOfTables(ArrayOfTables::new()));
+            for (target, path) in dictionaries {
+                let path = path
+                    .to_str()
+                    .ok_or_else(|| io::Error::other("Dictionary path is not UTF-8"))?;
+                update_dictionary(records, target, path)?;
+            }
+            set_value(
+                document.as_table_mut(),
+                RuntimeSetting::AutoSwitch.key(),
+                false.into(),
+            );
+            Ok(())
+        })
+    }
+
+    fn current_document(&self, snapshot: &DocumentMut) -> io::Result<DocumentMut> {
+        match fs::read_to_string(&self.path) {
+            Ok(contents) => contents.parse().map_err(io::Error::other),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(snapshot.clone()),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn update(
+        &self,
+        edit: impl FnOnce(&mut DocumentMut) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let mut snapshot = self.snapshot.lock().unwrap();
+        let mut document = self.current_document(&snapshot)?;
+        edit(&mut document)?;
+        fs::create_dir_all(self.directory())?;
+        let mut temporary = tempfile::NamedTempFile::new_in(self.directory())?;
         temporary.write_all(document.to_string().as_bytes())?;
         temporary.persist(&self.path).map_err(|error| error.error)?;
+        *snapshot = document;
         Ok(())
     }
+}
+
+fn set_value(table: &mut dyn TableLike, key: &str, mut value: Value) {
+    if let Some(old) = table.get(key).and_then(Item::as_value) {
+        *value.decor_mut() = old.decor().clone();
+        *table.get_mut(key).expect("existing TOML field") = Item::Value(value);
+    } else {
+        table.insert(key, Item::Value(value));
+    }
+}
+
+fn update_dictionary(records: &mut Item, target: &str, path: &str) -> io::Result<()> {
+    let is_target =
+        |table: &dyn TableLike| table.get("target").and_then(Item::as_str) == Some(target);
+    match records {
+        Item::ArrayOfTables(tables) => {
+            if let Some(table) = tables.iter_mut().find(|table| is_target(*table)) {
+                set_value(table, "file", path.into());
+            } else {
+                let mut table = Table::new();
+                set_new_dictionary(&mut table, target, path);
+                tables.push(table);
+            }
+        }
+        Item::Value(Value::Array(tables)) => {
+            let existing = tables
+                .iter_mut()
+                .filter_map(Value::as_inline_table_mut)
+                .find(|table| is_target(*table));
+            if let Some(table) = existing {
+                set_value(table, "file", path.into());
+            } else {
+                let mut table = InlineTable::new();
+                set_new_dictionary(&mut table, target, path);
+                tables.push(Value::InlineTable(table));
+            }
+        }
+        _ => return Err(io::Error::other("Expected a list of dictionaries")),
+    }
+    Ok(())
+}
+
+fn set_new_dictionary(table: &mut dyn TableLike, target: &str, path: &str) {
+    set_value(table, "target", target.into());
+    set_value(table, "file", path.into());
+    set_value(table, "threshold", DEFAULT_DICTIONARY_THRESHOLD.into());
 }
 
 pub fn load() -> Result<(Configuration, ConfigurationFile), String> {
@@ -215,23 +351,10 @@ pub fn load() -> Result<(Configuration, ConfigurationFile), String> {
 pub(crate) fn load_from(path: &Path) -> Result<(Configuration, ConfigurationFile), String> {
     let contents = fs::read_to_string(path)
         .map_err(|error| format!("Cannot read {}: {error}", path.display()))?;
-    let mut config =
+    let config =
         from_contents(&contents).map_err(|error| format!("{}: {error}", path.display()))?;
     crate::punctuation::Punctuation::new(&config.punctuation)
         .map_err(|error| format!("{}: {error}", path.display()))?;
-    let directory = path
-        .parent()
-        .expect("configuration path includes a directory");
-    for dictionary in &mut config.dict {
-        if !dictionary.file.is_relative() {
-            return Err(format!(
-                "{}: dict.file must be relative to the configuration directory: {}",
-                path.display(),
-                dictionary.file.display(),
-            ));
-        }
-        dictionary.file = directory.join(&dictionary.file);
-    }
     let document = contents
         .parse()
         .map_err(|error| format!("{}: {error}", path.display()))?;
@@ -239,7 +362,7 @@ pub(crate) fn load_from(path: &Path) -> Result<(Configuration, ConfigurationFile
         config,
         ConfigurationFile {
             path: path.to_path_buf(),
-            document,
+            snapshot: Mutex::new(document),
         },
     ))
 }
@@ -295,66 +418,32 @@ mod tests {
     }
 
     #[test]
-    fn resolves_dictionary_path_from_config_location() {
-        let directory =
-            std::env::temp_dir().join(format!("true-switcher-config-{}", std::process::id()));
-        fs::create_dir(&directory).unwrap();
-        let path = directory.join(CONFIG_FILE);
-        let contents = |file: &str| {
-            format!(
-                "switch_key = 'KEY_PAUSE'\n[[dict]]\ntarget = 'us'\nfile = '{file}'\nthreshold = 5.0\n"
-            )
-        };
-        fs::write(&path, contents("dictionaries/words.txt")).unwrap();
-        let (config, _) = load_from(&path).unwrap();
-        assert_eq!(
-            config.dict[0].file,
-            directory.join("dictionaries/words.txt")
-        );
-        fs::write(&path, contents("/dictionaries/words.txt")).unwrap();
-        assert!(load_from(&path).is_err());
-        fs::remove_file(path).unwrap();
-        fs::remove_dir(directory).unwrap();
-    }
-
-    #[test]
-    fn save_replaces_the_file_from_the_loaded_document() {
+    fn saves_only_the_selected_field_and_restores_the_last_successful_snapshot() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join(CONFIG_FILE);
-        let original = "\
-# Header
-switch_key = 'KEY_PAUSE'
-'auto_switch'  =  false   # Inline
-unknown = [ 1, 2 ]
-
-[[dict]]
-target = 'us'
-file = 'words.txt'
-threshold = 5.0
-# Footer
-";
+        let original = "switch_key = 'KEY_PAUSE'\nauto_switch = true\n";
         fs::write(&path, original).unwrap();
-        let (config, file) = load_from(&path).unwrap();
-        let mut settings = RuntimeSettings::from(&config);
-        settings.toggle(RuntimeSetting::AutoSwitch);
+        let (_, file) = load_from(&path).unwrap();
+        let edited = format!("{original}'manual_switch_sound'  =  false   # Inline\n");
+        fs::write(&path, &edited).unwrap();
+
+        let mut settings = RuntimeSettings::default();
         settings.toggle(RuntimeSetting::ManualSwitchSound);
+        file.save_setting(RuntimeSetting::ManualSwitchSound, settings)
+            .unwrap();
+        let saved = edited.replace("=  false", "=  true");
+        assert_eq!(fs::read_to_string(&path).unwrap(), saved);
+
         fs::write(&path, "invalid TOML").unwrap();
-        file.save(settings, log::LevelFilter::Debug).unwrap();
-        let saved = fs::read_to_string(&path).unwrap();
-        assert_eq!(
-            saved,
-            original.replace("'auto_switch'  =  false", "'auto_switch'  =  true").replace(
-                "\n[[dict]]",
-                "pattern_switch = false\nmanual_switch_sound = true\nauto_switch_sound = true\nlog_level = \"debug\"\n\n[[dict]]",
-            )
-        );
-        let (saved_config, _) = load_from(&path).unwrap();
-        assert!(saved_config.manual_switch_sound);
-        assert_eq!(saved_config.log_level, log::LevelFilter::Debug);
+        assert!(file.save_log_level(log::LevelFilter::Debug).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "invalid TOML");
 
         fs::remove_file(&path).unwrap();
-        file.save(settings, log::LevelFilter::Debug).unwrap();
-        assert_eq!(fs::read_to_string(path).unwrap(), saved);
+        file.save_log_level(log::LevelFilter::Trace).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!("{saved}log_level = \"trace\"\n")
+        );
     }
 
     #[test]
@@ -366,15 +455,49 @@ threshold = 5.0
             "switch_key = 'KEY_PAUSE'\nlog_level  =  'info'   # Logging\n",
         )
         .unwrap();
-        let (config, file) = load_from(&path).unwrap();
-        file.save(RuntimeSettings::from(&config), log::LevelFilter::Trace)
-            .unwrap();
+        let (_, file) = load_from(&path).unwrap();
+        file.save_log_level(log::LevelFilter::Trace).unwrap();
         let saved = fs::read_to_string(&path).unwrap();
         assert!(saved.contains("log_level  =  \"trace\"   # Logging\n"));
         assert_eq!(
             load_from(&path).unwrap().0.log_level,
             log::LevelFilter::Trace
         );
+    }
+
+    #[test]
+    fn connects_dictionaries_in_existing_inline_arrays() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(CONFIG_FILE);
+        for (array, threshold) in [
+            ("[]", "15.0"),
+            (
+                "[{ target = 'us', file = 'old.txt', threshold = 5.0 }]",
+                "5.0",
+            ),
+        ] {
+            fs::write(
+                &path,
+                format!("switch_key = 'KEY_PAUSE'\ndict = {array} # Keep\n"),
+            )
+            .unwrap();
+            let (_, file) = load_from(&path).unwrap();
+            file.connect_dictionaries(
+                [
+                    ("us", Path::new("dicts/en.txt")),
+                    ("ru", Path::new("dicts/ru.txt")),
+                ],
+                "",
+            )
+            .unwrap();
+            let saved = fs::read_to_string(&path).unwrap();
+            assert!(saved.contains("dict = ["));
+            assert!(saved.contains("] # Keep"));
+            assert!(saved.contains(&format!("threshold = {threshold}")));
+            assert!(saved.contains("dicts/en.txt"));
+            assert!(saved.contains("dicts/ru.txt"));
+            assert_eq!(load_from(&path).unwrap().0.dict.len(), 2);
+        }
     }
 
     #[test]

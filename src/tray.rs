@@ -1,3 +1,5 @@
+mod download;
+mod download_menu;
 mod menu;
 
 use std::collections::HashMap;
@@ -39,6 +41,7 @@ impl Tray {
         config: &Configuration,
         config_file: ConfigurationFile,
         is_dictionary_pair_loaded: bool,
+        warning: Option<&'static str>,
     ) -> io::Result<Self> {
         let runtime = menu::RuntimeMenu::new(
             sender.clone(),
@@ -46,12 +49,13 @@ impl Tray {
             config_file,
             is_dictionary_pair_loaded,
             crate::kde::layout_count,
+            crate::kde::active_layouts,
         );
         let mut menu = menu::Menu::new(sender);
         menu.runtime = Some(Arc::new(runtime));
         thread::Builder::new()
             .name("system-tray".into())
-            .spawn(move || maintain(menu))?;
+            .spawn(move || maintain(menu, warning))?;
         Ok(Self)
     }
 
@@ -106,10 +110,10 @@ fn wait_for_shutdown(
     Ok(None)
 }
 
-fn maintain(menu: menu::Menu) {
+fn maintain(menu: menu::Menu, mut warning: Option<&str>) {
     let mut delay = RETRY_DELAY;
     loop {
-        match maintain_connection(&mut delay, &menu) {
+        match maintain_connection(&mut delay, &menu, &mut warning) {
             Ok(()) => delay = RETRY_DELAY,
             Err(error) => {
                 log::warn!("true-switcher: tray registration: {error}");
@@ -120,15 +124,29 @@ fn maintain(menu: menu::Menu) {
     }
 }
 
-fn maintain_connection(delay: &mut Duration, menu: &menu::Menu) -> zbus::Result<()> {
+fn maintain_connection(
+    delay: &mut Duration,
+    menu: &menu::Menu,
+    warning: &mut Option<&str>,
+) -> zbus::Result<()> {
     let connection = Connection::session()?;
     menu.refresh();
+    menu.refresh_downloads();
     export(&connection, menu.clone(), None)?;
+    send_startup_warning(&connection, warning);
     let mut owner = None;
     loop {
         register(&connection, &mut owner)?;
         *delay = RETRY_DELAY;
         thread::sleep(RETRY_DELAY);
+    }
+}
+
+fn send_startup_warning(connection: &Connection, warning: &mut Option<&str>) {
+    if let Some(warning) = warning.take()
+        && let Err(error) = notify(connection, "Dictionary auto-switch disabled", warning)
+    {
+        log::warn!("true-switcher: cannot send startup notification: {error}");
     }
 }
 
@@ -162,14 +180,23 @@ fn icon_directory() -> &'static str {
 }
 
 fn notify(connection: &Connection, summary: &str, body: &str) -> zbus::Result<()> {
+    notify_replacing(connection, 0, summary, body).map(|_| ())
+}
+
+fn notify_replacing(
+    connection: &Connection,
+    replaces_id: u32,
+    summary: &str,
+    body: &str,
+) -> zbus::Result<u32> {
     let proxy = Proxy::new(connection, NOTIFICATIONS, NOTIFICATIONS_PATH, NOTIFICATIONS)?;
     let icon = format!("{}/{ICON_NAME}.svg", icon_directory());
     let hints: HashMap<&str, OwnedValue> = HashMap::new();
-    let _: u32 = proxy.call(
+    proxy.call(
         "Notify",
         &(
             APP_TITLE,
-            0_u32,
+            replaces_id,
             icon,
             summary,
             body,
@@ -177,8 +204,7 @@ fn notify(connection: &Connection, summary: &str, body: &str) -> zbus::Result<()
             hints,
             DEFAULT_NOTIFICATION_TIMEOUT,
         ),
-    )?;
-    Ok(())
+    )
 }
 
 struct Item {

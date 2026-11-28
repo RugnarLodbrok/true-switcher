@@ -38,6 +38,16 @@ struct Transition {
     child: usize,
 }
 
+pub(crate) fn validate_file(path: &std::path::Path, skip_pattern: &str) -> io::Result<()> {
+    let pattern = compile_full_match_pattern(skip_pattern, "dict_skip_pattern")?;
+    let validate = || {
+        let file = std::fs::File::open(path)?;
+        DictionaryTrie::read_with_progress(BufReader::new(file), pattern.as_ref(), 0, |_| {})?;
+        Ok(())
+    };
+    validate().map_err(|error: io::Error| invalid(format!("{}: {error}", path.display())))
+}
+
 struct DictionaryTrie {
     nodes: Vec<Node<f64>>,
     transitions: Vec<Transition>,
@@ -326,26 +336,53 @@ pub(crate) struct DictionaryAutoSwitch {
 }
 
 impl DictionaryAutoSwitch {
+    #[cfg(test)]
     pub(crate) fn load(
         settings: &Configuration,
         resolve: impl Fn(&str) -> io::Result<Arc<Layout>>,
         layout_count: impl FnOnce() -> io::Result<usize>,
     ) -> io::Result<Self> {
-        Self::load_with_progress(settings, resolve, layout_count, None)
+        let entries = settings.dict.iter().collect::<Vec<_>>();
+        Self::load_entries(settings, &entries, None, resolve, layout_count, None)
     }
 
     pub(crate) fn load_with_progress(
         settings: &Configuration,
+        directory: &std::path::Path,
+        layout_names: &[&str],
+        resolve: impl Fn(&str) -> io::Result<Arc<Layout>>,
+        observer: Option<&mut DictionaryLoadObserver<'_>>,
+    ) -> io::Result<Self> {
+        let entries = settings
+            .dict
+            .iter()
+            .filter(|entry| layout_names.contains(&entry.target.as_str()))
+            .collect::<Vec<_>>();
+        Self::load_entries(
+            settings,
+            &entries,
+            Some(directory),
+            resolve,
+            || Ok(layout_names.len()),
+            observer,
+        )
+    }
+
+    fn load_entries(
+        settings: &Configuration,
+        entries: &[&crate::config::DictionaryEntry],
+        directory: Option<&std::path::Path>,
         resolve: impl Fn(&str) -> io::Result<Arc<Layout>>,
         layout_count: impl FnOnce() -> io::Result<usize>,
         mut observer: Option<&mut DictionaryLoadObserver<'_>>,
     ) -> io::Result<Self> {
-        if settings.dict.len() != DICTIONARY_COUNT
-            && (settings.auto_switch || !settings.dict.is_empty())
-        {
+        if entries.len() > DICTIONARY_COUNT {
             return Err(invalid("Exactly two dictionaries must be configured"));
         }
-        if settings.auto_switch && layout_count()? > DICTIONARY_COUNT {
+        if entries.len() == DICTIONARY_COUNT
+            && settings.auto_switch
+            && layout_count()? > DICTIONARY_COUNT
+        {
             return Err(invalid(
                 "Dictionary auto-switch supports at most two KDE layouts",
             ));
@@ -355,21 +392,32 @@ impl DictionaryAutoSwitch {
         let punctuation = PunctuationRuns::new(&settings.punctuation)?;
         let mut targets = HashSet::new();
         let mut dictionaries = Vec::new();
-        for setting in &settings.dict {
-            if !targets.insert(&setting.target) {
+        for entry in entries {
+            if !targets.insert(&entry.target) {
                 return Err(invalid(format!(
                     "Duplicate dictionary target {:?}",
-                    setting.target
+                    entry.target
                 )));
             }
+            let setting = entry.settings()?;
+            let path = match directory {
+                Some(directory) if setting.file.is_relative() => directory.join(&setting.file),
+                Some(_) => {
+                    return Err(invalid(format!(
+                        "dict.file must be relative to the configuration directory: {}",
+                        setting.file.display()
+                    )));
+                }
+                None => setting.file,
+            };
             if !setting.threshold.is_finite() || setting.threshold <= 0.0 {
                 return Err(invalid(format!(
                     "dict {:?}: threshold must be finite and positive",
-                    setting.target
+                    entry.target
                 )));
             }
-            let target = resolve(&setting.target)?;
-            let trie = std::fs::File::open(&setting.file)
+            let target = resolve(&entry.target)?;
+            let trie = std::fs::File::open(&path)
                 .and_then(|file| {
                     let total_bytes = observer
                         .as_ref()
@@ -381,17 +429,20 @@ impl DictionaryAutoSwitch {
                         total_bytes,
                         |progress| {
                             if let Some(report) = observer.as_deref_mut() {
-                                report(&setting.file, progress);
+                                report(&path, progress);
                             }
                         },
                     )
                 })
-                .map_err(|error| invalid(format!("{}: {error}", setting.file.display())))?;
+                .map_err(|error| invalid(format!("{}: {error}", path.display())))?;
             dictionaries.push(Dictionary {
                 target,
                 trie,
                 threshold: setting.threshold,
             });
+        }
+        if dictionaries.len() < DICTIONARY_COUNT {
+            dictionaries.clear();
         }
         Ok(Self {
             dictionaries,
@@ -1540,10 +1591,12 @@ mod tests {
         let load = || {
             let (config, _) = crate::config::load_from(&path).unwrap();
             assert!(!config.auto_switch);
-            DictionaryAutoSwitch::load(
+            DictionaryAutoSwitch::load_with_progress(
                 &config,
+                directory.path(),
+                &["us", "ru"],
                 |name| Ok(Arc::new(Layout::new(name, "", "", ""))),
-                || Ok(DICTIONARY_COUNT),
+                None,
             )
             .unwrap()
         };
@@ -1600,13 +1653,10 @@ mod tests {
         assert_eq!(compile(&valid, 2, true).unwrap().dictionaries.len(), 2);
         assert!(compile(&valid, 3, true).is_err());
         assert_eq!(compile(&valid, 3, false).unwrap().dictionaries.len(), 2);
-        for empty in ["", "dict = []"] {
-            assert!(compile(empty, 2, false).unwrap().dictionaries.is_empty());
-            let error = compile(empty, 2, true).err().unwrap();
-            assert_eq!(
-                error.to_string(),
-                "Exactly two dictionaries must be configured"
-            );
+        for is_enabled in [false, true] {
+            for contents in ["", "dict = []", us.as_str()] {
+                assert!(!compile(contents, 2, is_enabled).unwrap().is_pair_loaded());
+            }
         }
         for setting in ["dict_skip_pattern", "punctuation"] {
             let error = compile(&format!("{setting} = '['"), 2, false)
@@ -1614,7 +1664,7 @@ mod tests {
                 .unwrap();
             assert!(error.to_string().contains(setting));
         }
-        for invalid_config in [us.clone(), format!("{us}{us}"), format!("{valid}{us}")] {
+        for invalid_config in [format!("{us}{us}"), format!("{valid}{us}")] {
             for is_enabled in [true, false] {
                 assert!(compile(&invalid_config, 2, is_enabled).is_err());
             }
@@ -1626,6 +1676,40 @@ mod tests {
         let invalid_target = format!("{}{}", dictionary("invalid", &path, "5.0"), ru);
         assert!(compile(&invalid_target, 2, true).is_err());
         std::fs::remove_file(&path).unwrap();
-        assert!(compile(&valid, 2, true).is_err());
+        for is_enabled in [false, true] {
+            assert!(compile(&us, 2, is_enabled).is_err());
+        }
+    }
+
+    #[test]
+    fn validates_only_current_dictionary_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("words"), "word 1\n").unwrap();
+        let contents = "switch_key = 'KEY_PAUSE'\n[[dict]]\ntarget = 'us'\nfile = 'words'\nthreshold = 5.0\n[[dict]]\ntarget = 'ru'\nfile = 'missing'\nthreshold = 5.0\n[[dict]]\ntarget = 'de'\nfile = '/invalid'\nthreshold = 'invalid'\n";
+        let config = crate::config::from_contents(contents).unwrap();
+        let load = |names: &[&str]| {
+            DictionaryAutoSwitch::load_with_progress(
+                &config,
+                directory.path(),
+                names,
+                |name| Ok(Arc::new(Layout::new(name, "", "", ""))),
+                None,
+            )
+        };
+        assert!(!load(&["us"]).unwrap().is_pair_loaded());
+        assert!(
+            load(&["us", "ru"])
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("missing")
+        );
+        assert!(load(&["us", "de"]).is_err());
+        assert_eq!(
+            load(&["us", "ru", "de"]).err().unwrap().to_string(),
+            "Exactly two dictionaries must be configured"
+        );
+        std::fs::write(directory.path().join("missing"), "not a dictionary").unwrap();
+        assert!(load(&["us", "ru"]).is_err());
     }
 }

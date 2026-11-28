@@ -19,6 +19,8 @@ SYSTEM_UNIT = Path('/etc/systemd/system/true-switcher.service')
 USER_UNIT = Path.home() / '.config/systemd/user/true-switcher-session.service'
 USER_CONFIG = Path.home() / '.config/true-switcher/config.toml'
 CONFIG_TEMPLATE = Path(__file__).resolve().with_name('config.example.toml')
+DICT_SOURCES_TEMPLATE = CONFIG_TEMPLATE.with_name('dict-sources.example.toml')
+DICT_SOURCES_NAME = 'dict-sources.toml'
 POLKIT = Path('/etc/polkit-1/rules.d/49-true-switcher.rules')
 SYSTEM_NAME = 'true-switcher.service'
 USER_NAME = 'true-switcher-session.service'
@@ -109,16 +111,21 @@ def _preflight() -> bool:
 
 
 def _ensure_user_config() -> None:
-    if os.path.lexists(USER_CONFIG):
+    _copy_config_template(CONFIG_TEMPLATE, USER_CONFIG)
+    _copy_config_template(DICT_SOURCES_TEMPLATE, USER_CONFIG.with_name(DICT_SOURCES_NAME))
+
+
+def _copy_config_template(template: Path, destination: Path) -> None:
+    if os.path.lexists(destination):
         return
-    template = CONFIG_TEMPLATE.read_bytes()
-    USER_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    contents = template.read_bytes()
+    destination.parent.mkdir(parents=True, exist_ok=True)
     try:
-        with USER_CONFIG.open('xb') as config:
-            config.write(template)
+        with destination.open('xb') as config:
+            config.write(contents)
     except FileExistsError:
         return
-    print(f'created user config {USER_CONFIG}')
+    print(f'created user config {destination}')
 
 
 def _contents() -> tuple:

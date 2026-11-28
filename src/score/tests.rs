@@ -84,7 +84,15 @@ fn reports_missing_dictionary_pair_and_kde_configuration() {
     assert!(error.contains(kde_path.to_str().unwrap()), "{error}");
     fs::write(kde_path, "[Layout]\nLayoutList=us\n").unwrap();
     let error = fixture.load(true).err().unwrap().to_string();
-    assert!(error.contains("Layout \"ru\" is absent"), "{error}");
+    assert!(error.contains("Exactly two dictionaries"), "{error}");
+}
+
+#[test]
+fn score_ignores_dictionaries_for_inactive_layouts() {
+    let config = format!(
+        "{DICTIONARY_CONFIG}\n[[dict]]\ntarget = 'de'\nfile = 'missing'\nthreshold = 1.0\n"
+    );
+    assert!(Fixture::new(&config).load(false).is_ok());
 }
 
 #[test]
