@@ -68,3 +68,6 @@ update-installed: build
 	sudo install -m 755 target/release/true-switcher /usr/local/bin/true-switcher
 	if command -v restorecon >/dev/null 2>&1; then sudo restorecon /usr/local/bin/true-switcher; fi
 	sudo systemctl start true-switcher.service
+
+score: build
+	cargo run --release --locked -- score

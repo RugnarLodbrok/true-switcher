@@ -1,9 +1,10 @@
+use std::collections::HashMap;
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -324,7 +325,7 @@ fn read_configuration() -> io::Result<String> {
     fs::read_to_string(config_path()?)
 }
 
-fn config_path() -> io::Result<PathBuf> {
+pub(crate) fn config_path() -> io::Result<PathBuf> {
     let directory = env::var_os("XDG_CONFIG_HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
@@ -335,8 +336,32 @@ fn config_path() -> io::Result<PathBuf> {
 }
 
 fn configured_layout(contents: &str, index: usize, name: &str) -> Option<Layout> {
+    let values = layout_values(contents);
+    let layout = values.get("LayoutList")?.split(',').nth(index)?;
+    (layout == name && !layout.is_empty()).then(|| layout_at(&values, index, layout))
+}
+
+pub(crate) fn configured_layouts_from(path: &Path) -> io::Result<Vec<Layout>> {
+    let contents = fs::read_to_string(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("Cannot read {}: {error}", path.display()),
+        )
+    })?;
+    let values = layout_values(&contents);
+    Ok(values
+        .get("LayoutList")
+        .unwrap_or(&"")
+        .split(',')
+        .enumerate()
+        .filter(|(_, layout)| !layout.is_empty())
+        .map(|(index, layout)| layout_at(&values, index, layout))
+        .collect())
+}
+
+fn layout_values(contents: &str) -> HashMap<&str, &str> {
     let mut is_layout_group = false;
-    let mut values = std::collections::HashMap::new();
+    let mut values = HashMap::new();
     for line in contents.lines().map(str::trim) {
         if line.starts_with('[') {
             is_layout_group = line == "[Layout]";
@@ -349,11 +374,11 @@ fn configured_layout(contents: &str, index: usize, name: &str) -> Option<Layout>
             values.insert(key.trim(), value.trim());
         }
     }
-    let layout = values.get("LayoutList")?.split(',').nth(index)?;
-    if layout != name || layout.is_empty() {
-        return None;
-    }
-    Some(Layout::new(
+    values
+}
+
+fn layout_at(values: &HashMap<&str, &str>, index: usize, layout: &str) -> Layout {
+    Layout::new(
         layout,
         values
             .get("VariantList")
@@ -361,7 +386,7 @@ fn configured_layout(contents: &str, index: usize, name: &str) -> Option<Layout>
             .unwrap_or_default(),
         values.get("Model").copied().unwrap_or("pc104"),
         values.get("Options").copied().unwrap_or_default(),
-    ))
+    )
 }
 
 const QDBUS_NAMES: [&str; 3] = ["qdbus-qt6", "qdbus6", "qdbus"];

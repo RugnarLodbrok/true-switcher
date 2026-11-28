@@ -76,13 +76,13 @@ impl Punctuation {
     }
 }
 
-fn single_character(text: &str) -> Option<char> {
+pub(crate) fn single_character(text: &str) -> Option<char> {
     let mut characters = text.chars();
     let character = characters.next()?;
     characters.next().is_none().then_some(character)
 }
 
-fn text_strokes() -> impl Iterator<Item = Stroke> {
+pub(crate) fn text_strokes() -> impl Iterator<Item = Stroke> {
     text_keys().flat_map(|key| [false, true].map(move |shift| Stroke { key, shift }))
 }
 

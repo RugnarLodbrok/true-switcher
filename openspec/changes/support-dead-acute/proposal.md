@@ -8,6 +8,8 @@
 
 Учитывать композицию dead_acute при ручной и автоматической коррекции, сохраняя защиту для неподдержанных dead keys.
 
+Поддержать композицию `dead_acute` в трассах словарного скоринга команды `true-switcher score` из change [add-interactive-dictionary-score](../add-interactive-dictionary-score/proposal.md).
+
 ## Capabilities
 
 ### Modified Capabilities

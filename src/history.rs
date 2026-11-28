@@ -1,4 +1,3 @@
-use crate::dictionary::DictionaryAutoSwitch;
 use crate::key_codes::is_text_key;
 use crate::layout::Layout;
 use crate::punctuation::Punctuation;
@@ -86,7 +85,6 @@ impl History {
         key: KeyCode,
         is_shift: bool,
         layout: Option<Arc<Layout>>,
-        dictionaries: &DictionaryAutoSwitch,
         punctuation: &Punctuation,
     ) -> HistoryEvent {
         match key {
@@ -129,7 +127,7 @@ impl History {
                 }
                 let entry = WordStroke { stroke, layout };
                 if !is_strong {
-                    word.push_stroke(entry, dictionaries);
+                    word.entries.push(entry);
                     return HistoryEvent::Stroke;
                 }
                 let is_word_end = word.has_search_text() && !word.is_closed();
@@ -195,7 +193,6 @@ mod tests {
             key,
             false,
             Some(Arc::new(Layout::new("us", "", "", ""))),
-            &DictionaryAutoSwitch::default(),
             &Punctuation::default(),
         );
     }
@@ -255,7 +252,7 @@ mod tests {
         }
         let words = history.reset();
         assert_eq!(words[0].text().as_deref(), Ok("ab,"));
-        assert!(words[0].dictionary_prefixes.is_empty());
+        assert_eq!(words[0].trailing_spaces, 0);
     }
 
     #[test]
@@ -265,24 +262,16 @@ mod tests {
             KeyCode::KEY_A,
             true,
             Some(Arc::new(Layout::new("us", "", "", ""))),
-            &DictionaryAutoSwitch::default(),
             &Punctuation::default(),
         );
         history.process(
             KeyCode::KEY_B,
             false,
             Some(Arc::new(Layout::new("ru", "", "", ""))),
-            &DictionaryAutoSwitch::default(),
             &Punctuation::default(),
         );
         assert_eq!(history.latest_word().unwrap().text().as_deref(), Ok("Aи"));
-        history.process(
-            KeyCode::KEY_C,
-            false,
-            None,
-            &DictionaryAutoSwitch::default(),
-            &Punctuation::default(),
-        );
+        history.process(KeyCode::KEY_C, false, None, &Punctuation::default());
         assert!(matches!(
             history.latest_word().unwrap().text(),
             Err(crate::xkb::ConversionError::UnknownLayout { .. })
@@ -300,7 +289,6 @@ mod tests {
         let ru = Arc::new(Layout::new("ru", "", "pc105", ""));
         let mut punctuation = Punctuation::new(r"[`~<>\p{P}]+").unwrap();
         punctuation.update_layouts(vec![(*us).clone(), (*ru).clone()]);
-        let dictionaries = DictionaryAutoSwitch::default();
         let mut history = History::default();
         for (layout, keys) in [
             (
@@ -322,13 +310,7 @@ mod tests {
             (&us, &[K::KEY_M, K::KEY_P, K::KEY_3][..]),
         ] {
             for &key in keys {
-                history.process(
-                    key,
-                    key == K::KEY_GRAVE,
-                    Some(layout.clone()),
-                    &dictionaries,
-                    &punctuation,
-                );
+                history.process(key, key == K::KEY_GRAVE, Some(layout.clone()), &punctuation);
             }
         }
         let words = history.reset();
@@ -347,10 +329,9 @@ mod tests {
         let us = Arc::new(Layout::new("us", "", "", ""));
         let mut punctuation = Punctuation::new("[/]+").unwrap();
         punctuation.update_layouts(vec![(*us).clone()]);
-        let dictionaries = DictionaryAutoSwitch::default();
         let mut history = History::default();
         let press = |history: &mut History, key| {
-            history.process(key, false, Some(us.clone()), &dictionaries, &punctuation)
+            history.process(key, false, Some(us.clone()), &punctuation)
         };
         for key in [
             K::KEY_SLASH,

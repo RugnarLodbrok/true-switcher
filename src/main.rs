@@ -12,6 +12,7 @@ mod learned_rules;
 mod lifecycle;
 pub mod output;
 mod punctuation;
+mod score;
 mod sound;
 mod statistics;
 mod switch_rules;
@@ -23,6 +24,7 @@ mod word;
 mod xkb;
 
 use lifecycle::{RESTART_EXIT_CODE, ShutdownReason};
+use std::ffi::OsStr;
 use std::io;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -94,6 +96,11 @@ fn prepare_configuration() -> Result<
 }
 
 fn main() -> ExitCode {
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref() == Some(OsStr::new(score::COMMAND)) {
+        return score::run(args);
+    }
+
     env_logger::Builder::new()
         .filter_level(log::LevelFilter::Trace)
         .init();

@@ -58,7 +58,7 @@ pub fn to_text<'a>(
 ) -> Result<String, ConversionError> {
     #[cfg(test)]
     CONVERSIONS.with(|count| count.set(count.get() + 1));
-    convert(layout, strokes).inspect_err(|error| {
+    strokes_text(layout, strokes).inspect_err(|error| {
         log::error!("true-switcher: text conversion: {error}; layout={layout:?}");
     })
 }
@@ -99,7 +99,7 @@ fn shift_mask(stroke: &Stroke, shift_index: u32) -> Result<u32, ConversionError>
     }
 }
 
-fn convert<'a>(
+pub(crate) fn strokes_text<'a>(
     layout: &Layout,
     strokes: impl IntoIterator<Item = &'a Stroke>,
 ) -> Result<String, ConversionError> {
@@ -107,7 +107,11 @@ fn convert<'a>(
 }
 
 pub(crate) fn stroke_text(layout: &Layout, stroke: &Stroke) -> Result<String, ConversionError> {
-    convert(layout, [stroke])
+    strokes_text(layout, [stroke])
+}
+
+pub(crate) fn validate_keymap(layout: &Layout) -> Result<(), ConversionError> {
+    with_keymap(layout, |_| Ok(()))
 }
 
 pub(crate) fn has_dead_key<'a>(

@@ -669,7 +669,6 @@ impl Input {
             key,
             is_shift,
             self.layout.clone(),
-            &self.auto_switch.dictionaries,
             &self.auto_switch.punctuation,
         );
         let Some(word) = self.history.latest_word() else {
@@ -2549,6 +2548,10 @@ patterns = ['^\.тф']
         let path = directory.path().join(crate::learned_rules::FILE_NAME);
         std::fs::write(&path, "[us]\n\"/new\" = 3\nnew = 2\nnews = 7\n").unwrap();
         let mut input = auto_input_with_patterns("");
+        input.auto_switch.dictionaries = crate::dictionary::test_dictionaries([
+            ("us", "", "new 1", 5.0),
+            ("ru", "", "туц 1", 5.0),
+        ]);
         input.auto_switch.dictionaries.learned =
             crate::learned_rules::LearnedRules::load(path).unwrap();
         let us = layout("us");
@@ -2569,9 +2572,10 @@ patterns = ['^\.тф']
             input
                 .auto_switch
                 .dictionaries
-                .learned
-                .count(&us, word, false),
-            12
+                .comparison(word, &us, false)
+                .unwrap()
+                .learned_difference(),
+            (std::cmp::Ordering::Less, 12)
         );
         tap_keys(&mut input, [K::KEY_SLASH, K::KEY_SLASH]);
         let word = input.latest_word().unwrap();
@@ -2579,9 +2583,10 @@ patterns = ['^\.тф']
             input
                 .auto_switch
                 .dictionaries
-                .learned
-                .count(&us, word, true),
-            5
+                .comparison(word, &us, true)
+                .unwrap()
+                .learned_difference(),
+            (std::cmp::Ordering::Less, 5)
         );
         assert_eq!(us.to_text(word.strokes()).as_deref(), Ok("/new//"));
     }
@@ -3510,10 +3515,10 @@ patterns = ['^\.тф']
         assert!(input.switch_request().is_none());
 
         press(&mut input, KeyCode::KEY_P);
-        assert!(input.pending.is_dictionary());
+        assert_eq!(input.automatic_target().unwrap().name(), "us");
         let word = input.latest_word().unwrap();
         assert_eq!(word.trailing_spaces, 0);
-        assert_eq!(word.dictionary_prefixes[0].len(), 2);
+        assert_eq!(layout("us").to_text(word.strokes()).as_deref(), Ok("ap"));
     }
 
     #[test]
@@ -3837,8 +3842,6 @@ threshold = 7.0
 
     #[test]
     fn dictionary_backspace_restores_missing_prefix_and_previous_word() {
-        use crate::dictionary::Prefix;
-
         let mut input = auto_input_with_patterns("");
         input.auto_switch.dictionaries = crate::dictionary::test_dictionaries([
             ("us", "", "cats 7", 5.0),
@@ -3852,7 +3855,6 @@ threshold = 7.0
             keypress(&mut input, key);
             assert!(input.pending.is_dictionary());
         }
-        let existing = input.latest_word().unwrap().dictionary_prefixes[0].clone();
         for key in [
             KeyCode::KEY_DOT,
             KeyCode::KEY_1,
@@ -3861,22 +3863,25 @@ threshold = 7.0
         ] {
             keypress(&mut input, key);
         }
+        let us = layout("us");
+        let prefix_score = |input: &Input| {
+            input
+                .auto_switch
+                .dictionaries
+                .comparison(input.latest_word().unwrap(), &us, false)
+                .unwrap()
+                .current_base_score
+        };
         keypress(&mut input, KeyCode::KEY_BACKSPACE);
-        assert_eq!(
-            &input.latest_word().unwrap().dictionary_prefixes[0][3..],
-            &[Prefix::Missing, Prefix::Missing],
-        );
+        let word = input.latest_word().unwrap();
+        assert_eq!(us.to_text(word.strokes()).as_deref(), Ok("cat.1"));
+        assert_eq!(word.trailing_spaces, 1);
         keypress(&mut input, KeyCode::KEY_BACKSPACE); // Space
+        assert_eq!(prefix_score(&input), f64::NEG_INFINITY);
         keypress(&mut input, KeyCode::KEY_BACKSPACE); // Digit
-        assert_eq!(
-            input.latest_word().unwrap().dictionary_prefixes[0][3],
-            Prefix::Missing
-        );
+        assert_eq!(prefix_score(&input), f64::NEG_INFINITY);
         keypress(&mut input, KeyCode::KEY_BACKSPACE); // Punctuation
-        assert_eq!(
-            input.latest_word().unwrap().dictionary_prefixes[0],
-            existing
-        );
+        assert_eq!(prefix_score(&input), 0.0);
         assert!(input.pending.is_none());
         keypress(&mut input, KeyCode::KEY_S);
         assert_eq!(input.automatic_target().unwrap().name(), "us");
@@ -3936,8 +3941,6 @@ threshold = 7.0
 
     #[test]
     fn dictionary_conversion_failure_survives_until_the_stroke_is_removed() {
-        use crate::dictionary::Prefix;
-
         let mut input = auto_input_with_patterns("");
         input.auto_switch.dictionaries = crate::dictionary::test_dictionaries([
             ("us", "intl", "apple 1", 5.0),
@@ -3949,9 +3952,12 @@ threshold = 7.0
         press(&mut input, KeyCode::KEY_P);
         let word = input.latest_word().unwrap();
         assert!(!word.has_dead_key);
-        assert_eq!(
-            &word.dictionary_prefixes[0][1..],
-            &[Prefix::ConversionFailed; 2]
+        assert!(
+            input
+                .auto_switch
+                .dictionaries
+                .comparison(word, &layout("ru"), false)
+                .is_none()
         );
         assert!(input.pending.is_none());
         for _ in 0..2 {

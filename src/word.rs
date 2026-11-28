@@ -1,4 +1,3 @@
-use crate::dictionary::{DictionaryAutoSwitch, Prefix};
 use evdev::KeyCode;
 use std::fmt;
 use std::sync::Arc;
@@ -23,7 +22,6 @@ pub struct Word {
     pub trailing_spaces: usize,
     pub(crate) leading_punctuation: usize,
     pub(crate) trailing_punctuation: usize,
-    pub(crate) dictionary_prefixes: Vec<Vec<Prefix>>,
     pub(crate) has_dead_key: bool,
     pub(crate) chain_member: Option<ChainMember>,
     pub(crate) is_range_corrected: bool,
@@ -36,19 +34,10 @@ pub struct WordStroke {
 }
 
 impl Word {
-    pub(crate) fn push_stroke(&mut self, entry: WordStroke, dictionaries: &DictionaryAutoSwitch) {
-        dictionaries.push_prefixes(&mut self.dictionary_prefixes, &entry.stroke);
-        self.entries.push(entry);
-    }
-
     pub(crate) fn pop_stroke(&mut self) {
         if self.trailing_punctuation > 0 {
             self.trailing_punctuation -= 1;
-        } else if self.has_search_text() {
-            for stack in &mut self.dictionary_prefixes {
-                stack.pop();
-            }
-        } else {
+        } else if !self.has_search_text() {
             self.leading_punctuation -= 1;
         }
         self.entries.pop();

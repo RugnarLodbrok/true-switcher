@@ -513,7 +513,6 @@ mod tests {
         let ru = Arc::new(layout::Layout::new("ru", "", "pc105", ""));
         let mut punctuation = crate::punctuation::Punctuation::new(r"[`~<>\p{P}]+").unwrap();
         punctuation.update_layouts(vec![us.clone(), (*ru).clone()]);
-        let dictionaries = crate::dictionary::DictionaryAutoSwitch::default();
         let now = Instant::now();
         let completed = CorrectionOutcome::Completed {
             started_at: now,
@@ -523,15 +522,9 @@ mod tests {
             [(K::KEY_SLASH, false, "new"), (K::KEY_COMMA, true, "<new")]
         {
             let mut history = crate::history::History::default();
-            history.process(
-                first,
-                is_shift,
-                Some(ru.clone()),
-                &dictionaries,
-                &punctuation,
-            );
+            history.process(first, is_shift, Some(ru.clone()), &punctuation);
             for key in [K::KEY_N, K::KEY_E, K::KEY_W, K::KEY_SLASH] {
-                history.process(key, false, Some(ru.clone()), &dictionaries, &punctuation);
+                history.process(key, false, Some(ru.clone()), &punctuation);
             }
             let correction = Correction::from_request(
                 input::SwitchRequest {

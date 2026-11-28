@@ -3,8 +3,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use crate::layout::Layout;
-use crate::word::{WORD_END, Word};
+use crate::word::WORD_END;
 
 type Counts = BTreeMap<String, BTreeMap<String, i64>>;
 pub(crate) const FILE_NAME: &str = "learned-rules.toml";
@@ -76,25 +75,8 @@ impl LearnedRules {
             .collect();
     }
 
-    pub(crate) fn count(&self, layout: &Layout, word: &Word, is_word_end: bool) -> u128 {
-        if !word.has_search_text() {
-            return 0;
-        }
-        self.tries
-            .get(layout.name())
-            .and_then(|trie| {
-                let node = word.search_strokes().try_fold(0, |node, stroke| {
-                    let text = crate::xkb::stroke_text(layout, stroke).ok()?;
-                    trie.advance(node, &text)
-                })?;
-                let node = if is_word_end {
-                    trie.advance(node, WORD_END)?
-                } else {
-                    node
-                };
-                Some(trie.nodes[node].count)
-            })
-            .unwrap_or_default()
+    pub(crate) fn trie(&self, layout: &str) -> Option<&LearnedTrie> {
+        self.tries.get(layout)
     }
 
     pub(crate) fn increment(&mut self, layout: &str, word: &str) -> io::Result<()> {
@@ -138,7 +120,7 @@ struct LearnedNode {
     children: BTreeMap<char, usize>,
 }
 
-struct LearnedTrie {
+pub(crate) struct LearnedTrie {
     nodes: Vec<LearnedNode>,
 }
 
@@ -175,7 +157,13 @@ impl LearnedTrie {
         }
     }
 
-    fn advance(&self, mut node: usize, text: &str) -> Option<usize> {
+    pub(crate) fn count(&self, text: &str) -> u128 {
+        self.find_node(text)
+            .map_or(0, |node| self.nodes[node].count)
+    }
+
+    fn find_node(&self, text: &str) -> Option<usize> {
+        let mut node = 0;
         for character in text.chars().flat_map(char::to_lowercase) {
             node = *self.nodes[node].children.get(&character)?;
         }
@@ -186,6 +174,7 @@ impl LearnedTrie {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::Layout;
 
     #[test]
     fn persists_lowercase_counts_for_each_layout_with_quoted_keys() {
@@ -235,7 +224,7 @@ mod tests {
 
         let indexed_count = |rules: &LearnedRules, key: &str| {
             let trie = &rules.tries["us"];
-            trie.advance(0, key).map(|node| trie.nodes[node].count)
+            trie.find_node(key).map(|node| trie.nodes[node].count)
         };
         assert_eq!(indexed_count(&rules, "new "), Some(5));
         assert_eq!(indexed_count(&rules, "/new "), None);
@@ -268,31 +257,17 @@ mod tests {
 
     #[test]
     fn finds_shared_prefixes_and_exact_words_after_loading_and_updating() {
-        use crate::word::{Stroke, WordStroke};
-        use evdev::KeyCode;
-
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join(FILE_NAME);
         fs::write(&path, "[ru]\n\"кот\" = 2\n\"котик\" = 3\n").unwrap();
         let mut rules = LearnedRules::load(path).unwrap();
-        let layout = Layout::new("ru", "", "", "");
-        let word = |keys: &[KeyCode]| Word {
-            entries: keys
-                .iter()
-                .map(|&key| WordStroke {
-                    stroke: Stroke { key, shift: true },
-                    layout: None,
-                })
-                .collect(),
-            ..Word::default()
-        };
-        let cat = word(&[KeyCode::KEY_R, KeyCode::KEY_J, KeyCode::KEY_N]);
-        let unrelated = word(&[KeyCode::KEY_U]);
-        assert_eq!(rules.count(&layout, &cat, false), 5);
-        assert_eq!(rules.count(&layout, &cat, true), 2);
-        assert_eq!(rules.count(&layout, &unrelated, false), 0);
+        let trie = rules.trie("ru").unwrap();
+        assert_eq!(trie.count("КОТ"), 5);
+        assert_eq!(trie.count("КОТ "), 2);
+        assert_eq!(trie.count("г"), 0);
         rules.increment("ru", "кот").unwrap();
-        assert_eq!(rules.count(&layout, &cat, false), 6);
-        assert_eq!(rules.count(&layout, &cat, true), 3);
+        let trie = rules.trie("ru").unwrap();
+        assert_eq!(trie.count("КОТ"), 6);
+        assert_eq!(trie.count("КОТ "), 3);
     }
 }

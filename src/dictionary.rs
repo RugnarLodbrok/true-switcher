@@ -1,27 +1,30 @@
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::io::{self, BufRead, BufReader};
 use std::ops::Range;
+use std::path::Path;
 use std::sync::Arc;
 
 use regex::Regex;
 
 use crate::config::Configuration;
 use crate::layout::Layout;
-use crate::word::{Stroke, WORD_END, Word};
+use crate::learned_rules::{LearnedRules, LearnedTrie};
+use crate::word::{WORD_END, Word};
 
 pub(crate) const DICTIONARY_COUNT: usize = 2;
+
+pub(crate) enum DictionaryLoadProgress {
+    Reading { bytes_read: u64, total_bytes: u64 },
+    BuildingIndex,
+}
+
+pub(crate) type DictionaryLoadObserver<'a> = dyn FnMut(&Path, DictionaryLoadProgress) + 'a;
 
 // Give learned-only matches the weight of a rare token (about 1 in 262,000).
 // A fixed log2 probability keeps this weight independent of dictionary frequency units.
 const LEARNED_BASE_SCORE: f64 = -18.0;
 const AMBIGUOUS_WORD_DSCORE_MULTIPLIER: f64 = 1.0;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Prefix {
-    Node(usize),
-    Missing,
-    ConversionFailed,
-}
 
 struct Node<T> {
     value: T,
@@ -39,13 +42,40 @@ struct DictionaryTrie {
 }
 
 impl DictionaryTrie {
+    #[cfg(test)]
     fn read(input: impl BufRead, skip_pattern: Option<&Regex>) -> io::Result<Self> {
+        Self::read_with_progress(input, skip_pattern, 0, |_| {})
+    }
+
+    fn read_with_progress(
+        mut input: impl BufRead,
+        skip_pattern: Option<&Regex>,
+        total_bytes: u64,
+        mut report: impl FnMut(DictionaryLoadProgress),
+    ) -> io::Result<Self> {
         let mut records = Vec::new();
         let mut total = 0_u64;
-        for (index, line) in input.lines().enumerate() {
-            let line = line?;
+        let mut line = String::new();
+        let mut line_number = 0;
+        let mut bytes_read = 0;
+        report(DictionaryLoadProgress::Reading {
+            bytes_read,
+            total_bytes,
+        });
+        loop {
+            line.clear();
+            let consumed = input.read_line(&mut line)?;
+            if consumed == 0 {
+                break;
+            }
+            line_number += 1;
+            bytes_read += consumed as u64;
+            report(DictionaryLoadProgress::Reading {
+                bytes_read,
+                total_bytes,
+            });
             let (word, frequency) = parse_record(&line).ok_or_else(|| {
-                invalid(format!("Invalid dictionary record on line {}", index + 1))
+                invalid(format!("Invalid dictionary record on line {line_number}"))
             })?;
             if skip_pattern.is_some_and(|pattern| pattern.is_match(word)) {
                 continue;
@@ -58,6 +88,7 @@ impl DictionaryTrie {
         if total == 0 {
             return Err(invalid("Dictionary frequency sum must be positive"));
         }
+        report(DictionaryLoadProgress::BuildingIndex);
         records.sort_unstable_by(|left, right| left.0.cmp(&right.0));
         if let Some(duplicate) = records.windows(2).find(|pair| pair[0].0 == pair[1].0) {
             return Err(invalid(format!(
@@ -118,36 +149,17 @@ impl DictionaryTrie {
         Self { nodes, transitions }
     }
 
-    fn advance(&self, prefix: Prefix, text: &str) -> Prefix {
-        let Prefix::Node(mut node) = prefix else {
-            return prefix;
-        };
+    fn score(&self, text: &str) -> f64 {
+        let mut node = 0;
         for character in text.chars().flat_map(char::to_lowercase) {
             let transitions = &self.transitions[self.nodes[node].transitions.clone()];
             let Ok(index) = transitions.binary_search_by_key(&character, |edge| edge.character)
             else {
-                return Prefix::Missing;
+                return f64::NEG_INFINITY;
             };
             node = transitions[index].child;
         }
-        Prefix::Node(node)
-    }
-
-    fn score(&self, prefix: Prefix) -> Option<f64> {
-        match prefix {
-            Prefix::Node(index) => Some(self.nodes[index].value),
-            Prefix::Missing => Some(f64::NEG_INFINITY),
-            Prefix::ConversionFailed => None,
-        }
-    }
-
-    fn word_score(&self, prefix: Prefix, is_word_end: bool) -> Option<f64> {
-        let prefix = if is_word_end {
-            self.advance(prefix, WORD_END)
-        } else {
-            prefix
-        };
-        self.score(prefix)
+        self.nodes[node].value
     }
 }
 
@@ -194,14 +206,37 @@ struct Dictionary {
     threshold: f64,
 }
 
-struct DictionaryComparison<'a> {
+struct LayoutIndexes<'a> {
+    dictionary: &'a DictionaryTrie,
+    learned: Option<&'a LearnedTrie>,
+}
+
+impl LayoutIndexes<'_> {
+    fn score(&self, key: &str) -> (f64, u128) {
+        (
+            self.dictionary.score(key),
+            self.learned.map_or(0, |trie| trie.count(key)),
+        )
+    }
+}
+
+pub(crate) struct DictionaryComparison<'a> {
     current_threshold: f64,
     alternative_dictionary: &'a Dictionary,
-    delta_score: f64,
-    current_base_score: f64,
-    alternative_base_score: f64,
+    pub(crate) delta_score: f64,
+    pub(crate) current_base_score: f64,
+    pub(crate) alternative_base_score: f64,
     learned_current: u128,
     learned_alternative: u128,
+}
+
+impl DictionaryComparison<'_> {
+    pub(crate) fn learned_difference(&self) -> (Ordering, u128) {
+        (
+            self.learned_alternative.cmp(&self.learned_current),
+            self.learned_alternative.abs_diff(self.learned_current),
+        )
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -226,7 +261,7 @@ pub(crate) struct DictionaryAutoSwitch {
     ambiguity_score_floor: Option<f64>,
     full_punctuation: Option<Regex>,
     leading_punctuation: Option<Regex>,
-    pub(crate) learned: crate::learned_rules::LearnedRules,
+    pub(crate) learned: LearnedRules,
 }
 
 impl DictionaryAutoSwitch {
@@ -234,6 +269,15 @@ impl DictionaryAutoSwitch {
         settings: &Configuration,
         resolve: impl Fn(&str) -> io::Result<Arc<Layout>>,
         layout_count: impl FnOnce() -> io::Result<usize>,
+    ) -> io::Result<Self> {
+        Self::load_with_progress(settings, resolve, layout_count, None)
+    }
+
+    pub(crate) fn load_with_progress(
+        settings: &Configuration,
+        resolve: impl Fn(&str) -> io::Result<Arc<Layout>>,
+        layout_count: impl FnOnce() -> io::Result<usize>,
+        mut observer: Option<&mut DictionaryLoadObserver<'_>>,
     ) -> io::Result<Self> {
         if settings.dict.len() != DICTIONARY_COUNT
             && (settings.auto_switch || !settings.dict.is_empty())
@@ -267,7 +311,22 @@ impl DictionaryAutoSwitch {
             }
             let target = resolve(&setting.target)?;
             let trie = std::fs::File::open(&setting.file)
-                .and_then(|file| DictionaryTrie::read(BufReader::new(file), skip_pattern.as_ref()))
+                .and_then(|file| {
+                    let total_bytes = observer
+                        .as_ref()
+                        .and_then(|_| file.metadata().ok())
+                        .map_or(0, |metadata| metadata.len());
+                    DictionaryTrie::read_with_progress(
+                        BufReader::new(file),
+                        skip_pattern.as_ref(),
+                        total_bytes,
+                        |progress| {
+                            if let Some(report) = observer.as_deref_mut() {
+                                report(&setting.file, progress);
+                            }
+                        },
+                    )
+                })
                 .map_err(|error| invalid(format!("{}: {error}", setting.file.display())))?;
             dictionaries.push(Dictionary {
                 target,
@@ -288,53 +347,49 @@ impl DictionaryAutoSwitch {
         self.dictionaries.len() == DICTIONARY_COUNT
     }
 
-    pub(crate) fn push_prefixes(&self, prefixes: &mut Vec<Vec<Prefix>>, stroke: &Stroke) {
-        prefixes.resize_with(self.dictionaries.len(), Vec::new);
-        for (dictionary, stack) in self.dictionaries.iter().zip(prefixes) {
-            let previous = stack.last().copied().unwrap_or(Prefix::Node(0));
-            let next = if previous == Prefix::ConversionFailed {
-                previous
-            } else {
-                match crate::xkb::stroke_text(&dictionary.target, stroke) {
-                    Ok(text) => dictionary.trie.advance(previous, &text),
-                    Err(_) => Prefix::ConversionFailed,
-                }
-            };
-            stack.push(next);
-        }
+    pub(crate) fn layout_pair(&self) -> Option<[&Arc<Layout>; DICTIONARY_COUNT]> {
+        let [first, second] = self.dictionaries.as_slice() else {
+            return None;
+        };
+        Some([&first.target, &second.target])
+    }
+
+    pub(crate) fn threshold(&self, layout: &Layout) -> Option<f64> {
+        self.dictionaries
+            .iter()
+            .find(|dictionary| dictionary.target.name() == layout.name())
+            .map(|dictionary| dictionary.threshold)
     }
 
     fn layout_score(&self, word: &Word, index: usize, is_word_end: bool) -> Option<(f64, u128)> {
-        let dictionary = &self.dictionaries[index];
-        let prefix = *word.dictionary_prefixes.get(index)?.last()?;
-        let mut score = dictionary.trie.word_score(prefix, is_word_end)?;
-        if let Some(remainder_score) =
-            self.punctuation_remainder_score(word, dictionary, is_word_end)
-        {
-            score = score.max(remainder_score);
+        if !word.has_search_text() {
+            return None;
         }
-        let learned = self.learned.count(&dictionary.target, word, is_word_end);
+        let dictionary = &self.dictionaries[index];
+        let mut text = crate::xkb::strokes_text(&dictionary.target, word.search_strokes()).ok()?;
+        let indexes = LayoutIndexes {
+            dictionary: &dictionary.trie,
+            learned: self.learned.trie(dictionary.target.name()),
+        };
+        let remainder_start = self.punctuation_remainder_start(&text);
+        if is_word_end {
+            text.push_str(WORD_END);
+        }
+        let (score, learned) = indexes.score(&text);
+        if let Some(start) = remainder_start {
+            let (remainder_score, remainder_learned) = indexes.score(&text[start..]);
+            return Some((score.max(remainder_score), learned.max(remainder_learned)));
+        }
         Some((score, learned))
     }
 
-    fn punctuation_remainder_score(
-        &self,
-        word: &Word,
-        dictionary: &Dictionary,
-        is_word_end: bool,
-    ) -> Option<f64> {
+    fn punctuation_remainder_start(&self, text: &str) -> Option<usize> {
         let pattern = self.leading_punctuation.as_ref()?;
-        let text = dictionary.target.to_text(word.search_strokes()).ok()?;
-        let matched = pattern.find(&text)?;
-        if matched.is_empty() || matched.end() == text.len() {
-            return None;
-        }
-        let trie = &dictionary.trie;
-        let prefix = trie.advance(Prefix::Node(0), &text[matched.end()..]);
-        trie.word_score(prefix, is_word_end)
+        let matched = pattern.find(text)?;
+        (!matched.is_empty() && matched.end() < text.len()).then_some(matched.end())
     }
 
-    fn comparison(
+    pub(crate) fn comparison(
         &self,
         word: &Word,
         current: &Layout,
@@ -453,17 +508,11 @@ impl DictionaryAutoSwitch {
             return;
         }
 
-        let learned = comparison
-            .learned_alternative
-            .abs_diff(comparison.learned_current);
+        let (ordering, learned) = comparison.learned_difference();
         let correction = if learned == 0 {
             String::new()
         } else {
-            let sign = if comparison.learned_alternative > comparison.learned_current {
-                '+'
-            } else {
-                '-'
-            };
+            let sign = if ordering.is_gt() { '+' } else { '-' };
             format!(" {sign} {learned:2}")
         };
         log::debug!(
@@ -504,10 +553,52 @@ pub(crate) fn test_dictionaries(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::word::{Stroke, WordStroke};
     use evdev::KeyCode;
 
     fn trie(records: &str) -> DictionaryTrie {
         DictionaryTrie::read(records.as_bytes(), None).unwrap()
+    }
+
+    #[test]
+    fn reports_consumed_bytes_including_skipped_records_and_line_endings() {
+        let skipped = "skip 1\r\n";
+        let records = format!("{skipped}слово 2\nlast 3");
+        let total = records.len() as u64;
+        let mut events = Vec::new();
+        let skip_pattern = Regex::new("^skip$").unwrap();
+        DictionaryTrie::read_with_progress(
+            records.as_bytes(),
+            Some(&skip_pattern),
+            total,
+            |progress| events.push(progress),
+        )
+        .unwrap();
+
+        let (building, reading) = events.split_last().unwrap();
+        assert!(matches!(building, DictionaryLoadProgress::BuildingIndex));
+        let bytes_read: Vec<_> = reading
+            .iter()
+            .map(|event| match event {
+                DictionaryLoadProgress::Reading {
+                    bytes_read,
+                    total_bytes,
+                } => {
+                    assert_eq!(*total_bytes, total);
+                    *bytes_read
+                }
+                DictionaryLoadProgress::BuildingIndex => panic!("expected reading progress"),
+            })
+            .collect();
+        assert_eq!(
+            bytes_read,
+            [
+                0,
+                skipped.len() as u64,
+                total - "last 3".len() as u64,
+                total,
+            ]
+        );
     }
 
     #[test]
@@ -517,18 +608,11 @@ mod tests {
             "all 20\nкот 10\na 20\nкоты 30\n",
         ] {
             let trie = trie(records);
-            let root = Prefix::Node(0);
-            assert_eq!(trie.score(trie.advance(root, "КО")), Some(-1.0));
-            assert_eq!(trie.score(trie.advance(root, "кот")), Some(-1.0));
-            assert_eq!(
-                trie.score(trie.advance(root, "коты")),
-                Some(0.375_f64.log2())
-            );
-            assert_eq!(trie.score(trie.advance(root, "AL")), Some(-2.0));
-            assert_eq!(
-                trie.score(trie.advance(root, "кот#")),
-                Some(f64::NEG_INFINITY)
-            );
+            assert_eq!(trie.score("КО"), -1.0);
+            assert_eq!(trie.score("кот"), -1.0);
+            assert_eq!(trie.score("коты"), 0.375_f64.log2());
+            assert_eq!(trie.score("AL"), -2.0);
+            assert_eq!(trie.score("кот#"), f64::NEG_INFINITY);
             for node in &trie.nodes {
                 assert!(
                     trie.transitions[node.transitions.clone()]
@@ -542,10 +626,7 @@ mod tests {
     #[test]
     fn loads_capitalized_words_without_a_skip_pattern() {
         let trie = trie("abc1 5\nApple 10\n");
-        assert_eq!(
-            trie.score(trie.advance(Prefix::Node(0), "abc1 ")),
-            Some((5.0_f64 / 15.0).log2())
-        );
+        assert_eq!(trie.score("abc1 "), (5.0_f64 / 15.0).log2());
         assert_eq!(trie.transitions[0].character, 'A');
     }
 
@@ -554,11 +635,10 @@ mod tests {
         let pattern = compile_full_match_pattern(r".*\p{Lu}.*", "dict_skip_pattern").unwrap();
         let records = "cat 2\nCat 18446744073709551615\ncoDe 4\nКОТ 3\nмир 6\n";
         let trie = DictionaryTrie::read(records.as_bytes(), pattern.as_ref()).unwrap();
-        let root = Prefix::Node(0);
-        assert_eq!(trie.score(trie.advance(root, "CAT")), Some(-2.0));
-        assert_eq!(trie.score(trie.advance(root, "мир")), Some(0.75_f64.log2()));
-        assert_eq!(trie.advance(root, "code"), Prefix::Missing);
-        assert_eq!(trie.advance(root, "кот"), Prefix::Missing);
+        assert_eq!(trie.score("CAT"), -2.0);
+        assert_eq!(trie.score("мир"), 0.75_f64.log2());
+        assert_eq!(trie.score("code"), f64::NEG_INFINITY);
+        assert_eq!(trie.score("кот"), f64::NEG_INFINITY);
     }
 
     #[test]
@@ -608,13 +688,8 @@ mod tests {
         ] {
             let skip_pattern = compile_full_match_pattern(pattern, "dict_skip_pattern").unwrap();
             let trie = DictionaryTrie::read(records.as_bytes(), skip_pattern.as_ref()).unwrap();
-            let root = Prefix::Node(0);
-            assert_eq!(trie.advance(root, skipped), Prefix::Missing, "{pattern:?}");
-            assert_eq!(
-                trie.score(trie.advance(root, retained)),
-                Some(probability.log2()),
-                "{pattern:?}"
-            );
+            assert_eq!(trie.score(skipped), f64::NEG_INFINITY, "{pattern:?}");
+            assert_eq!(trie.score(retained), probability.log2(), "{pattern:?}");
         }
     }
 
@@ -653,14 +728,8 @@ mod tests {
             (&dictionaries.dictionaries[0], "abc1", "apple "),
             (&dictionaries.dictionaries[1], "абв2", "абрикос "),
         ] {
-            let root = Prefix::Node(0);
-            assert_eq!(dictionary.trie.advance(root, skipped), Prefix::Missing);
-            assert_eq!(
-                dictionary
-                    .trie
-                    .score(dictionary.trie.advance(root, retained)),
-                Some(0.0)
-            );
+            assert_eq!(dictionary.trie.score(skipped), f64::NEG_INFINITY);
+            assert_eq!(dictionary.trie.score(retained), 0.0);
         }
     }
 
@@ -731,8 +800,7 @@ mod tests {
             ("punctuation = ''", true),
         ] {
             let dictionaries = load_dictionaries_with_settings(settings, "cat 1", "ёж 1").unwrap();
-            let mut word =
-                word_from_keys(&dictionaries, &[KeyCode::KEY_GRAVE, KeyCode::KEY_SEMICOLON]);
+            let mut word = word_from_keys(&[KeyCode::KEY_GRAVE, KeyCode::KEY_SEMICOLON]);
             for is_first_space in [false, true] {
                 word.trailing_spaces = usize::from(is_first_space);
                 assert_eq!(
@@ -747,22 +815,19 @@ mod tests {
         }
     }
 
-    fn word_from_keys(dictionaries: &DictionaryAutoSwitch, keys: &[KeyCode]) -> Word {
+    fn word_from_keys(keys: &[KeyCode]) -> Word {
         let mut word = Word::default();
         for &key in keys {
-            push_key(&mut word, dictionaries, Stroke { key, shift: false });
+            push_key(&mut word, Stroke { key, shift: false });
         }
         word
     }
 
-    fn push_key(word: &mut Word, dictionaries: &DictionaryAutoSwitch, stroke: Stroke) {
-        word.push_stroke(
-            crate::word::WordStroke {
-                stroke,
-                layout: None,
-            },
-            dictionaries,
-        );
+    fn push_key(word: &mut Word, stroke: Stroke) {
+        word.entries.push(WordStroke {
+            stroke,
+            layout: None,
+        });
     }
 
     #[test]
@@ -774,15 +839,12 @@ mod tests {
         ] {
             let dictionaries =
                 test_dictionaries([("us", "", records, 5.0), ("ru", "", "юпше 1", 5.0)]);
-            let word = word_from_keys(
-                &dictionaries,
-                &[
-                    KeyCode::KEY_DOT,
-                    KeyCode::KEY_G,
-                    KeyCode::KEY_I,
-                    KeyCode::KEY_T,
-                ],
-            );
+            let word = word_from_keys(&[
+                KeyCode::KEY_DOT,
+                KeyCode::KEY_G,
+                KeyCode::KEY_I,
+                KeyCode::KEY_T,
+            ]);
             assert_eq!(
                 dictionaries.layout_score(&word, 0, false),
                 Some((prefix_score, 0))
@@ -846,7 +908,7 @@ mod tests {
             ),
         ] {
             let dictionaries = load_dictionaries_with_settings(settings, "git 1", "кот 1").unwrap();
-            let word = word_from_keys(&dictionaries, keys);
+            let word = word_from_keys(keys);
             for is_first_space in [false, true] {
                 assert_eq!(
                     dictionaries.layout_score(&word, 0, is_first_space),
@@ -857,64 +919,77 @@ mod tests {
     }
 
     #[test]
-    fn leading_punctuation_affects_both_layout_scores_but_learned_counts_use_the_full_token() {
+    fn comparison_maximizes_the_dictionary_score_and_learned_count_independently() {
+        use KeyCode as K;
+        use std::cmp::Ordering::Less;
+
         let us = Layout::new("us", "", "", "");
         let ru = Layout::new("ru", "", "", "");
-        let mut dictionaries =
-            test_dictionaries([("us", "", "git 1", 5.0), ("ru", "", "юпше 1\nя 255", 5.0)]);
-        let word = word_from_keys(
-            &dictionaries,
-            &[
-                KeyCode::KEY_DOT,
-                KeyCode::KEY_G,
-                KeyCode::KEY_I,
-                KeyCode::KEY_T,
-            ],
-        );
+        let mut dictionaries = test_dictionaries([
+            ("us", "", ";git 1\ngit 2\ngithub 5", 5.0),
+            ("ru", "", "жпше 1\nя 7", 5.0),
+        ]);
+        let word = word_from_keys(&[K::KEY_SEMICOLON, K::KEY_G, K::KEY_I, K::KEY_T]);
 
-        dictionaries.learned.increment("us", "git").unwrap();
-        for is_first_space in [false, true] {
-            assert_eq!(
-                dictionaries
-                    .comparison(&word, &us, is_first_space)
-                    .unwrap()
-                    .delta_score,
-                -8.0
-            );
-            assert_eq!(
-                dictionaries
-                    .comparison(&word, &ru, is_first_space)
-                    .unwrap()
-                    .delta_score,
-                8.0
-            );
+        for key in ["git", "git", "github", "github", "github"] {
+            dictionaries.learned.increment("us", key).unwrap();
         }
-
-        dictionaries.learned.increment("us", ".git").unwrap();
-        for is_first_space in [false, true] {
-            assert_eq!(
-                dictionaries
-                    .comparison(&word, &us, is_first_space)
-                    .unwrap()
-                    .delta_score,
-                -9.0
-            );
-            assert_eq!(
-                dictionaries
-                    .comparison(&word, &ru, is_first_space)
-                    .unwrap()
-                    .delta_score,
-                9.0
-            );
+        for (repetitions, prefix_count, exact_count) in [(1, 5, 2), (5, 6, 6)] {
+            for _ in 0..repetitions {
+                dictionaries.learned.increment("us", ";git").unwrap();
+            }
+            for (is_word_end, us_score, count) in [
+                (false, 0.875_f64.log2(), prefix_count),
+                (true, -2.0, exact_count),
+            ] {
+                let comparison = dictionaries.comparison(&word, &us, is_word_end).unwrap();
+                assert_eq!(comparison.current_base_score, us_score);
+                assert_eq!(comparison.alternative_base_score, -3.0);
+                assert_eq!(comparison.learned_difference(), (Less, count));
+                assert_eq!(comparison.delta_score, -3.0 - us_score - count as f64);
+                let reverse = dictionaries.comparison(&word, &ru, is_word_end).unwrap();
+                assert_eq!(reverse.delta_score, -comparison.delta_score);
+            }
         }
     }
 
     #[test]
     fn terminal_space_matches_only_the_complete_word() {
         let trie = trie("cat 2\ncats 6\ndog 8");
-        let prefix = trie.advance(Prefix::Node(0), "cat");
-        assert_eq!(trie.score(prefix), Some(-1.0));
-        assert_eq!(trie.score(trie.advance(prefix, WORD_END)), Some(-3.0));
+        assert_eq!(trie.score("cat"), -1.0);
+        assert_eq!(trie.score("cat "), -3.0);
+    }
+
+    #[test]
+    fn layout_indexes_score_the_same_key_in_both_tries() {
+        let dictionary = trie("cat 2\ncats 6\ndog 8");
+        let mut learned = LearnedRules::default();
+        learned.increment("us", "cat").unwrap();
+        learned.increment("us", "cats").unwrap();
+        let indexes = LayoutIndexes {
+            dictionary: &dictionary,
+            learned: learned.trie("us"),
+        };
+        assert_eq!(indexes.score("CAT"), (-1.0, 2));
+        assert_eq!(indexes.score("CAT "), (-3.0, 1));
+        assert_eq!(indexes.score("CATZ"), (f64::NEG_INFINITY, 0));
+    }
+
+    #[test]
+    fn comparison_is_unavailable_when_a_search_stroke_cannot_be_converted() {
+        let dictionaries =
+            test_dictionaries([("us", "intl", "apple 1", 5.0), ("ru", "", "я 1", 5.0)]);
+        let word = word_from_keys(&[KeyCode::KEY_A, KeyCode::KEY_APOSTROPHE]);
+        for (name, variant) in [("us", "intl"), ("ru", "")] {
+            let current = Layout::new(name, variant, "", "");
+            for is_word_end in [false, true] {
+                assert!(
+                    dictionaries
+                        .comparison(&word, &current, is_word_end)
+                        .is_none()
+                );
+            }
+        }
     }
 
     #[test]
@@ -929,7 +1004,7 @@ mod tests {
             (KeyCode::KEY_A, 2.0, None),
             (KeyCode::KEY_P, 6.0, Some("us")),
         ] {
-            push_key(&mut word, &dictionaries, Stroke { key, shift: false });
+            push_key(&mut word, Stroke { key, shift: false });
             assert_eq!(
                 dictionaries
                     .comparison(&word, &current, false)
@@ -951,8 +1026,8 @@ mod tests {
             ("ru", "", "ф 4\nи 1\nя 1048571", 2.0),
         ]);
         let us = Layout::new("us", "", "", "");
-        let a = word_from_keys(&dictionaries, &[KeyCode::KEY_A]);
-        let b = word_from_keys(&dictionaries, &[KeyCode::KEY_B]);
+        let a = word_from_keys(&[KeyCode::KEY_A]);
+        let b = word_from_keys(&[KeyCode::KEY_B]);
         for (word, delta_score) in [(&a, 2.0), (&b, -2.0)] {
             assert_eq!(dictionaries.decision(word, &us, false, |_| 0.0), Keep);
             assert_eq!(
@@ -999,8 +1074,8 @@ mod tests {
         let mut dictionaries =
             test_dictionaries([("us", "", "a 1\nz 131071", 2.0), ("ru", "", "я 1", 2.0)]);
         let us = Layout::new("us", "", "", "");
-        let a = word_from_keys(&dictionaries, &[KeyCode::KEY_A]);
-        let missing = word_from_keys(&dictionaries, &[KeyCode::KEY_B]);
+        let a = word_from_keys(&[KeyCode::KEY_A]);
+        let missing = word_from_keys(&[KeyCode::KEY_B]);
         assert_eq!(dictionaries.decision(&a, &us, true, |_| 0.0), Keep);
         assert_eq!(dictionaries.decision(&missing, &us, true, |_| 3.0), Keep);
 
@@ -1034,7 +1109,7 @@ mod tests {
                     ("ru", "", "ф 1\nи 8", thresholds("ru")),
                 ]);
                 let mut word = Word::default();
-                push_key(&mut word, &dictionaries, Stroke { key, shift: true });
+                push_key(&mut word, Stroke { key, shift: true });
                 let target = dictionaries.target(&word, &Layout::new(source, "", "", ""), false);
                 assert_eq!(target.as_deref().map(Layout::name), expected);
             }
@@ -1052,7 +1127,7 @@ mod tests {
             (KeyCode::KEY_X, Some(0.0), None),
         ] {
             let mut word = Word::default();
-            push_key(&mut word, &dictionaries, Stroke { key, shift: false });
+            push_key(&mut word, Stroke { key, shift: false });
             assert_eq!(
                 dictionaries
                     .comparison(&word, &current, false)
@@ -1065,7 +1140,7 @@ mod tests {
     }
 
     #[test]
-    fn first_space_scores_complete_words_without_changing_cached_prefixes() {
+    fn first_space_scores_complete_words() {
         let dictionaries = test_dictionaries([
             ("us", "", "a 8\nap 1\nbp 2\nc 8\nd 13", 3.0),
             ("ru", "", "ф 1\nфз 8\nиз 2\nсз 8\nя 13", 3.0),
@@ -1077,8 +1152,7 @@ mod tests {
             (KeyCode::KEY_C, Some(f64::INFINITY), Some("us")),
         ] {
             let mut word = Word::default();
-            push_key(&mut word, &dictionaries, Stroke { key, shift: false });
-            let prefixes = word.dictionary_prefixes.clone();
+            push_key(&mut word, Stroke { key, shift: false });
             let prefix_score = dictionaries
                 .comparison(&word, &current, false)
                 .unwrap()
@@ -1090,7 +1164,6 @@ mod tests {
             assert_eq!(score, expected_score);
             let target = dictionaries.target(&word, &current, true);
             assert_eq!(target.as_deref().map(Layout::name), expected_target);
-            assert_eq!(word.dictionary_prefixes, prefixes);
         }
     }
 
@@ -1108,7 +1181,7 @@ mod tests {
                 ("ru", "", &format!("я {}\nф 0", 8 * scale), 2.0),
             ]);
             let mut word = Word::default();
-            push_key(&mut word, &dictionaries, stroke);
+            push_key(&mut word, stroke);
             assert_eq!(
                 dictionaries
                     .comparison(&word, &ru, false)
