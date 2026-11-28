@@ -38,7 +38,7 @@ impl<'a> ScoreTable<'a> {
         from_text: &str,
         to_text: Option<&str>,
         is_word_end: bool,
-        comparison: Option<DictionaryComparison<'_>>,
+        comparison: Option<DictionaryComparison>,
     ) {
         let [from_score, to_score, learned, delta, above_threshold] = comparison.map_or_else(
             || std::array::from_fn(|_| UNAVAILABLE.into()),
@@ -85,7 +85,7 @@ impl<'a> ScoreTable<'a> {
     }
 }
 
-fn score_cells(comparison: &DictionaryComparison<'_>, threshold: f64) -> [String; 5] {
+fn score_cells(comparison: &DictionaryComparison, threshold: f64) -> [String; 5] {
     let (ordering, learned) = comparison.learned_difference();
     let sign = match ordering {
         std::cmp::Ordering::Less => "-",

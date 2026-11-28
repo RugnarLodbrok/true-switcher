@@ -215,6 +215,15 @@ struct LayoutIndexes<'a> {
 struct ScoredKey<'a> {
     key: Cow<'a, str>,
     total: f64,
+    penalty: f64,
+}
+
+struct ScoredLayout<'a> {
+    dictionary: &'a Dictionary,
+    indexes: LayoutIndexes<'a>,
+    key: String,
+    total: f64,
+    penalty: f64,
 }
 
 struct PunctuationRuns {
@@ -254,11 +263,15 @@ impl PunctuationRuns {
 
 impl LayoutIndexes<'_> {
     fn score(&self, key: &str) -> f64 {
-        let (base, learned) = self.score_separated(key);
+        let (base, learned) = self.lookup_scores(key);
         base + learned as f64
     }
 
     fn score_separated(&self, key: &str) -> (f64, u128) {
+        self.lookup_scores(key)
+    }
+
+    fn lookup_scores(&self, key: &str) -> (f64, u128) {
         let dictionary = self.dictionary.score(key);
         let learned = self.learned.map_or(0, |trie| trie.count(key));
         let base = if dictionary == f64::NEG_INFINITY && learned > 0 {
@@ -278,6 +291,7 @@ impl LayoutIndexes<'_> {
         ScoredKey {
             total: self.score(&key),
             key,
+            penalty: 0.0,
         }
     }
 
@@ -285,6 +299,7 @@ impl LayoutIndexes<'_> {
         &self,
         parts: impl Iterator<Item = &'a str>,
         is_last_exact: bool,
+        split_score_penalty: f64,
     ) -> Option<ScoredKey<'a>> {
         let mut parts = parts.filter(|part| !part.is_empty()).peekable();
         let first = parts.next()?;
@@ -296,13 +311,51 @@ impl LayoutIndexes<'_> {
                 weakest = candidate;
             }
         }
+        weakest.total -= split_score_penalty;
+        weakest.penalty = split_score_penalty;
         Some(weakest)
+    }
+
+    fn best_key<'a>(
+        &self,
+        text: &'a str,
+        punctuation: Option<&PunctuationRuns>,
+        is_word_end: bool,
+        split_score_penalty: f64,
+    ) -> ScoredKey<'a> {
+        let mut best = self.score_text(text, is_word_end);
+        let Some(punctuation) = punctuation else {
+            return best;
+        };
+        let (remainder, has_trailing_punctuation) = punctuation.trim_edges(text);
+        let is_remainder_exact = is_word_end || has_trailing_punctuation;
+        if !remainder.is_empty() && remainder.len() < text.len() {
+            let trimmed = self.score_text(remainder, is_remainder_exact);
+            if trimmed.total > best.total {
+                best = trimmed;
+            }
+        }
+        if let Some(split) = self.score_parts(
+            punctuation.separator.split(remainder),
+            is_remainder_exact,
+            split_score_penalty,
+        ) && split.total > best.total
+        {
+            best = split;
+        }
+        best
     }
 }
 
-pub(crate) struct DictionaryComparison<'a> {
-    current_threshold: f64,
-    alternative_dictionary: &'a Dictionary,
+fn delta_score(current: f64, alternative: f64) -> f64 {
+    if current == f64::NEG_INFINITY && alternative == f64::NEG_INFINITY {
+        0.0
+    } else {
+        alternative - current
+    }
+}
+
+pub(crate) struct DictionaryComparison {
     pub(crate) delta_score: f64,
     pub(crate) current_base_score: f64,
     pub(crate) alternative_base_score: f64,
@@ -310,7 +363,7 @@ pub(crate) struct DictionaryComparison<'a> {
     learned_alternative: u128,
 }
 
-impl DictionaryComparison<'_> {
+impl DictionaryComparison {
     pub(crate) fn learned_difference(&self) -> (Ordering, u128) {
         (
             self.learned_alternative.cmp(&self.learned_current),
@@ -332,6 +385,7 @@ pub(crate) struct DictionaryAutoSwitch {
     dictionaries: Vec<Dictionary>,
     ambiguity_score_floor: Option<f64>,
     punctuation: Option<PunctuationRuns>,
+    split_score_penalty: f64,
     pub(crate) learned: LearnedRules,
 }
 
@@ -448,6 +502,7 @@ impl DictionaryAutoSwitch {
             dictionaries,
             ambiguity_score_floor: settings.ambiguity_score_floor,
             punctuation,
+            split_score_penalty: settings.split_score_penalty,
             ..Self::default()
         })
     }
@@ -470,7 +525,12 @@ impl DictionaryAutoSwitch {
             .map(|dictionary| dictionary.threshold)
     }
 
-    fn layout_score(&self, word: &Word, index: usize, is_word_end: bool) -> Option<(f64, u128)> {
+    fn layout_score(
+        &self,
+        word: &Word,
+        index: usize,
+        is_word_end: bool,
+    ) -> Option<ScoredLayout<'_>> {
         if !word.has_search_text() {
             return None;
         }
@@ -480,25 +540,44 @@ impl DictionaryAutoSwitch {
             dictionary: &dictionary.trie,
             learned: self.learned.trie(dictionary.target.name()),
         };
-        let mut best = indexes.score_text(&text, is_word_end);
-        let Some(punctuation) = &self.punctuation else {
-            return Some(indexes.score_separated(&best.key));
+        let ScoredKey {
+            key,
+            total,
+            penalty,
+        } = indexes.best_key(
+            &text,
+            self.punctuation.as_ref(),
+            is_word_end,
+            self.split_score_penalty,
+        );
+        let key = match key {
+            Cow::Borrowed(key) if key.len() == text.len() => text,
+            key => key.into_owned(),
         };
-        let (remainder, has_trailing_punctuation) = punctuation.trim_edges(&text);
-        let is_remainder_exact = is_word_end || has_trailing_punctuation;
-        if !remainder.is_empty() && remainder.len() < text.len() {
-            let trimmed = indexes.score_text(remainder, is_remainder_exact);
-            if trimmed.total > best.total {
-                best = trimmed;
-            }
-        }
-        if let Some(split) =
-            indexes.score_parts(punctuation.separator.split(remainder), is_remainder_exact)
-            && split.total > best.total
-        {
-            best = split;
-        }
-        Some(indexes.score_separated(&best.key))
+        Some(ScoredLayout {
+            dictionary,
+            indexes,
+            key,
+            total,
+            penalty,
+        })
+    }
+
+    fn layout_scores(
+        &self,
+        word: &Word,
+        current: &Layout,
+        is_word_end: bool,
+    ) -> Option<(ScoredLayout<'_>, ScoredLayout<'_>)> {
+        let current_index = self
+            .dictionaries
+            .iter()
+            .position(|dictionary| dictionary.target.name() == current.name())?;
+        let alternative_index = 1 - current_index;
+        Some((
+            self.layout_score(word, current_index, is_word_end)?,
+            self.layout_score(word, alternative_index, is_word_end)?,
+        ))
     }
 
     pub(crate) fn comparison(
@@ -506,29 +585,15 @@ impl DictionaryAutoSwitch {
         word: &Word,
         current: &Layout,
         is_word_end: bool,
-    ) -> Option<DictionaryComparison<'_>> {
-        let current_index = self
-            .dictionaries
-            .iter()
-            .position(|dictionary| dictionary.target.name() == current.name())?;
-        let alternative_index = 1 - current_index;
-        let (current_score, learned_current) =
-            self.layout_score(word, current_index, is_word_end)?;
-        let (alternative_score, learned_alternative) =
-            self.layout_score(word, alternative_index, is_word_end)?;
-        let current = current_score + learned_current as f64;
-        let alternative = alternative_score + learned_alternative as f64;
-        let delta_score = if current == f64::NEG_INFINITY && alternative == f64::NEG_INFINITY {
-            0.0
-        } else {
-            alternative - current
-        };
+    ) -> Option<DictionaryComparison> {
+        let (current, alternative) = self.layout_scores(word, current, is_word_end)?;
+        let (current_base_score, learned_current) = current.indexes.score_separated(&current.key);
+        let (alternative_base_score, learned_alternative) =
+            alternative.indexes.score_separated(&alternative.key);
         Some(DictionaryComparison {
-            current_threshold: self.dictionaries[current_index].threshold,
-            alternative_dictionary: &self.dictionaries[alternative_index],
-            delta_score,
-            current_base_score: current_score,
-            alternative_base_score: alternative_score,
+            delta_score: delta_score(current.total, alternative.total),
+            current_base_score: current_base_score - current.penalty,
+            alternative_base_score: alternative_base_score - alternative.penalty,
             learned_current,
             learned_alternative,
         })
@@ -541,27 +606,30 @@ impl DictionaryAutoSwitch {
         is_word_end: bool,
         preceding_ambiguous_score: impl FnOnce(&Layout) -> f64,
     ) -> DictionaryDecision {
-        let Some(comparison) = self.comparison(word, current, is_word_end) else {
+        let Some((current_score, alternative_score)) =
+            self.layout_scores(word, current, is_word_end)
+        else {
             return DictionaryDecision::Keep;
         };
-        let alternative = comparison.alternative_dictionary;
-        let has_current_score = comparison.current_base_score.is_finite();
-        let has_alternative_score = comparison.alternative_base_score.is_finite();
+        let alternative = alternative_score.dictionary;
+        let delta = delta_score(current_score.total, alternative_score.total);
+        let has_current_score = current_score.total.is_finite();
+        let has_alternative_score = alternative_score.total.is_finite();
         let switch_delta_score = if has_current_score && has_alternative_score {
-            comparison.delta_score
+            delta
                 + AMBIGUOUS_WORD_DSCORE_MULTIPLIER * preceding_ambiguous_score(&alternative.target)
         } else {
-            comparison.delta_score
+            delta
         };
         let is_switch = switch_delta_score > alternative.threshold;
         let ambiguity_lower_bound = self
             .ambiguity_score_floor
-            .unwrap_or(-comparison.current_threshold);
+            .unwrap_or(-current_score.dictionary.threshold);
         let is_ambiguous = is_word_end
             && has_current_score
             && has_alternative_score
-            && comparison.delta_score >= ambiguity_lower_bound
-            && comparison.delta_score <= alternative.threshold;
+            && delta >= ambiguity_lower_bound
+            && delta <= alternative.threshold;
         if !is_switch && !is_ambiguous {
             return DictionaryDecision::Keep;
         }
@@ -584,7 +652,7 @@ impl DictionaryAutoSwitch {
         } else if word.has_dead_key_in(current) || word.has_dead_key_in(&alternative.target) {
             DictionaryDecision::Keep
         } else {
-            DictionaryDecision::Ambiguous(comparison.delta_score)
+            DictionaryDecision::Ambiguous(delta)
         }
     }
 
@@ -930,6 +998,17 @@ mod tests {
         });
     }
 
+    fn layout_total(
+        dictionaries: &DictionaryAutoSwitch,
+        word: &Word,
+        index: usize,
+        is_word_end: bool,
+    ) -> Option<f64> {
+        dictionaries
+            .layout_score(word, index, is_word_end)
+            .map(|score| score.total)
+    }
+
     #[test]
     fn scores_the_best_dictionary_key_with_or_without_leading_punctuation() {
         for (records, prefix_score, exact_score) in [
@@ -946,12 +1025,12 @@ mod tests {
                 KeyCode::KEY_T,
             ]);
             assert_eq!(
-                dictionaries.layout_score(&word, 0, false),
-                Some((prefix_score, 0))
+                layout_total(&dictionaries, &word, 0, false),
+                Some(prefix_score)
             );
             assert_eq!(
-                dictionaries.layout_score(&word, 0, true),
-                Some((exact_score, 0))
+                layout_total(&dictionaries, &word, 0, true),
+                Some(exact_score)
             );
         }
     }
@@ -1011,8 +1090,8 @@ mod tests {
             let word = word_from_keys(keys);
             for is_first_space in [false, true] {
                 assert_eq!(
-                    dictionaries.layout_score(&word, 0, is_first_space),
-                    Some((score, 0))
+                    layout_total(&dictionaries, &word, 0, is_first_space),
+                    Some(score)
                 );
             }
         }
@@ -1048,17 +1127,17 @@ mod tests {
                     ));
                 }
                 let word = history.latest_word().unwrap();
-                assert_eq!(dictionaries.layout_score(word, 0, false), Some((-2.0, 0)));
+                assert_eq!(layout_total(&dictionaries, word, 0, false), Some(-2.0));
                 if leading.is_none() {
-                    assert_eq!(dictionaries.layout_score(word, 1, false), Some((0.0, 0)));
+                    assert_eq!(layout_total(&dictionaries, word, 1, false), Some(0.0));
                 }
                 assert!(matches!(
                     history.process(end, false, None, &punctuation),
                     HistoryEvent::WordEnd
                 ));
                 assert_eq!(
-                    dictionaries.layout_score(history.latest_word().unwrap(), 0, true),
-                    Some((-2.0, 0))
+                    layout_total(&dictionaries, history.latest_word().unwrap(), 0, true),
+                    Some(-2.0)
                 );
             }
         }
@@ -1078,7 +1157,7 @@ mod tests {
                     shift: true,
                 },
             );
-            assert_eq!(dictionaries.layout_score(&word, 0, false), Some((score, 0)));
+            assert_eq!(layout_total(&dictionaries, &word, 0, false), Some(score));
         }
 
         let dictionaries = test_dictionaries([
@@ -1094,10 +1173,10 @@ mod tests {
                 .trim_edges("git;"),
             ("git", true)
         );
-        assert_eq!(dictionaries.layout_score(&word, 0, false), Some((-1.0, 0)));
+        assert_eq!(layout_total(&dictionaries, &word, 0, false), Some(-1.0));
         assert_eq!(
-            dictionaries.layout_score(&word, 0, true),
-            Some((f64::NEG_INFINITY, 0))
+            layout_total(&dictionaries, &word, 0, true),
+            Some(f64::NEG_INFINITY)
         );
         for key in [K::KEY_H, K::KEY_U, K::KEY_B] {
             push_key(&mut word, Stroke { key, shift: false });
@@ -1110,7 +1189,7 @@ mod tests {
                 .trim_edges("git;hub"),
             ("git;hub", false)
         );
-        assert_eq!(dictionaries.layout_score(&word, 0, true), Some((-1.0, 0)));
+        assert_eq!(layout_total(&dictionaries, &word, 0, true), Some(-1.0));
     }
 
     #[test]
@@ -1132,11 +1211,11 @@ mod tests {
             K::KEY_A,
             K::KEY_R,
         ]);
-        assert_eq!(dictionaries.layout_score(&word, 0, false), Some((-1.0, 0)));
-        assert_eq!(dictionaries.layout_score(&word, 0, true), Some((-3.0, 0)));
+        assert_eq!(layout_total(&dictionaries, &word, 0, false), Some(-1.0));
+        assert_eq!(layout_total(&dictionaries, &word, 0, true), Some(-3.0));
         assert_eq!(
-            dictionaries.layout_score(&word, 1, false),
-            Some((f64::NEG_INFINITY, 0))
+            layout_total(&dictionaries, &word, 1, false),
+            Some(f64::NEG_INFINITY)
         );
         assert_eq!(dictionaries.target(&word, &ru, false).unwrap().name(), "us");
 
@@ -1147,14 +1226,14 @@ mod tests {
                 shift: false,
             },
         );
-        assert_eq!(dictionaries.layout_score(&word, 0, false), Some((-3.0, 0)));
+        assert_eq!(layout_total(&dictionaries, &word, 0, false), Some(-3.0));
     }
 
     #[test]
     fn splits_at_different_characters_in_the_two_layouts() {
         use KeyCode as K;
 
-        let dictionaries = test_dictionaries([
+        let mut dictionaries = test_dictionaries([
             ("us", "", "foo 2\nbar$baz 6", 5.0),
             ("ru", "", "ащщжифк 4\nифя 1\nя 3", 5.0),
         ]);
@@ -1182,6 +1261,72 @@ mod tests {
         assert_eq!(comparison.current_base_score, -2.0);
         assert_eq!(comparison.alternative_base_score, -3.0);
         assert_eq!(comparison.delta_score, -1.0);
+
+        dictionaries.split_score_penalty = 2.5;
+        assert_eq!(layout_total(&dictionaries, &word, 0, false), Some(-4.5));
+        assert_eq!(layout_total(&dictionaries, &word, 1, false), Some(-5.5));
+        assert_eq!(
+            dictionaries
+                .comparison(&word, &us, false)
+                .unwrap()
+                .delta_score,
+            -1.0
+        );
+    }
+
+    #[test]
+    fn applies_split_penalty_before_selecting_the_winning_key() {
+        use KeyCode as K;
+
+        let mut dictionaries = test_dictionaries([
+            ("us", "", "a 1\na.b 1\nb 1\nbb 1\nz 4", 5.0),
+            ("ru", "", "кот 1", 5.0),
+        ]);
+        let word = word_from_keys(&[K::KEY_A, K::KEY_DOT, K::KEY_B]);
+        for _ in 0..2 {
+            dictionaries.learned.increment("us", "a").unwrap();
+        }
+        let exact = dictionaries.layout_score(&word, 0, true).unwrap();
+        assert_eq!(exact.key, "a.b ");
+        assert_eq!(exact.total, -3.0);
+
+        dictionaries.split_score_penalty = 0.5;
+        let prefix = dictionaries.layout_score(&word, 0, false).unwrap();
+        assert_eq!(prefix.key, "b");
+        assert_eq!(prefix.total, -2.5);
+        assert_eq!(layout_total(&dictionaries, &word, 0, true), Some(-3.0));
+
+        dictionaries.split_score_penalty = 1.5;
+        let prefix = dictionaries.layout_score(&word, 0, false).unwrap();
+        assert_eq!(prefix.key, "a.b");
+        assert_eq!(prefix.total, -3.0);
+    }
+
+    #[test]
+    fn logs_the_penalized_split_score_used_to_decide_switching() {
+        use KeyCode as K;
+
+        let mut dictionaries = test_dictionaries([
+            ("us", "", "a 63\nb 1\nz 64", 1.5),
+            ("ru", "", "фюи 1\nя 511", 5.0),
+        ]);
+        dictionaries.learned.increment("ru", "фюи").unwrap();
+        for _ in 0..2 {
+            dictionaries.learned.increment("us", "b").unwrap();
+        }
+        let word = word_from_keys(&[K::KEY_A, K::KEY_DOT, K::KEY_B]);
+        let ru = Layout::new("ru", "", "", "");
+        for (penalty, is_switch, message) in [
+            (0.0, true, "dict switch score:  +3.00 =  9.00 -  7.00 +  1"),
+            (2.5, false, "dict switch score:  +0.50 =  9.00 -  9.50 +  1"),
+        ] {
+            dictionaries.split_score_penalty = penalty;
+            assert_eq!(dictionaries.target(&word, &ru, true).is_some(), is_switch);
+            let (_, messages) = crate::test_logging::capture_at(log::LevelFilter::Debug, || {
+                dictionaries.log_score(&word, Some(&ru), true);
+            });
+            assert_eq!(messages, [message]);
+        }
     }
 
     #[test]
@@ -1193,16 +1338,18 @@ mod tests {
             ("ru", "", "кот 1", 5.0),
         ]);
         let word = word_from_keys(&[K::KEY_A, K::KEY_DOT, K::KEY_B]);
-        dictionaries.learned.increment("us", "a").unwrap();
-        assert_eq!(dictionaries.layout_score(&word, 0, true), Some((-3.0, 1)));
-        dictionaries.learned.increment("us", "a").unwrap();
-        assert_eq!(dictionaries.layout_score(&word, 0, true), Some((-2.0, 0)));
+        for expected_key in ["a ", "b "] {
+            dictionaries.learned.increment("us", "a").unwrap();
+            let score = dictionaries.layout_score(&word, 0, true).unwrap();
+            assert_eq!(score.key, expected_key);
+            assert_eq!(score.total, -2.0);
+        }
 
         let dictionaries = test_dictionaries([
             ("us", "", "a.b 1\napple 1\nb 2\nz 4", 5.0),
             ("ru", "", "кот 1", 5.0),
         ]);
-        assert_eq!(dictionaries.layout_score(&word, 0, false), Some((-3.0, 0)));
+        assert_eq!(layout_total(&dictionaries, &word, 0, false), Some(-3.0));
     }
 
     #[test]
@@ -1222,16 +1369,19 @@ mod tests {
         );
 
         dictionaries.learned.increment("us", "git;").unwrap();
-        assert_eq!(dictionaries.layout_score(&plain, 0, true), Some((-1.0, 0)));
+        assert_eq!(layout_total(&dictionaries, &plain, 0, true), Some(-1.0));
 
         for key in ["git", "git", "github", "github", "github"] {
             dictionaries.learned.increment("us", key).unwrap();
         }
-        assert_eq!(dictionaries.layout_score(&plain, 0, false), Some((-1.0, 6)));
+        assert_eq!(
+            layout_total(&dictionaries, &plain, 0, false),
+            Some(-1.0 + 6.0)
+        );
         for is_word_end in [false, true] {
             assert_eq!(
-                dictionaries.layout_score(&punctuated, 0, is_word_end),
-                Some((-1.0, 2))
+                layout_total(&dictionaries, &punctuated, 0, is_word_end),
+                Some(-1.0 + 2.0)
             );
         }
     }
@@ -1323,7 +1473,7 @@ mod tests {
             ("owl ", (-18.0, 1), -17.0),
             ("CATZ", (f64::NEG_INFINITY, 0), f64::NEG_INFINITY),
         ] {
-            assert_eq!(indexes.score_separated(key), separated);
+            assert_eq!(indexes.lookup_scores(key), separated);
             assert_eq!(indexes.score(key), total);
         }
     }
@@ -1550,8 +1700,8 @@ mod tests {
             );
             for is_first_space in [false, true] {
                 assert_eq!(
-                    dictionaries.layout_score(&word, 1, is_first_space),
-                    Some((LEARNED_BASE_SCORE, 1))
+                    layout_total(&dictionaries, &word, 1, is_first_space),
+                    Some(LEARNED_BASE_SCORE + 1.0)
                 );
                 assert_eq!(
                     dictionaries

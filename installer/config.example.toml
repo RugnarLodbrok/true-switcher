@@ -35,6 +35,12 @@ dict_skip_pattern = ''
 # An empty string disables punctuation handling.
 punctuation = '[`~<>\p{P}]'
 
+# When scoring a word that has mid-word punctuation in given layout:
+# scoring is also tested for split parts individially
+# penalty is added to compensate fact that short tokens
+# tend to have higher score, and too often overweight score of full token
+split_score_penalty = 6
+
 
 [[switch_rules]]       # Optional regex rule set
 target = "us"          # XKB layout identifier configured in KDE

@@ -291,3 +291,30 @@ fn displays_the_score_and_learned_adjustment_from_the_winning_key() {
         );
     }
 }
+
+#[test]
+fn displays_the_weakest_part_of_the_winning_split_with_its_penalty() {
+    let mut fixture = Fixture::new(DICTIONARY_CONFIG);
+    fs::write(fixture.dir.path().join("us.txt"), "a 63\nb 1\nz 64\n").unwrap();
+    fs::write(fixture.dir.path().join("ru.txt"), "фюи 1\nя 511\n").unwrap();
+    fs::write(
+        fixture.config_file.learned_rules_path(),
+        "[us]\nb = 2\n[ru]\n'фюи' = 1\n",
+    )
+    .unwrap();
+
+    for (penalty, base, delta, above_threshold) in [
+        (fixture.config.split_score_penalty, "-13.00", "-3.00", "no"),
+        (0.0, "-7.00", "3.00", "yes"),
+        (2.5, "-9.50", "0.50", "no"),
+    ] {
+        fixture.config.split_score_penalty = penalty;
+        let output = fixture
+            .load(true)
+            .unwrap()
+            .trace("ru us фюи", None)
+            .unwrap();
+        let expected = ["фюи␣", "a.b␣", "-9.00", base, "+1", delta, above_threshold];
+        assert_eq!(score_rows(&output).last().unwrap(), &expected);
+    }
+}

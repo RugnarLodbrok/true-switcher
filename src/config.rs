@@ -13,6 +13,7 @@ const CONFIG_DIRECTORY: &str = ".config/true-switcher";
 const CONFIG_FILE: &str = "config.toml";
 const LOG_LEVEL_KEY: &str = "log_level";
 const DEFAULT_DICTIONARY_THRESHOLD: f64 = 15.0;
+const DEFAULT_SPLIT_SCORE_PENALTY: f64 = 6.0;
 pub(crate) const DEFAULT_MOUSE_MOTION_PAUSE_MS: u64 = 500;
 pub(crate) const DEFAULT_PUNCTUATION: &str = r"[`~<>\p{P}]";
 pub(crate) const LOG_LEVELS: [(&str, log::LevelFilter); 6] = [
@@ -49,6 +50,11 @@ pub struct Configuration {
     pub dict_skip_pattern: String,
     #[serde(default = "default_punctuation")]
     pub punctuation: String,
+    #[serde(
+        default = "default_split_score_penalty",
+        deserialize_with = "deserialize_split_score_penalty"
+    )]
+    pub split_score_penalty: f64,
     #[serde(default, deserialize_with = "deserialize_ambiguity_score_floor")]
     pub ambiguity_score_floor: Option<f64>,
     #[serde(default)]
@@ -158,6 +164,23 @@ fn default_punctuation() -> String {
 
 fn default_mouse_motion_pause_ms() -> u64 {
     DEFAULT_MOUSE_MOTION_PAUSE_MS
+}
+
+fn default_split_score_penalty() -> f64 {
+    DEFAULT_SPLIT_SCORE_PENALTY
+}
+
+fn deserialize_split_score_penalty<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<f64, D::Error> {
+    let value = f64::deserialize(deserializer)?;
+    if value.is_finite() && value >= 0.0 {
+        Ok(value)
+    } else {
+        Err(de::Error::custom(
+            "split_score_penalty must be finite and nonnegative",
+        ))
+    }
 }
 
 fn deserialize_ambiguity_score_floor<'de, D: Deserializer<'de>>(
@@ -391,6 +414,26 @@ mod tests {
             .unwrap();
             let error = load_from(&path).err().expect(pattern);
             assert!(error.contains("Invalid punctuation"), "{pattern}: {error}");
+        }
+    }
+
+    #[test]
+    fn reads_and_validates_split_score_penalty() {
+        const BASE: &str = "switch_key = 'KEY_PAUSE'";
+        for contents in [BASE, include_str!("../installer/config.example.toml")] {
+            assert_eq!(from_contents(contents).unwrap().split_score_penalty, 6.0);
+        }
+        for (value, expected) in [("0", 0.0), ("2.5", 2.5)] {
+            let contents = format!("{BASE}\nsplit_score_penalty = {value}");
+            assert_eq!(
+                from_contents(&contents).unwrap().split_score_penalty,
+                expected
+            );
+        }
+        for value in ["-1", "inf", "-inf", "nan"] {
+            let contents = format!("{BASE}\nsplit_score_penalty = {value}");
+            let error = from_contents(&contents).err().expect(value);
+            assert!(error.contains("split_score_penalty"), "{error}");
         }
     }
 

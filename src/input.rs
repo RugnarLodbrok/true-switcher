@@ -3844,6 +3844,28 @@ threshold = 7.0
     }
 
     #[test]
+    fn logs_the_weakest_part_of_the_winning_split() {
+        use KeyCode as K;
+
+        let mut input = auto_input_with_patterns("");
+        input.accept_layout(Some(layout("ru")), false);
+        let mut dictionaries = crate::dictionary::test_dictionaries([
+            ("us", "", "a 63\nb 1\nz 64", 4.0),
+            ("ru", "", "ф 255\nфю 255\nфюи 1\nя 1", 4.0),
+        ]);
+        dictionaries.learned.increment("ru", "фюи").unwrap();
+        dictionaries.learned.increment("us", "b").unwrap();
+        dictionaries.learned.increment("us", "b").unwrap();
+        input.auto_switch.dictionaries = dictionaries;
+
+        for key in [K::KEY_A, K::KEY_DOT, K::KEY_B] {
+            press(&mut input, key);
+        }
+        let scores = logged_dictionary_scores(&mut input, K::KEY_SPACE, log::LevelFilter::Debug);
+        assert_eq!(scores, [" +3.00 =  9.00 -  7.00 +  1"]);
+    }
+
+    #[test]
     fn filters_dictionary_score_logs_and_reports_unavailable_comparisons() {
         use log::LevelFilter;
 
