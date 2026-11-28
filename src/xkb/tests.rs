@@ -46,6 +46,42 @@ fn converts_shift_and_layout_without_changing_physical_keys() {
     );
 }
 
+#[test]
+fn dictionary_splits_text_from_a_single_stroke_with_multiple_symbols() {
+    use crate::dictionary::test_dictionaries;
+    use crate::word::{Word, WordStroke};
+
+    let layout = Layout::new("us", "", "", "");
+    let keymap = xkb::Keymap::new_from_string(
+        &xkb::Context::new(xkb::CONTEXT_NO_FLAGS),
+        r#"xkb_keymap {
+            xkb_keycodes { include "evdev+aliases(qwerty)" };
+            xkb_types { include "complete" };
+            xkb_compatibility { include "complete" };
+            xkb_symbols { key <AC01> { [ { a, period, b } ] }; };
+        };"#
+        .to_owned(),
+        xkb::KEYMAP_FORMAT_TEXT_V1,
+        xkb::KEYMAP_COMPILE_NO_FLAGS,
+    )
+    .unwrap();
+    KEYMAPS.with(|maps| maps.borrow_mut().insert(layout.clone(), keymap));
+    let stroke = stroke(KeyCode::KEY_A);
+    assert_eq!(stroke_text(&layout, &stroke).as_deref(), Ok("a.b"));
+
+    let mut word = Word::default();
+    word.entries.push(WordStroke {
+        stroke,
+        layout: None,
+    });
+    let dictionaries = test_dictionaries([
+        ("us", "", "a 4\nb 1\nbeta 3", 5.0),
+        ("ru", "", "кот 1", 5.0),
+    ]);
+    let comparison = dictionaries.comparison(&word, &layout, false).unwrap();
+    assert_eq!(comparison.current_base_score, -1.0);
+}
+
 fn layout() -> Layout {
     Layout::new("us", "", "", "")
 }

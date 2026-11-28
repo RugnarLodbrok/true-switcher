@@ -287,7 +287,7 @@ mod tests {
         use KeyCode as K;
         let us = Arc::new(Layout::new("us", "", "pc105", ""));
         let ru = Arc::new(Layout::new("ru", "", "pc105", ""));
-        let mut punctuation = Punctuation::new(r"[`~<>\p{P}]+").unwrap();
+        let mut punctuation = Punctuation::new(crate::config::DEFAULT_PUNCTUATION).unwrap();
         punctuation.update_layouts(vec![(*us).clone(), (*ru).clone()]);
         let mut history = History::default();
         for (layout, keys) in [
@@ -327,7 +327,7 @@ mod tests {
     fn keeps_initial_and_trailing_series_and_reopens_on_the_last_backspace() {
         use KeyCode as K;
         let us = Arc::new(Layout::new("us", "", "", ""));
-        let mut punctuation = Punctuation::new("[/]+").unwrap();
+        let mut punctuation = Punctuation::new("[/]").unwrap();
         punctuation.update_layouts(vec![(*us).clone()]);
         let mut history = History::default();
         let press = |history: &mut History, key| {

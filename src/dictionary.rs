@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::io::{self, BufRead, BufReader};
@@ -10,6 +11,7 @@ use regex::Regex;
 use crate::config::Configuration;
 use crate::layout::Layout;
 use crate::learned_rules::{LearnedRules, LearnedTrie};
+use crate::punctuation;
 use crate::word::{WORD_END, Word};
 
 pub(crate) const DICTIONARY_COUNT: usize = 2;
@@ -177,25 +179,14 @@ fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
-pub(crate) fn compile_full_match_pattern(
-    pattern: &str,
-    setting: &str,
-) -> io::Result<Option<Regex>> {
-    compile_anchored_pattern(pattern, setting, r"\z")
-}
-
-fn compile_anchored_pattern(
-    pattern: &str,
-    setting: &str,
-    end_anchor: &str,
-) -> io::Result<Option<Regex>> {
+fn compile_full_match_pattern(pattern: &str, setting: &str) -> io::Result<Option<Regex>> {
     if pattern.is_empty() {
         return Ok(None);
     }
     let invalid_pattern = |error| invalid(format!("Invalid {setting}: {error}"));
     Regex::new(pattern).map_err(invalid_pattern)?; // Reject unmatched groups before wrapping.
     // The newline terminates a trailing verbose-mode comment and is ignored otherwise.
-    Regex::new(&format!("\\A(?:{pattern}(?x)\n){end_anchor}"))
+    Regex::new(&format!("\\A(?:{pattern}(?x)\n)\\z"))
         .map(Some)
         .map_err(invalid_pattern)
 }
@@ -211,12 +202,91 @@ struct LayoutIndexes<'a> {
     learned: Option<&'a LearnedTrie>,
 }
 
+struct ScoredKey<'a> {
+    key: Cow<'a, str>,
+    total: f64,
+}
+
+struct PunctuationRuns {
+    full: Regex,
+    leading: Regex,
+    trailing: Regex,
+    separator: Regex,
+}
+
+impl PunctuationRuns {
+    fn new(pattern: &str) -> io::Result<Option<Self>> {
+        let Some(pattern) = punctuation::validate_pattern(pattern)? else {
+            return Ok(None);
+        };
+        let run = format!("(?:{pattern})+");
+        let compile = |prefix, suffix| {
+            Regex::new(&format!("{prefix}{run}{suffix}")).map_err(punctuation::invalid_pattern)
+        };
+        Ok(Some(Self {
+            full: compile(r"\A", r"\z")?,
+            leading: compile(r"\A", "")?,
+            trailing: compile("", r"\z")?,
+            separator: compile("", "")?,
+        }))
+    }
+
+    fn trim_edges<'a>(&self, text: &'a str) -> (&'a str, bool) {
+        let start = self.leading.find(text).map_or(0, |matched| matched.end());
+        let remainder = &text[start..];
+        let end = self
+            .trailing
+            .find(remainder)
+            .map_or(remainder.len(), |matched| matched.start());
+        (&remainder[..end], end < remainder.len())
+    }
+}
+
 impl LayoutIndexes<'_> {
-    fn score(&self, key: &str) -> (f64, u128) {
-        (
-            self.dictionary.score(key),
-            self.learned.map_or(0, |trie| trie.count(key)),
-        )
+    fn score(&self, key: &str) -> f64 {
+        let (base, learned) = self.score_separated(key);
+        base + learned as f64
+    }
+
+    fn score_separated(&self, key: &str) -> (f64, u128) {
+        let dictionary = self.dictionary.score(key);
+        let learned = self.learned.map_or(0, |trie| trie.count(key));
+        let base = if dictionary == f64::NEG_INFINITY && learned > 0 {
+            LEARNED_BASE_SCORE
+        } else {
+            dictionary
+        };
+        (base, learned)
+    }
+
+    fn score_text<'a>(&self, text: &'a str, is_exact: bool) -> ScoredKey<'a> {
+        let key = if is_exact {
+            Cow::Owned(format!("{text}{WORD_END}"))
+        } else {
+            Cow::Borrowed(text)
+        };
+        ScoredKey {
+            total: self.score(&key),
+            key,
+        }
+    }
+
+    fn score_parts<'a>(
+        &self,
+        parts: impl Iterator<Item = &'a str>,
+        is_last_exact: bool,
+    ) -> Option<ScoredKey<'a>> {
+        let mut parts = parts.filter(|part| !part.is_empty()).peekable();
+        let first = parts.next()?;
+        parts.peek()?;
+        let mut weakest = self.score_text(first, true);
+        while let Some(part) = parts.next() {
+            let candidate = self.score_text(part, is_last_exact || parts.peek().is_some());
+            if candidate.total < weakest.total {
+                weakest = candidate;
+            }
+        }
+        Some(weakest)
     }
 }
 
@@ -247,20 +317,11 @@ pub(crate) enum DictionaryDecision {
     Switch(Arc<Layout>),
 }
 
-fn score_with_learned_baseline(score: f64, learned: u128) -> f64 {
-    if score == f64::NEG_INFINITY && learned > 0 {
-        LEARNED_BASE_SCORE
-    } else {
-        score
-    }
-}
-
 #[derive(Default)]
 pub(crate) struct DictionaryAutoSwitch {
     dictionaries: Vec<Dictionary>,
     ambiguity_score_floor: Option<f64>,
-    full_punctuation: Option<Regex>,
-    leading_punctuation: Option<Regex>,
+    punctuation: Option<PunctuationRuns>,
     pub(crate) learned: LearnedRules,
 }
 
@@ -291,9 +352,7 @@ impl DictionaryAutoSwitch {
         }
         let skip_pattern =
             compile_full_match_pattern(&settings.dict_skip_pattern, "dict_skip_pattern")?;
-        let full_punctuation = compile_full_match_pattern(&settings.punctuation, "punctuation")?;
-        let leading_punctuation =
-            compile_anchored_pattern(&settings.punctuation, "punctuation", "")?;
+        let punctuation = PunctuationRuns::new(&settings.punctuation)?;
         let mut targets = HashSet::new();
         let mut dictionaries = Vec::new();
         for setting in &settings.dict {
@@ -337,8 +396,7 @@ impl DictionaryAutoSwitch {
         Ok(Self {
             dictionaries,
             ambiguity_score_floor: settings.ambiguity_score_floor,
-            full_punctuation,
-            leading_punctuation,
+            punctuation,
             ..Self::default()
         })
     }
@@ -366,27 +424,30 @@ impl DictionaryAutoSwitch {
             return None;
         }
         let dictionary = &self.dictionaries[index];
-        let mut text = crate::xkb::strokes_text(&dictionary.target, word.search_strokes()).ok()?;
+        let text = crate::xkb::strokes_text(&dictionary.target, word.search_strokes()).ok()?;
         let indexes = LayoutIndexes {
             dictionary: &dictionary.trie,
             learned: self.learned.trie(dictionary.target.name()),
         };
-        let remainder_start = self.punctuation_remainder_start(&text);
-        if is_word_end {
-            text.push_str(WORD_END);
+        let mut best = indexes.score_text(&text, is_word_end);
+        let Some(punctuation) = &self.punctuation else {
+            return Some(indexes.score_separated(&best.key));
+        };
+        let (remainder, has_trailing_punctuation) = punctuation.trim_edges(&text);
+        let is_remainder_exact = is_word_end || has_trailing_punctuation;
+        if !remainder.is_empty() && remainder.len() < text.len() {
+            let trimmed = indexes.score_text(remainder, is_remainder_exact);
+            if trimmed.total > best.total {
+                best = trimmed;
+            }
         }
-        let (score, learned) = indexes.score(&text);
-        if let Some(start) = remainder_start {
-            let (remainder_score, remainder_learned) = indexes.score(&text[start..]);
-            return Some((score.max(remainder_score), learned.max(remainder_learned)));
+        if let Some(split) =
+            indexes.score_parts(punctuation.separator.split(remainder), is_remainder_exact)
+            && split.total > best.total
+        {
+            best = split;
         }
-        Some((score, learned))
-    }
-
-    fn punctuation_remainder_start(&self, text: &str) -> Option<usize> {
-        let pattern = self.leading_punctuation.as_ref()?;
-        let matched = pattern.find(text)?;
-        (!matched.is_empty() && matched.end() < text.len()).then_some(matched.end())
+        Some(indexes.score_separated(&best.key))
     }
 
     pub(crate) fn comparison(
@@ -404,24 +465,19 @@ impl DictionaryAutoSwitch {
             self.layout_score(word, current_index, is_word_end)?;
         let (alternative_score, learned_alternative) =
             self.layout_score(word, alternative_index, is_word_end)?;
-        let current = score_with_learned_baseline(current_score, learned_current);
-        let alternative = score_with_learned_baseline(alternative_score, learned_alternative);
+        let current = current_score + learned_current as f64;
+        let alternative = alternative_score + learned_alternative as f64;
         let delta_score = if current == f64::NEG_INFINITY && alternative == f64::NEG_INFINITY {
             0.0
         } else {
-            let learned_delta = if learned_alternative >= learned_current {
-                (learned_alternative - learned_current) as f64
-            } else {
-                -((learned_current - learned_alternative) as f64)
-            };
-            alternative - current + learned_delta
+            alternative - current
         };
         Some(DictionaryComparison {
             current_threshold: self.dictionaries[current_index].threshold,
             alternative_dictionary: &self.dictionaries[alternative_index],
             delta_score,
-            current_base_score: current,
-            alternative_base_score: alternative,
+            current_base_score: current_score,
+            alternative_base_score: alternative_score,
             learned_current,
             learned_alternative,
         })
@@ -458,10 +514,10 @@ impl DictionaryAutoSwitch {
         if !is_switch && !is_ambiguous {
             return DictionaryDecision::Keep;
         }
-        if self.full_punctuation.as_ref().is_some_and(|pattern| {
+        if self.punctuation.as_ref().is_some_and(|punctuation| {
             current
                 .to_text(word.strokes())
-                .is_ok_and(|text| pattern.is_match(&text))
+                .is_ok_and(|text| punctuation.full.is_match(&text))
         }) {
             if is_word_end
                 && is_switch
@@ -535,17 +591,7 @@ pub(crate) fn test_dictionaries(
                 threshold,
             })
             .collect(),
-        full_punctuation: compile_full_match_pattern(
-            crate::config::DEFAULT_PUNCTUATION,
-            "punctuation",
-        )
-        .unwrap(),
-        leading_punctuation: compile_anchored_pattern(
-            crate::config::DEFAULT_PUNCTUATION,
-            "punctuation",
-            "",
-        )
-        .unwrap(),
+        punctuation: PunctuationRuns::new(crate::config::DEFAULT_PUNCTUATION).unwrap(),
         ..Default::default()
     }
 }
@@ -765,7 +811,7 @@ mod tests {
         for (settings, expected) in [
             ("", [true, true, true, true, true, false]),
             (
-                r"punctuation = '[./\\]+'",
+                r"punctuation = '[./\\]'",
                 [true, false, false, false, false, false],
             ),
             ("punctuation = ''", [false; 6]),
@@ -777,9 +823,9 @@ mod tests {
             {
                 assert_eq!(
                     dictionaries
-                        .full_punctuation
+                        .punctuation
                         .as_ref()
-                        .is_some_and(|regex| regex.is_match(token)),
+                        .is_some_and(|punctuation| punctuation.full.is_match(token)),
                     matches,
                     "{settings}: {token:?}"
                 );
@@ -789,6 +835,9 @@ mod tests {
             .err()
             .expect("invalid punctuation regex should fail to load");
         assert!(error.to_string().contains("Invalid punctuation"), "{error}");
+        let runs = PunctuationRuns::new(";|ж").unwrap().unwrap();
+        assert!(runs.full.is_match(";ж;"));
+        assert!(!runs.full.is_match(";жa"));
     }
 
     #[test]
@@ -796,7 +845,7 @@ mod tests {
         let current = Layout::new("us", "", "", "");
         for (settings, should_switch) in [
             ("", false),
-            (r"punctuation = '[./\\]+'", true),
+            (r"punctuation = '[./\\]'", true),
             ("punctuation = ''", true),
         ] {
             let dictionaries = load_dictionaries_with_settings(settings, "cat 1", "ёж 1").unwrap();
@@ -880,7 +929,7 @@ mod tests {
                 f64::NEG_INFINITY,
             ),
             (
-                r"punctuation = '\.{2}|,+'",
+                r"punctuation = '\.|,'",
                 &[
                     KeyCode::KEY_DOT,
                     KeyCode::KEY_DOT,
@@ -891,7 +940,7 @@ mod tests {
                 0.0,
             ),
             (
-                r"punctuation = '\.{2}|,+'",
+                r"punctuation = '\.|,'",
                 &[
                     KeyCode::KEY_A,
                     KeyCode::KEY_COMMA,
@@ -919,7 +968,225 @@ mod tests {
     }
 
     #[test]
-    fn comparison_maximizes_the_dictionary_score_and_learned_count_independently() {
+    fn scores_trailing_weak_punctuation_as_an_exact_trimmed_key() {
+        use crate::history::{History, HistoryEvent};
+        use crate::punctuation::Punctuation;
+        use KeyCode as K;
+
+        let dictionaries = test_dictionaries([
+            ("us", "", "git 2\ngithub 5\ngit;more 1", 5.0),
+            ("ru", "", "пшежня 1", 5.0),
+        ]);
+        let [us, ru] = dictionaries
+            .layout_pair()
+            .unwrap()
+            .map(|layout| layout.as_ref());
+        let mut punctuation = Punctuation::new(crate::config::DEFAULT_PUNCTUATION).unwrap();
+        punctuation.update_layouts(vec![us.clone(), ru.clone()]);
+        for end in [K::KEY_SPACE, K::KEY_SLASH] {
+            for leading in [None, Some(K::KEY_SEMICOLON)] {
+                let mut history = History::default();
+                for key in
+                    leading
+                        .into_iter()
+                        .chain([K::KEY_G, K::KEY_I, K::KEY_T, K::KEY_SEMICOLON])
+                {
+                    assert!(matches!(
+                        history.process(key, false, None, &punctuation),
+                        HistoryEvent::Stroke
+                    ));
+                }
+                let word = history.latest_word().unwrap();
+                assert_eq!(dictionaries.layout_score(word, 0, false), Some((-2.0, 0)));
+                if leading.is_none() {
+                    assert_eq!(dictionaries.layout_score(word, 1, false), Some((0.0, 0)));
+                }
+                assert!(matches!(
+                    history.process(end, false, None, &punctuation),
+                    HistoryEvent::WordEnd
+                ));
+                assert_eq!(
+                    dictionaries.layout_score(history.latest_word().unwrap(), 0, true),
+                    Some((-2.0, 0))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn only_configured_trailing_punctuation_enables_exact_trimmed_lookup() {
+        use KeyCode as K;
+
+        for (settings, score) in [(r"punctuation = '\$'", 0.0), ("", f64::NEG_INFINITY)] {
+            let dictionaries = load_dictionaries_with_settings(settings, "git 1", "кот 1").unwrap();
+            let mut word = word_from_keys(&[K::KEY_G, K::KEY_I, K::KEY_T]);
+            push_key(
+                &mut word,
+                Stroke {
+                    key: K::KEY_4,
+                    shift: true,
+                },
+            );
+            assert_eq!(dictionaries.layout_score(&word, 0, false), Some((score, 0)));
+        }
+
+        let dictionaries = test_dictionaries([
+            ("us", "", "github 1\ngit;hub 1", 5.0),
+            ("ru", "", "кот 1", 5.0),
+        ]);
+        let mut word = word_from_keys(&[K::KEY_G, K::KEY_I, K::KEY_T, K::KEY_SEMICOLON]);
+        assert_eq!(
+            dictionaries
+                .punctuation
+                .as_ref()
+                .unwrap()
+                .trim_edges("git;"),
+            ("git", true)
+        );
+        assert_eq!(dictionaries.layout_score(&word, 0, false), Some((-1.0, 0)));
+        assert_eq!(
+            dictionaries.layout_score(&word, 0, true),
+            Some((f64::NEG_INFINITY, 0))
+        );
+        for key in [K::KEY_H, K::KEY_U, K::KEY_B] {
+            push_key(&mut word, Stroke { key, shift: false });
+        }
+        assert_eq!(
+            dictionaries
+                .punctuation
+                .as_ref()
+                .unwrap()
+                .trim_edges("git;hub"),
+            ("git;hub", false)
+        );
+        assert_eq!(dictionaries.layout_score(&word, 0, true), Some((-1.0, 0)));
+    }
+
+    #[test]
+    fn splits_in_the_layout_with_internal_punctuation_and_scores_the_last_part_exactly_at_the_end()
+    {
+        use KeyCode as K;
+
+        let dictionaries = test_dictionaries([
+            ("us", "", "foo 4\nbar 1\nbart 3", 5.0),
+            ("ru", "", "кот 1", 5.0),
+        ]);
+        let ru = Layout::new("ru", "", "", "");
+        let mut word = word_from_keys(&[
+            K::KEY_F,
+            K::KEY_O,
+            K::KEY_O,
+            K::KEY_DOT,
+            K::KEY_B,
+            K::KEY_A,
+            K::KEY_R,
+        ]);
+        assert_eq!(dictionaries.layout_score(&word, 0, false), Some((-1.0, 0)));
+        assert_eq!(dictionaries.layout_score(&word, 0, true), Some((-3.0, 0)));
+        assert_eq!(
+            dictionaries.layout_score(&word, 1, false),
+            Some((f64::NEG_INFINITY, 0))
+        );
+        assert_eq!(dictionaries.target(&word, &ru, false).unwrap().name(), "us");
+
+        push_key(
+            &mut word,
+            Stroke {
+                key: K::KEY_SEMICOLON,
+                shift: false,
+            },
+        );
+        assert_eq!(dictionaries.layout_score(&word, 0, false), Some((-3.0, 0)));
+    }
+
+    #[test]
+    fn splits_at_different_characters_in_the_two_layouts() {
+        use KeyCode as K;
+
+        let dictionaries = test_dictionaries([
+            ("us", "", "foo 2\nbar$baz 6", 5.0),
+            ("ru", "", "ащщжифк 4\nифя 1\nя 3", 5.0),
+        ]);
+        let us = Layout::new("us", "", "", "");
+        let mut word = word_from_keys(&[
+            K::KEY_F,
+            K::KEY_O,
+            K::KEY_O,
+            K::KEY_SEMICOLON,
+            K::KEY_B,
+            K::KEY_A,
+            K::KEY_R,
+        ]);
+        push_key(
+            &mut word,
+            Stroke {
+                key: K::KEY_4,
+                shift: true,
+            },
+        );
+        for key in [K::KEY_B, K::KEY_A, K::KEY_Z] {
+            push_key(&mut word, Stroke { key, shift: false });
+        }
+        let comparison = dictionaries.comparison(&word, &us, false).unwrap();
+        assert_eq!(comparison.current_base_score, -2.0);
+        assert_eq!(comparison.alternative_base_score, -3.0);
+        assert_eq!(comparison.delta_score, -1.0);
+    }
+
+    #[test]
+    fn scores_split_parts_by_total_and_falls_back_when_a_part_is_missing() {
+        use KeyCode as K;
+
+        let mut dictionaries = test_dictionaries([
+            ("us", "", "a 1\na.b 1\nb 2\nz 4", 5.0),
+            ("ru", "", "кот 1", 5.0),
+        ]);
+        let word = word_from_keys(&[K::KEY_A, K::KEY_DOT, K::KEY_B]);
+        dictionaries.learned.increment("us", "a").unwrap();
+        assert_eq!(dictionaries.layout_score(&word, 0, true), Some((-3.0, 1)));
+        dictionaries.learned.increment("us", "a").unwrap();
+        assert_eq!(dictionaries.layout_score(&word, 0, true), Some((-2.0, 0)));
+
+        let dictionaries = test_dictionaries([
+            ("us", "", "a.b 1\napple 1\nb 2\nz 4", 5.0),
+            ("ru", "", "кот 1", 5.0),
+        ]);
+        assert_eq!(dictionaries.layout_score(&word, 0, false), Some((-3.0, 0)));
+    }
+
+    #[test]
+    fn trailing_weak_punctuation_looks_up_exact_learned_counts() {
+        use KeyCode as K;
+
+        let mut dictionaries =
+            test_dictionaries([("us", "", "git 1\nz 1", 5.0), ("ru", "", "кот 1", 5.0)]);
+        let plain = word_from_keys(&[K::KEY_G, K::KEY_I, K::KEY_T]);
+        let mut punctuated = plain.clone();
+        push_key(
+            &mut punctuated,
+            Stroke {
+                key: K::KEY_SEMICOLON,
+                shift: false,
+            },
+        );
+
+        dictionaries.learned.increment("us", "git;").unwrap();
+        assert_eq!(dictionaries.layout_score(&plain, 0, true), Some((-1.0, 0)));
+
+        for key in ["git", "git", "github", "github", "github"] {
+            dictionaries.learned.increment("us", key).unwrap();
+        }
+        assert_eq!(dictionaries.layout_score(&plain, 0, false), Some((-1.0, 6)));
+        for is_word_end in [false, true] {
+            assert_eq!(
+                dictionaries.layout_score(&punctuated, 0, is_word_end),
+                Some((-1.0, 2))
+            );
+        }
+    }
+
+    #[test]
+    fn comparison_uses_dictionary_and_learned_scores_from_the_same_key() {
         use KeyCode as K;
         use std::cmp::Ordering::Less;
 
@@ -934,22 +1201,50 @@ mod tests {
         for key in ["git", "git", "github", "github", "github"] {
             dictionaries.learned.increment("us", key).unwrap();
         }
-        for (repetitions, prefix_count, exact_count) in [(1, 5, 2), (5, 6, 6)] {
+        for (repetitions, exact_score, exact_count) in [(1, -2.0, 2), (5, -3.0, 6)] {
             for _ in 0..repetitions {
                 dictionaries.learned.increment("us", ";git").unwrap();
             }
             for (is_word_end, us_score, count) in [
-                (false, 0.875_f64.log2(), prefix_count),
-                (true, -2.0, exact_count),
+                (false, 0.875_f64.log2(), 5),
+                (true, exact_score, exact_count),
             ] {
                 let comparison = dictionaries.comparison(&word, &us, is_word_end).unwrap();
                 assert_eq!(comparison.current_base_score, us_score);
                 assert_eq!(comparison.alternative_base_score, -3.0);
                 assert_eq!(comparison.learned_difference(), (Less, count));
-                assert_eq!(comparison.delta_score, -3.0 - us_score - count as f64);
+                assert_eq!(comparison.delta_score, -3.0 - (us_score + count as f64));
                 let reverse = dictionaries.comparison(&word, &ru, is_word_end).unwrap();
                 assert_eq!(reverse.delta_score, -comparison.delta_score);
             }
+        }
+    }
+
+    #[test]
+    fn a_learned_only_key_can_win_but_the_full_key_wins_ties() {
+        use KeyCode as K;
+
+        let us = Layout::new("us", "", "", "");
+        let mut dictionaries = test_dictionaries([
+            ("us", "", ";git 1\nz 4095", 4.0),
+            ("ru", "", "жпше 1\nя 127", 4.0),
+        ]);
+        let word = word_from_keys(&[K::KEY_SEMICOLON, K::KEY_G, K::KEY_I, K::KEY_T]);
+        let mut count = 0;
+        for (next_count, expected_base, expected_delta) in
+            [(3, -12.0, 5.0), (6, -12.0, 5.0), (8, -18.0, 3.0)]
+        {
+            for _ in count..next_count {
+                dictionaries.learned.increment("us", "git").unwrap();
+            }
+            count = next_count;
+            let comparison = dictionaries.comparison(&word, &us, true).unwrap();
+            assert_eq!(comparison.current_base_score, expected_base);
+            assert_eq!(comparison.delta_score, expected_delta);
+            assert_eq!(
+                dictionaries.target(&word, &us, true).is_some(),
+                expected_delta > 4.0
+            );
         }
     }
 
@@ -966,13 +1261,20 @@ mod tests {
         let mut learned = LearnedRules::default();
         learned.increment("us", "cat").unwrap();
         learned.increment("us", "cats").unwrap();
+        learned.increment("us", "owl").unwrap();
         let indexes = LayoutIndexes {
             dictionary: &dictionary,
             learned: learned.trie("us"),
         };
-        assert_eq!(indexes.score("CAT"), (-1.0, 2));
-        assert_eq!(indexes.score("CAT "), (-3.0, 1));
-        assert_eq!(indexes.score("CATZ"), (f64::NEG_INFINITY, 0));
+        for (key, separated, total) in [
+            ("CAT", (-1.0, 2), 1.0),
+            ("CAT ", (-3.0, 1), -2.0),
+            ("owl ", (-18.0, 1), -17.0),
+            ("CATZ", (f64::NEG_INFINITY, 0), f64::NEG_INFINITY),
+        ] {
+            assert_eq!(indexes.score_separated(key), separated);
+            assert_eq!(indexes.score(key), total);
+        }
     }
 
     #[test]
@@ -1198,7 +1500,7 @@ mod tests {
             for is_first_space in [false, true] {
                 assert_eq!(
                     dictionaries.layout_score(&word, 1, is_first_space),
-                    Some((f64::NEG_INFINITY, 1))
+                    Some((LEARNED_BASE_SCORE, 1))
                 );
                 assert_eq!(
                     dictionaries

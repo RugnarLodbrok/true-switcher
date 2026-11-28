@@ -218,7 +218,8 @@ mod tests {
         let mut rules = LearnedRules::load(path.clone()).unwrap();
         let us = Layout::new("us", "", "pc105", "");
         let ru = Layout::new("ru", "", "pc105", "");
-        let mut punctuation = crate::punctuation::Punctuation::new(r"[`~<>\p{P}]+").unwrap();
+        let mut punctuation =
+            crate::punctuation::Punctuation::new(crate::config::DEFAULT_PUNCTUATION).unwrap();
         punctuation.update_layouts(vec![us.clone(), ru]);
         rules.set_strong_punctuation(punctuation.strong_characters_by_layout());
 

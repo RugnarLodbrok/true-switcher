@@ -3816,6 +3816,34 @@ threshold = 7.0
     }
 
     #[test]
+    fn logs_the_same_winning_key_used_for_the_dictionary_switch() {
+        use KeyCode as K;
+
+        for (count, expected, is_switch) in [
+            (6, " +5.00 = 12.00 -  7.00", true),
+            (8, " +3.00 = 18.00 -  7.00 -  8", false),
+        ] {
+            let mut input = auto_input_with_patterns("");
+            input.accept_layout(Some(layout("us")), false);
+            let mut dictionaries = crate::dictionary::test_dictionaries([
+                ("us", "", ";git 1\nz 4095", 4.0),
+                ("ru", "", "жпше 1\nя 127", 4.0),
+            ]);
+            for _ in 0..count {
+                dictionaries.learned.increment("us", "git").unwrap();
+            }
+            input.auto_switch.dictionaries = dictionaries;
+            for key in [K::KEY_SEMICOLON, K::KEY_G, K::KEY_I, K::KEY_T] {
+                press(&mut input, key);
+            }
+            let scores =
+                logged_dictionary_scores(&mut input, K::KEY_SPACE, log::LevelFilter::Debug);
+            assert_eq!(scores, [expected]);
+            assert_eq!(input.pending.is_dictionary(), is_switch);
+        }
+    }
+
+    #[test]
     fn filters_dictionary_score_logs_and_reports_unavailable_comparisons() {
         use log::LevelFilter;
 

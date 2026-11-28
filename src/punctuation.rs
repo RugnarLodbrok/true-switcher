@@ -4,8 +4,42 @@ use std::{
 };
 
 use regex::Regex;
+use regex_syntax::ast::{Ast, parse::Parser};
 
 use crate::{key_codes::text_keys, layout::Layout, word::Stroke};
+
+pub(crate) fn validate_pattern(pattern: &str) -> io::Result<Option<&str>> {
+    if pattern.is_empty() {
+        return Ok(None);
+    }
+    let ast = Parser::new().parse(pattern).map_err(invalid_pattern)?;
+    if !is_single_character(&ast) {
+        return Err(invalid_pattern(
+            "expected a regex matching single Unicode characters",
+        ));
+    }
+    Ok(Some(pattern))
+}
+
+fn is_single_character(ast: &Ast) -> bool {
+    match ast {
+        Ast::Literal(_)
+        | Ast::Dot(_)
+        | Ast::ClassUnicode(_)
+        | Ast::ClassPerl(_)
+        | Ast::ClassBracketed(_) => true,
+        Ast::Group(group) => is_single_character(&group.ast),
+        Ast::Alternation(alternation) => alternation.asts.iter().all(is_single_character),
+        _ => false,
+    }
+}
+
+pub(crate) fn invalid_pattern(error: impl std::fmt::Display) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("Invalid punctuation: {error}"),
+    )
+}
 
 #[derive(Default)]
 pub(crate) struct Punctuation {
@@ -16,8 +50,12 @@ pub(crate) struct Punctuation {
 
 impl Punctuation {
     pub(crate) fn new(pattern: &str) -> io::Result<Self> {
+        let pattern = validate_pattern(pattern)?
+            .map(|pattern| Regex::new(&format!(r"\A(?:{pattern})\z")))
+            .transpose()
+            .map_err(invalid_pattern)?;
         Ok(Self {
-            pattern: crate::dictionary::compile_full_match_pattern(pattern, "punctuation")?,
+            pattern,
             ..Self::default()
         })
     }
@@ -93,7 +131,7 @@ mod tests {
 
     #[test]
     fn uses_the_physical_key_and_shift_across_all_active_layouts() {
-        let mut punctuation = Punctuation::new(r"[`~<>\p{P}]+").unwrap();
+        let mut punctuation = Punctuation::new(crate::config::DEFAULT_PUNCTUATION).unwrap();
         let slash = Stroke {
             key: KeyCode::KEY_SLASH,
             shift: false,
@@ -134,6 +172,24 @@ mod tests {
         }));
         punctuation.update_layouts(Vec::new());
         assert!(!punctuation.is_strong(&slash));
+    }
+
+    #[test]
+    fn matches_a_single_unicode_character_per_stroke() {
+        let mut punctuation = Punctuation::new(r"(?:;|ж|\p{P})").unwrap();
+        let pattern = punctuation.pattern.as_ref().unwrap();
+        for character in [";", "ж", "。"] {
+            assert!(pattern.is_match(character));
+        }
+        assert!(!pattern.is_match(";ж;"));
+        punctuation.update_layouts(vec![
+            Layout::new("us", "", "pc105", ""),
+            Layout::new("ru", "", "pc105", ""),
+        ]);
+        assert!(punctuation.is_strong(&Stroke {
+            key: KeyCode::KEY_SEMICOLON,
+            shift: false,
+        }));
     }
 
     #[test]

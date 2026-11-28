@@ -1,17 +1,5 @@
 # Как работает автосвич
 
-`pattern_switch` включает свич по regex, `auto_switch` — по словарям. В трассах `␣` обозначает введённый пробел. [Что хранит `Stroke`](glossary.md#stroke)
-
-Для примеров использованы словари `en_full.txt` и `ru_full.txt` из `dicts/content/2018`. С этими словарями в конфиге трассы можно получить командой:
-
-```bash
-printf '%s\n' 'ru us хшв2ъ' 'ru us .е 0' 'ru us куищще' 'us ru ult' \
-  'us ru ,jkmit' 'us ru .git 0' 'us ru git' |
-  true-switcher score --learned-rules false --threshold 15
-```
-
-`score` показывает текст в обеих раскладках и словарные скоры. Решения по regex в примерах следуют из `switch_rules`. Индекс `0` выбирает для точки клавишу `KEY_SLASH` в запросе `ru us .е 0` и `KEY_DOT` в запросе `us ru .git 0`.
-
 ## Паттерн-свич
 
 Ввод начинается в RU. Оба regex проверяют текст в US. Для этих примеров словарный свич отключён.

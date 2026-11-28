@@ -257,3 +257,29 @@ fn marks_unavailable_comparison_and_prints_learned_adjustment_when_enabled() {
         ["bkb␣", "или␣", "-inf", "-inf", "0.00", "no"]
     );
 }
+
+#[test]
+fn displays_the_score_and_learned_adjustment_from_the_winning_key() {
+    let fixture = Fixture::new(DICTIONARY_CONFIG);
+    fs::write(fixture.dir.path().join("us.txt"), ";git 1\nz 4095\n").unwrap();
+    fs::write(fixture.dir.path().join("ru.txt"), "жпше 1\nя 127\n").unwrap();
+    for (count, base, adjustment, delta, above) in [
+        (6, "-12.00", "0", "5.00", "yes"),
+        (8, "-18.00", "-8", "3.00", "no"),
+    ] {
+        fs::write(
+            fixture.config_file.learned_rules_path(),
+            format!("[us]\ngit = {count}\n"),
+        )
+        .unwrap();
+        let output = fixture
+            .load(true)
+            .unwrap()
+            .trace("us ru ;git", Some(4.0))
+            .unwrap();
+        assert_eq!(
+            score_rows(&output).last().unwrap(),
+            &[";git␣", "жпше␣", base, "-7.00", adjustment, delta, above]
+        );
+    }
+}

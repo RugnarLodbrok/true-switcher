@@ -14,6 +14,7 @@ libpulse-simple-binding = "2"
 log = "0.4"
 nix = { version = "0.29.0", features = ["signal", "inotify"] }
 regex = "1.13.1"
+regex-syntax = "0.8.11"
 rusqlite = { version = "0.41.1", features = ["bundled"] }
 rustline = "0.1.0"
 serde = { version = "1", features = ["derive"] }

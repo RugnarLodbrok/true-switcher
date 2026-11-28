@@ -182,7 +182,7 @@ dict_skip_pattern = '.*\p{Lu}.*'
 # pattern that disables dictionary-based switch. This example protects punctuation. 
 # for example `~/` is not in `us`-dict, but `ru`-layout counterpart `Ё.` might be present in `ru`-dictionary.
 # this rule protects from auto-switching `~/`->`Ё.`
-punctuation = '[\p{P}\x{0060}]+'   
+punctuation = '[\p{P}\x{0060}]'
 
 [[dict]]
 target = "us"

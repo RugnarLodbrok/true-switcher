@@ -55,7 +55,7 @@ In this example, both `word` and `цщкв` are in the dictionary, but `цщкв
 The `punctuation` setting defines which characters count as punctuation.
 
 ```toml
-punctuation = '[`~<>\p{P}]+'
+punctuation = '[`~<>\p{P}]'
 ```
 
 ### strong punctuation / strong pnt

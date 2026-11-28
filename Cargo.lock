@@ -1227,6 +1227,7 @@ dependencies = [
  "log",
  "nix 0.29.0",
  "regex",
+ "regex-syntax",
  "rusqlite",
  "rustline",
  "serde",

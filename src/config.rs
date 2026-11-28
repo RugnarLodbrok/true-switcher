@@ -12,7 +12,7 @@ const CONFIG_DIRECTORY: &str = ".config/true-switcher";
 const CONFIG_FILE: &str = "config.toml";
 const LOG_LEVEL_KEY: &str = "log_level";
 pub(crate) const DEFAULT_MOUSE_MOTION_PAUSE_MS: u64 = 500;
-pub(crate) const DEFAULT_PUNCTUATION: &str = r"[`~<>\p{P}]+";
+pub(crate) const DEFAULT_PUNCTUATION: &str = r"[`~<>\p{P}]";
 pub(crate) const LOG_LEVELS: [(&str, log::LevelFilter); 6] = [
     ("off", log::LevelFilter::Off),
     ("error", log::LevelFilter::Error),
@@ -217,6 +217,8 @@ pub(crate) fn load_from(path: &Path) -> Result<(Configuration, ConfigurationFile
         .map_err(|error| format!("Cannot read {}: {error}", path.display()))?;
     let mut config =
         from_contents(&contents).map_err(|error| format!("{}: {error}", path.display()))?;
+    crate::punctuation::Punctuation::new(&config.punctuation)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
     let directory = path
         .parent()
         .expect("configuration path includes a directory");
@@ -253,6 +255,21 @@ fn config_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_punctuation_that_is_not_a_set_of_single_characters() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(CONFIG_FILE);
+        for pattern in ["[", "[!?]+", ";;|жж", ";?", "^;", ";|"] {
+            fs::write(
+                &path,
+                format!("switch_key = 'KEY_PAUSE'\npunctuation = '{pattern}'"),
+            )
+            .unwrap();
+            let error = load_from(&path).err().expect(pattern);
+            assert!(error.contains("Invalid punctuation"), "{pattern}: {error}");
+        }
+    }
 
     #[test]
     fn reads_and_validates_ambiguity_score_floor() {

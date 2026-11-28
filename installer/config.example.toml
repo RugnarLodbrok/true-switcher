@@ -29,10 +29,11 @@ mouse_motion_pause_ms = 500
 # An empty string keeps entries of any case. Use '.*\p{Lu}.*' to skip words containing uppercase letters.
 dict_skip_pattern = ''
 
-# Disable dict-based autoswitch for punctuation-only words;
-# Also trim leading punctuation for alternative scoring. (scoring without trim remains)
-# An empty string disables both checks.
-punctuation = '[`~<>\p{P}]+'
+# Regex matching one Unicode character. Use literals, character classes, or alternatives.
+# This setting defines strong punctuation and protects punctuation-only words from dictionary autoswitch.
+# Dictionary scoring also tries removing punctuation from both ends and splitting on internal punctuation.
+# An empty string disables punctuation handling.
+punctuation = '[`~<>\p{P}]'
 
 
 [[switch_rules]]       # Optional regex rule set

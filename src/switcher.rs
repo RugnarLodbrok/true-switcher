@@ -507,23 +507,26 @@ mod tests {
     }
 
     #[test]
-    fn teach_trims_actual_strong_strokes_but_keeps_a_non_strong_way_to_type_a_symbol() {
+    fn teach_trims_strong_strokes_and_keeps_weak_ones() {
         use evdev::KeyCode as K;
         let us = layout::Layout::new("us", "", "pc105", "");
         let ru = Arc::new(layout::Layout::new("ru", "", "pc105", ""));
-        let mut punctuation = crate::punctuation::Punctuation::new(r"[`~<>\p{P}]+").unwrap();
+        let mut punctuation =
+            crate::punctuation::Punctuation::new(crate::config::DEFAULT_PUNCTUATION).unwrap();
         punctuation.update_layouts(vec![us.clone(), (*ru).clone()]);
         let now = Instant::now();
         let completed = CorrectionOutcome::Completed {
             started_at: now,
             finished_at: now,
         };
-        for (first, is_shift, expected) in
-            [(K::KEY_SLASH, false, "new"), (K::KEY_COMMA, true, "<new")]
-        {
+        for (first, is_shift, last, expected) in [
+            (K::KEY_SLASH, false, K::KEY_SLASH, "new"),
+            (K::KEY_COMMA, true, K::KEY_SLASH, "<new"),
+            (K::KEY_SLASH, false, K::KEY_SEMICOLON, "new;"),
+        ] {
             let mut history = crate::history::History::default();
             history.process(first, is_shift, Some(ru.clone()), &punctuation);
-            for key in [K::KEY_N, K::KEY_E, K::KEY_W, K::KEY_SLASH] {
+            for key in [K::KEY_N, K::KEY_E, K::KEY_W, last] {
                 history.process(key, false, Some(ru.clone()), &punctuation);
             }
             let correction = Correction::from_request(
